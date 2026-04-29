@@ -3,7 +3,10 @@ import { homedir } from "node:os";
 import path from "node:path";
 import lockfile from "proper-lockfile";
 
-export const ROOT = process.env.CLAUDE_COORD_DIR ?? path.join(homedir(), "claude-coord");
+export const ROOT =
+  process.env.AGENT_COORD_DIR ??
+  process.env.CLAUDE_COORD_DIR ??
+  path.join(homedir(), "agent-coord");
 export const AGENTS_FILE = path.join(ROOT, "agents.json");
 export const ROOM_FILE = path.join(ROOT, "room.jsonl");
 export const STATUS_FILE = path.join(ROOT, "status.jsonl");

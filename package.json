@@ -1,10 +1,10 @@
 {
-  "name": "claude-coord-mcp",
+  "name": "agent-coord-mcp",
   "version": "0.1.0",
-  "description": "File-backed MCP server for coordinating multiple Claude Code sessions",
+  "description": "File-backed MCP server for coordinating multiple AI coding agents (Claude Code, Cursor, Cline, etc.) on the same machine.",
   "type": "module",
   "bin": {
-    "claude-coord-mcp": "dist/server.js"
+    "agent-coord-mcp": "dist/server.js"
   },
   "scripts": {
     "build": "tsc",
@@ -20,7 +20,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/davidbalzan/claude-coord-mcp.git"
+    "url": "https://github.com/davidbalzan/agent-coord-mcp.git"
   },
   "license": "MIT",
   "dependencies": {

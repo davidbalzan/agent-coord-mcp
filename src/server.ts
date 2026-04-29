@@ -29,7 +29,7 @@ async function main() {
   ensureDirs();
 
   const server = new McpServer({
-    name: "claude-coord",
+    name: "agent-coord",
     version: "0.1.0",
   });
 
@@ -87,6 +87,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("[claude-coord-mcp] fatal:", err);
+  console.error("[agent-coord-mcp] fatal:", err);
   process.exit(1);
 });
