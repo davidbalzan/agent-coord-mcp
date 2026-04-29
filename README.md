@@ -62,6 +62,7 @@ If you're building an agent with the official MCP SDKs (`@modelcontextprotocol/s
 | `read_messages({agentId, source, limit?, peek?, sinceTs?})` | Read new messages. `source` is `inbox`/`room`/`status`. Advances cursor unless `peek:true`. |
 | `post_status({agentId, status, detail?})` | Append to the shared status stream (separate from chat). |
 | `wait_for_message({agentId, source, timeoutMs?})` | Block (max 60s) until a new entry appears, then return it. |
+| `prune({olderThanDays?, removeOrphanInboxes?, dryRun?})` | Trim room/status/inbox JSONL to entries newer than N days (default 7). Removes inbox files for agents no longer in the registry. Pass `dryRun:true` to preview. |
 
 ## Convention for agent IDs
 
@@ -97,6 +98,10 @@ tail -f ~/agent-coord/room.jsonl | jq -c '{ts: (.ts/1000|todate), from, to, text
 ```
 
 To reset everything: `rm -rf ~/agent-coord && mkdir -p ~/agent-coord/{inbox,cursors}`.
+
+### Cleanup
+
+The registry auto-evicts agents whose last heartbeat is older than 24h on every `list_agents` call. For chat history and inbox trimming, call `prune` periodically (e.g. weekly) — it's safe to run from any agent and supports `dryRun`.
 
 ## Override location
 

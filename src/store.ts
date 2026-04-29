@@ -113,6 +113,47 @@ function sanitize(id: string): string {
   return id.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
+export async function rewriteJsonl<T>(
+  file: string,
+  filter: (entry: T) => boolean
+): Promise<{ kept: number; removed: number }> {
+  if (!existsSync(file)) return { kept: 0, removed: 0 };
+  return withLock(file, async () => {
+    const raw = await fs.readFile(file, "utf8");
+    let kept = 0;
+    let removed = 0;
+    const out: string[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line) as T;
+        if (filter(entry)) {
+          out.push(line);
+          kept++;
+        } else {
+          removed++;
+        }
+      } catch {
+        removed++;
+      }
+    }
+    await fs.writeFile(file, out.length ? out.join("\n") + "\n" : "", "utf8");
+    return { kept, removed };
+  });
+}
+
+export async function deleteFile(file: string): Promise<boolean> {
+  if (!existsSync(file)) return false;
+  await fs.unlink(file);
+  return true;
+}
+
+export async function listInboxFiles(): Promise<string[]> {
+  if (!existsSync(INBOX_DIR)) return [];
+  const names = await fs.readdir(INBOX_DIR);
+  return names.filter((n) => n.endsWith(".jsonl"));
+}
+
 export async function fileSize(file: string): Promise<number> {
   if (!existsSync(file)) return 0;
   const st = await fs.stat(file);

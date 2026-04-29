@@ -9,6 +9,8 @@ import {
   listAgentsTool,
   postStatusSchema,
   postStatusTool,
+  pruneSchema,
+  pruneTool,
   readMessagesSchema,
   readMessagesTool,
   registerSchema,
@@ -73,6 +75,13 @@ async function main() {
     "Append a status broadcast to the shared status stream.",
     postStatusSchema,
     async (args) => jsonResult(await postStatusTool(args))
+  );
+
+  server.tool(
+    "prune",
+    "Trim room/status/inbox JSONL to entries newer than `olderThanDays` (default 7). Removes inbox files for agents no longer in the registry unless removeOrphanInboxes=false. Pass dryRun=true to preview.",
+    pruneSchema,
+    async (args) => jsonResult(await pruneTool(args))
   );
 
   server.tool(

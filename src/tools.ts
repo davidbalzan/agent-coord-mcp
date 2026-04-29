@@ -1,16 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { watch } from "node:fs";
 import { z } from "zod";
+import path from "node:path";
 import {
   AGENTS_FILE,
+  INBOX_DIR,
   ROOM_FILE,
   STATUS_FILE,
   appendJsonl,
   cursorFile,
+  deleteFile,
   fileSize,
   inboxFile,
+  listInboxFiles,
   readJson,
   readJsonl,
+  rewriteJsonl,
   updateJson,
 } from "./store.js";
 
@@ -48,6 +53,7 @@ type Cursor = {
 };
 
 const STALE_MS = 5 * 60 * 1000;
+const EVICT_MS = 24 * 60 * 60 * 1000;
 const MAX_WAIT_MS = 60_000;
 
 // ---------- register ----------
@@ -97,14 +103,23 @@ export async function heartbeatTool(args: { agentId: string }) {
 export const listAgentsSchema = {} as const;
 
 export async function listAgentsTool() {
-  const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
   const now = Date.now();
+  const evicted: string[] = [];
+  const reg = await updateJson<AgentRegistry>(AGENTS_FILE, {}, (current) => {
+    for (const [id, entry] of Object.entries(current)) {
+      if (now - entry.lastHeartbeat > EVICT_MS) {
+        evicted.push(id);
+        delete current[id];
+      }
+    }
+    return current;
+  });
   const agents = Object.values(reg).map((a) => ({
     ...a,
     online: now - a.lastHeartbeat < STALE_MS,
     secondsSinceHeartbeat: Math.floor((now - a.lastHeartbeat) / 1000),
   }));
-  return { agents };
+  return { agents, evicted };
 }
 
 // ---------- send_message ----------
@@ -254,6 +269,85 @@ export async function waitForMessageTool(args: {
     return { ok: false, timedOut: true };
   }
   return readMessagesTool({ agentId: args.agentId, source: args.source });
+}
+
+// ---------- prune ----------
+
+export const pruneSchema = {
+  olderThanDays: z.number().positive().max(365).optional(),
+  removeOrphanInboxes: z.boolean().optional(),
+  dryRun: z.boolean().optional(),
+};
+
+export async function pruneTool(args: {
+  olderThanDays?: number;
+  removeOrphanInboxes?: boolean;
+  dryRun?: boolean;
+}) {
+  const days = args.olderThanDays ?? 7;
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const dryRun = args.dryRun ?? false;
+
+  const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
+  const knownAgents = new Set(Object.keys(reg));
+
+  if (dryRun) {
+    const room = await readJsonl<Message>(ROOM_FILE);
+    const status = await readJsonl<StatusEntry>(STATUS_FILE);
+    const inboxFiles = await listInboxFiles();
+    let inboxRemoved = 0;
+    const orphans: string[] = [];
+    for (const fname of inboxFiles) {
+      const id = fname.replace(/\.jsonl$/, "");
+      if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) orphans.push(fname);
+      const entries = await readJsonl<Message>(path.join(INBOX_DIR, fname));
+      inboxRemoved += entries.filter((e) => e.ts <= cutoff).length;
+    }
+    return {
+      dryRun: true,
+      cutoff,
+      olderThanDays: days,
+      wouldRemove: {
+        roomMessages: room.filter((e) => e.ts <= cutoff).length,
+        statusEntries: status.filter((e) => e.ts <= cutoff).length,
+        inboxMessages: inboxRemoved,
+        orphanInboxes: orphans,
+      },
+    };
+  }
+
+  const roomResult = await rewriteJsonl<Message>(ROOM_FILE, (e) => e.ts > cutoff);
+  const statusResult = await rewriteJsonl<StatusEntry>(STATUS_FILE, (e) => e.ts > cutoff);
+
+  const inboxFiles = await listInboxFiles();
+  let inboxRemoved = 0;
+  const deletedOrphans: string[] = [];
+  for (const fname of inboxFiles) {
+    const id = fname.replace(/\.jsonl$/, "");
+    const filePath = path.join(INBOX_DIR, fname);
+    if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) {
+      const entries = await readJsonl<Message>(filePath);
+      inboxRemoved += entries.length;
+      await deleteFile(filePath);
+      deletedOrphans.push(id);
+      continue;
+    }
+    const r = await rewriteJsonl<Message>(filePath, (e) => e.ts > cutoff);
+    inboxRemoved += r.removed;
+  }
+
+  return {
+    dryRun: false,
+    cutoff,
+    olderThanDays: days,
+    removed: {
+      roomMessages: roomResult.removed,
+      statusEntries: statusResult.removed,
+      inboxMessages: inboxRemoved,
+      orphanInboxes: deletedOrphans,
+    },
+    note: "Cursors not adjusted; clients may see stale offsets but read_messages clamps via slice().",
+  };
 }
 
 // ---------- helpers ----------
