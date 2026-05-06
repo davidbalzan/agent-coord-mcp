@@ -111,7 +111,57 @@ Set `AGENT_COORD_DIR=/some/other/path` in the MCP server's env to relocate state
 
 `wait_for_message` is the cheap path: one tool call, server-side `fs.watch` + 500ms poll, capped at 60s. The model only pays for one round-trip per wait.
 
-The model is fundamentally turn-based — there's no async push that wakes an idle agent. For *passive* presence (react when pinged, even between user turns), wire a client-side hook that runs `read_messages --peek` and injects unread inbox entries into the next prompt. With Claude Code that's a `UserPromptSubmit` hook; other clients have similar mechanisms.
+But the model is fundamentally turn-based — there's no async push that wakes an idle agent. For *passive* presence (react when pinged without being told to poll) wire a client-side hook that drains unread messages into the next turn.
+
+### Claude Code hook
+
+A reference hook ships in [`hooks/peek-coord.mjs`](./hooks/peek-coord.mjs). It reads `~/agent-coord/inbox/<id>.jsonl` directly, advances the cursor, and prints unread DMs (and optionally room posts) so Claude Code can inject them into context. No MCP roundtrip, no extra deps.
+
+Two places to wire it:
+
+- **`UserPromptSubmit`** — fires before the agent sees the user's next message. Stdout is appended to context. Good for *"new DMs since last turn"*.
+- **`Stop`** — fires when the agent finishes its turn. If there are unread messages, the hook returns `{"decision":"block","reason":"..."}` which keeps the session going and feeds the messages in. Good for *"peer pinged me 2 seconds after I stopped"*.
+
+Add to your project or user `settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "AGENT_COORD_ID=frontend node /absolute/path/to/agent-coord-mcp/hooks/peek-coord.mjs --mode=user-prompt"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "AGENT_COORD_ID=frontend node /absolute/path/to/agent-coord-mcp/hooks/peek-coord.mjs --mode=stop"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Set `AGENT_COORD_ID` to whatever you passed to `register({agentId})`. Set `AGENT_COORD_INCLUDE_ROOM=1` to also drain the shared room. Set `AGENT_COORD_DIR` if you've relocated the state directory.
+
+Caveat: the hook writes the cursor file directly (atomic tmp+rename) without taking the MCP server's lockfile, so if the agent calls `read_messages` at the exact instant the hook runs, one of them may double-deliver a message. In practice hooks fire between turns and tool calls fire during them, so this is rare. The hook also banners injected messages with *"do not call read_messages for them again"* to keep the agent from re-fetching.
+
+### Other clients
+
+The script itself is plain Node — no Claude-specific deps — so it ports anywhere you can run a shell command around the agent loop. The MCP protocol doesn't standardize client-side hooks, so the wiring varies:
+
+- **Cursor / Cline / Continue / Zed** — no first-class lifecycle hooks today. Closest workaround is to put *"run `peek-coord.mjs` at turn start and treat its stdout as additional context"* in your rules/system prompt. Less reliable (model can skip it) but functional.
+- **Custom SDK agents (`@anthropic-ai/sdk`, `openai`, etc.)** — easiest fit. Shell out to the script (or inline the ~50 lines of logic) right before each completion call and prepend stdout as a system message. Fully deterministic.
+- **Client-agnostic fallback** — a `launchd`/`systemd`/cron watcher that tails `inbox/<id>.jsonl` and writes unread entries to a file the agent is told to `Read` on session start. Crude, works everywhere.
 
 ## License
 
