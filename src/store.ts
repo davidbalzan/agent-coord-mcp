@@ -154,6 +154,12 @@ export async function listInboxFiles(): Promise<string[]> {
   return names.filter((n) => n.endsWith(".jsonl"));
 }
 
+export async function listCursorFiles(): Promise<string[]> {
+  if (!existsSync(CURSOR_DIR)) return [];
+  const names = await fs.readdir(CURSOR_DIR);
+  return names.filter((n) => n.endsWith(".json"));
+}
+
 export async function fileSize(file: string): Promise<number> {
   if (!existsSync(file)) return 0;
   const st = await fs.stat(file);

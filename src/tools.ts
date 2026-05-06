@@ -4,6 +4,7 @@ import { z } from "zod";
 import path from "node:path";
 import {
   AGENTS_FILE,
+  CURSOR_DIR,
   INBOX_DIR,
   ROOM_FILE,
   STATUS_FILE,
@@ -12,6 +13,7 @@ import {
   deleteFile,
   fileSize,
   inboxFile,
+  listCursorFiles,
   listInboxFiles,
   readJson,
   readJsonl,
@@ -322,6 +324,9 @@ export async function pruneTool(args: {
   const inboxFiles = await listInboxFiles();
   let inboxRemoved = 0;
   const deletedOrphans: string[] = [];
+  // perAgentInboxRemoved: how many entries were stripped from each *kept* agent's
+  // inbox, so we can shift only that agent's inboxOffset cursor below.
+  const perAgentInboxRemoved: Record<string, number> = {};
   for (const fname of inboxFiles) {
     const id = fname.replace(/\.jsonl$/, "");
     const filePath = path.join(INBOX_DIR, fname);
@@ -334,6 +339,35 @@ export async function pruneTool(args: {
     }
     const r = await rewriteJsonl<Message>(filePath, (e) => e.ts > cutoff);
     inboxRemoved += r.removed;
+    perAgentInboxRemoved[id] = r.removed;
+  }
+
+  // Cursor adjustment: appendJsonl is time-ordered and rewriteJsonl removes
+  // the oldest entries (ts <= cutoff). Any cursor offset shifts down by the
+  // removed count, clamped at 0. Without this, an offset past the new file
+  // length would make read_messages return [] forever.
+  const cursorsAdjusted: string[] = [];
+  for (const cname of await listCursorFiles()) {
+    const id = cname.replace(/\.json$/, "");
+    const cursorPath = path.join(CURSOR_DIR, cname);
+    let touched = false;
+    await updateJson<Cursor>(cursorPath, {}, (current) => {
+      if (current.roomOffset !== undefined && roomResult.removed > 0) {
+        current.roomOffset = Math.max(0, current.roomOffset - roomResult.removed);
+        touched = true;
+      }
+      if (current.statusOffset !== undefined && statusResult.removed > 0) {
+        current.statusOffset = Math.max(0, current.statusOffset - statusResult.removed);
+        touched = true;
+      }
+      const myInboxRemoved = perAgentInboxRemoved[id] ?? 0;
+      if (current.inboxOffset !== undefined && myInboxRemoved > 0) {
+        current.inboxOffset = Math.max(0, current.inboxOffset - myInboxRemoved);
+        touched = true;
+      }
+      return current;
+    });
+    if (touched) cursorsAdjusted.push(id);
   }
 
   return {
@@ -346,7 +380,7 @@ export async function pruneTool(args: {
       inboxMessages: inboxRemoved,
       orphanInboxes: deletedOrphans,
     },
-    note: "Cursors not adjusted; clients may see stale offsets but read_messages clamps via slice().",
+    cursorsAdjusted,
   };
 }
 
