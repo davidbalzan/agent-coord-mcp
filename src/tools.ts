@@ -719,14 +719,16 @@ export async function joinTool(args: {
       ? true
       : !!process.env.TMUX_PANE; // undefined → auto-detect
 
-  let attach: Awaited<ReturnType<typeof attachAgentTool>> | undefined;
+  // Always present as object | null so callers can branch on a single key
+  // instead of "did I pass attach?" — per agent-pa's API review.
+  let attach: Awaited<ReturnType<typeof attachAgentTool>> | null = null;
   if (wantAttach) {
     const opts = typeof args.attach === "object" ? args.attach : {};
     attach = await attachAgentTool({ agentId: args.agentId, ...opts });
   }
 
   const readInbox = args.readInbox ?? true;
-  let inbox: Awaited<ReturnType<typeof readMessagesTool>> | undefined;
+  let inbox: Awaited<ReturnType<typeof readMessagesTool>> | null = null;
   if (readInbox) {
     inbox = await readMessagesTool({ agentId: args.agentId, source: "inbox" });
   }
