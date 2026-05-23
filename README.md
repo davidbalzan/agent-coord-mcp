@@ -6,7 +6,7 @@ State lives in `~/agent-coord/` as JSONL/JSON files, so you can `tail -f` the co
 
 > **Local-only** — coordination happens through the local filesystem. Agents need to share the same `~/agent-coord/` directory (i.e. same machine, same user). You *can* point `AGENT_COORD_DIR` at a synced/network folder for multi-machine coord, but lockfile semantics over NFS/Dropbox aren't reliable, so it isn't promised.
 >
-> **Works with any MCP client.** The server speaks plain MCP over stdio: Claude Code, Cursor, Cline, Continue, Zed AI, custom SDK apps. Anywhere two or more agents can connect to the same stdio MCP server, they can talk.
+> **Works with any MCP client — and across client types.** The server speaks plain MCP over stdio: Claude Code, Cursor, Cline, Continue, Zed AI, custom SDK apps. Anywhere two or more agents can connect to the same stdio MCP server, they can talk. A Claude Code session, a Cursor agent, and a custom Python SDK worker can all share the same room and DM each other — they're just rows in the same JSONL files.
 >
 > No auth, no encryption. Anything that can read your home directory can read the messages.
 
@@ -111,7 +111,17 @@ Set `AGENT_COORD_DIR=/some/other/path` in the MCP server's env to relocate state
 
 `wait_for_message` is the cheap path: one tool call, server-side `fs.watch` + 500ms poll, capped at 60s. The model only pays for one round-trip per wait.
 
-But the model is fundamentally turn-based — there's no async push that wakes an idle agent. For *passive* presence (react when pinged without being told to poll) wire a client-side hook that drains unread messages into the next turn.
+But the model is fundamentally turn-based — there's no async push that wakes a fully idle agent. For *passive* presence (react when pinged without being told to poll) wire a client-side hook that drains unread messages into the next turn.
+
+### Why this is a feature, not a bug
+
+Delivery is **always tied to a turn the agent is already taking** — a user prompt, a tool result, a Stop-hook continuation. That means:
+
+- **The human stays in control.** Peer agents can't silently kick off work in your session while you're away from the keyboard. Messages land the next time *you* (or your agent's own lifecycle) drive a turn.
+- **Billing stays predictable.** No background daemon spinning up extra completions on your subscription.
+- **Mixed-client coordination works naturally.** A Claude Code session driven by a human, a headless Claude Agent SDK worker running on a cron, and a Cursor agent in another repo can all participate in the same room — each on its own cadence, each respecting its own client's turn model. The MCP doesn't care who's on the other end of the socket.
+
+If you genuinely need an always-on responder (e.g. a worker that should react within seconds of any DM), build *that specific agent* on the Claude Agent SDK or a similar library where you own the loop, and let it talk to your interactive Claude Code sessions through this same MCP.
 
 ### Claude Code hook
 

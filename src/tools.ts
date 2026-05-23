@@ -195,7 +195,19 @@ export async function readMessagesTool(args: {
     });
   }
 
-  return { messages: limited, totalNew, returned: limited.length };
+  // Drop the agent's own posts on shared channels — reading your own broadcast
+  // back is never useful and confuses turn-based agents into self-replies.
+  // Cursor has already advanced past them, so they won't reappear.
+  const visible =
+    args.source === "room" || args.source === "status"
+      ? limited.filter((e) => entryAuthor(e) !== args.agentId)
+      : limited;
+
+  return { messages: visible, totalNew, returned: visible.length };
+}
+
+function entryAuthor(e: Message | StatusEntry): string | undefined {
+  return "from" in e ? e.from : e.agentId;
 }
 
 // ---------- post_status ----------
@@ -231,46 +243,57 @@ export async function waitForMessageTool(args: {
   source: "inbox" | "room" | "status";
   timeoutMs?: number;
 }) {
-  const timeout = Math.min(args.timeoutMs ?? 30_000, MAX_WAIT_MS);
+  const totalTimeout = Math.min(args.timeoutMs ?? 30_000, MAX_WAIT_MS);
   const file = sourceFile(args.source, args.agentId);
-  const startSize = await fileSize(file);
+  const deadline = Date.now() + totalTimeout;
 
-  const result = await new Promise<{ changed: boolean }>((resolve) => {
-    let settled = false;
-    const finish = (changed: boolean) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(poll);
+  // Loop so that file growth caused only by the agent's own self-posts (which
+  // readMessagesTool now filters out for room/status) doesn't return an empty
+  // result — keep waiting until we have something to deliver or time out.
+  while (Date.now() < deadline) {
+    const startSize = await fileSize(file);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+
+    const changed = await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (v: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(poll);
+        try {
+          watcher?.close();
+        } catch {
+          // ignore
+        }
+        clearTimeout(t);
+        resolve(v);
+      };
+
+      const check = async () => {
+        const sz = await fileSize(file);
+        if (sz > startSize) finish(true);
+      };
+
+      let watcher: ReturnType<typeof watch> | undefined;
       try {
-        watcher?.close();
+        watcher = watch(file, () => {
+          void check();
+        });
       } catch {
-        // ignore
+        // file may not exist; polling will handle
       }
-      clearTimeout(t);
-      resolve({ changed });
-    };
+      const poll = setInterval(() => void check(), 500);
+      const t = setTimeout(() => finish(false), remaining);
+    });
 
-    const check = async () => {
-      const sz = await fileSize(file);
-      if (sz > startSize) finish(true);
-    };
-
-    let watcher: ReturnType<typeof watch> | undefined;
-    try {
-      watcher = watch(file, () => {
-        void check();
-      });
-    } catch {
-      // file may not exist; polling will handle
-    }
-    const poll = setInterval(() => void check(), 500);
-    const t = setTimeout(() => finish(false), timeout);
-  });
-
-  if (!result.changed) {
-    return { ok: false, timedOut: true };
+    if (!changed) break;
+    const result = await readMessagesTool({ agentId: args.agentId, source: args.source });
+    if (result.returned > 0) return result;
+    // otherwise, only self-posts arrived; keep waiting on the remaining budget
   }
-  return readMessagesTool({ agentId: args.agentId, source: args.source });
+
+  return { ok: false, timedOut: true };
 }
 
 // ---------- prune ----------
