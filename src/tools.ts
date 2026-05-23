@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { watch } from "node:fs";
+import { existsSync, openSync, watch } from "node:fs";
+import { promises as fsp } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import path from "node:path";
 import {
@@ -15,9 +18,13 @@ import {
   inboxFile,
   listCursorFiles,
   listInboxFiles,
+  listTransportFiles,
+  logFile,
+  pidFile,
   readJson,
   readJsonl,
   rewriteJsonl,
+  transportFile,
   updateJson,
 } from "./store.js";
 
@@ -27,6 +34,15 @@ type AgentEntry = {
   role?: string;
   registeredAt: number;
   lastHeartbeat: number;
+  capabilities?: string[];
+};
+
+type TransportMarker = {
+  agentId: string;
+  transport: string;
+  pid: number;
+  tmuxTarget?: string;
+  since: number;
 };
 
 type AgentRegistry = Record<string, AgentEntry>;
@@ -116,12 +132,55 @@ export async function listAgentsTool() {
     }
     return current;
   });
-  const agents = Object.values(reg).map((a) => ({
-    ...a,
-    online: now - a.lastHeartbeat < STALE_MS,
-    secondsSinceHeartbeat: Math.floor((now - a.lastHeartbeat) / 1000),
-  }));
+
+  // Merge in live transport markers (e.g. tmux-push from the pusher daemon).
+  // A marker counts only if its pid is still alive; stale markers are pruned.
+  const liveTransports = await loadLiveTransports();
+
+  const agents = Object.values(reg).map((a) => {
+    const transport = liveTransports.get(a.agentId);
+    const merged = [...(a.capabilities ?? [])];
+    if (transport && !merged.includes(transport.transport)) merged.push(transport.transport);
+    return {
+      ...a,
+      online: now - a.lastHeartbeat < STALE_MS,
+      secondsSinceHeartbeat: Math.floor((now - a.lastHeartbeat) / 1000),
+      capabilities: merged.length > 0 ? merged : undefined,
+      transport: transport
+        ? { kind: transport.transport, tmuxTarget: transport.tmuxTarget, pid: transport.pid }
+        : undefined,
+    };
+  });
   return { agents, evicted };
+}
+
+async function loadLiveTransports(): Promise<Map<string, TransportMarker>> {
+  const out = new Map<string, TransportMarker>();
+  for (const fname of await listTransportFiles()) {
+    const file = path.join(path.dirname(transportFile("x")), fname);
+    const marker = await readJson<TransportMarker | null>(file, null);
+    if (!marker) {
+      await deleteFile(file);
+      continue;
+    }
+    if (!isPidAlive(marker.pid)) {
+      await deleteFile(file);
+      continue;
+    }
+    out.set(marker.agentId, marker);
+  }
+  return out;
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "EPERM"; // EPERM = exists but not ours; ESRCH = gone
+  }
 }
 
 // ---------- send_message ----------
@@ -405,6 +464,125 @@ export async function pruneTool(args: {
     },
     cursorsAdjusted,
   };
+}
+
+// ---------- attach_agent / detach_agent (tmux push transport) ----------
+
+export const attachAgentSchema = {
+  agentId: z.string().min(1),
+  tmuxTarget: z.string().optional(),
+  includeRoom: z.boolean().optional(),
+  allowlist: z.array(z.string()).optional(),
+  debounceMs: z.number().int().positive().max(60_000).optional(),
+};
+
+export async function attachAgentTool(args: {
+  agentId: string;
+  tmuxTarget?: string;
+  includeRoom?: boolean;
+  allowlist?: string[];
+  debounceMs?: number;
+}) {
+  // Resolve target: explicit arg > MCP server's own TMUX_PANE env.
+  const target = args.tmuxTarget ?? process.env.TMUX_PANE;
+  if (!target) {
+    return {
+      ok: false,
+      error:
+        "tmuxTarget not provided and the MCP server is not running inside tmux (no $TMUX_PANE). Pass tmuxTarget explicitly (e.g. '%42' or 'session:window.pane').",
+    };
+  }
+
+  // Validate target exists.
+  const probe = spawnSync("tmux", ["display-message", "-p", "-t", target, "ok"]);
+  if (probe.status !== 0) {
+    return {
+      ok: false,
+      error: `tmux target '${target}' not found: ${(probe.stderr ?? "").toString().trim()}`,
+    };
+  }
+
+  // If something's already attached, refuse rather than spawn a second pusher.
+  const existing = await readJson<TransportMarker | null>(transportFile(args.agentId), null);
+  if (existing && isPidAlive(existing.pid)) {
+    return {
+      ok: false,
+      error: `agent '${args.agentId}' already has a live ${existing.transport} attached (pid ${existing.pid}). Call detach_agent first.`,
+      existing,
+    };
+  }
+  // Clean up dead marker, if any.
+  if (existing) await deleteFile(transportFile(args.agentId));
+
+  const pusher = resolvePusherPath();
+  if (!existsSync(pusher)) {
+    return { ok: false, error: `tmux-pusher not found at ${pusher}` };
+  }
+
+  // Detached spawn so the pusher outlives this MCP request/process.
+  const log = logFile(args.agentId, "pusher");
+  await fsp.mkdir(path.dirname(log), { recursive: true });
+  await fsp.mkdir(path.dirname(pidFile(args.agentId, "pusher")), { recursive: true });
+  await fsp.mkdir(path.dirname(transportFile(args.agentId)), { recursive: true });
+  const out = openSync(log, "a");
+  const err = openSync(log, "a");
+  const child = spawn("node", [pusher], {
+    detached: true,
+    stdio: ["ignore", out, err],
+    env: {
+      ...process.env,
+      AGENT_COORD_ID: args.agentId,
+      AGENT_COORD_TMUX_TARGET: target,
+      ...(args.includeRoom ? { AGENT_COORD_INCLUDE_ROOM: "1" } : {}),
+      ...(args.allowlist && args.allowlist.length > 0
+        ? { AGENT_COORD_ALLOWLIST: args.allowlist.join(",") }
+        : {}),
+      ...(args.debounceMs ? { AGENT_COORD_DEBOUNCE_MS: String(args.debounceMs) } : {}),
+    },
+  });
+  child.unref();
+  const pid = child.pid;
+  if (!pid) return { ok: false, error: "spawn returned no pid" };
+
+  // Write pid file (for scripts) and transport marker (for list_agents).
+  await fsp.writeFile(pidFile(args.agentId, "pusher"), String(pid), "utf8");
+  const marker: TransportMarker = {
+    agentId: args.agentId,
+    transport: "tmux-push",
+    pid,
+    tmuxTarget: target,
+    since: Date.now(),
+  };
+  // Use updateJson so it lockfile-protects and creates the file atomically.
+  await updateJson<TransportMarker>(transportFile(args.agentId), marker, () => marker);
+
+  return { ok: true, agentId: args.agentId, transport: "tmux-push", tmuxTarget: target, pid, log };
+}
+
+export const detachAgentSchema = {
+  agentId: z.string().min(1),
+};
+
+export async function detachAgentTool(args: { agentId: string }) {
+  const marker = await readJson<TransportMarker | null>(transportFile(args.agentId), null);
+  let killed = false;
+  if (marker && isPidAlive(marker.pid)) {
+    try {
+      process.kill(marker.pid, "SIGTERM");
+      killed = true;
+    } catch {
+      // already gone
+    }
+  }
+  await deleteFile(transportFile(args.agentId));
+  await deleteFile(pidFile(args.agentId, "pusher"));
+  return { ok: true, agentId: args.agentId, killed, hadMarker: marker !== null };
+}
+
+function resolvePusherPath(): string {
+  // tools.js (compiled) lives in dist/; pusher lives in hooks/ at repo root.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(here, "..", "hooks", "tmux-pusher.mjs");
 }
 
 // ---------- helpers ----------

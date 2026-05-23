@@ -3,6 +3,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ensureDirs } from "./store.js";
 import {
+  attachAgentSchema,
+  attachAgentTool,
+  detachAgentSchema,
+  detachAgentTool,
   heartbeatSchema,
   heartbeatTool,
   listAgentsSchema,
@@ -89,6 +93,20 @@ async function main() {
     "Block (max 60s) until a new message appears on the given source, then return it.",
     waitForMessageSchema,
     async (args) => jsonResult(await waitForMessageTool(args))
+  );
+
+  server.tool(
+    "attach_agent",
+    "Start the tmux-push transport for an agent: spawns hooks/tmux-pusher.mjs as a background process so peer DMs (and optionally room messages) get typed into the agent's tmux pane in real time. tmuxTarget defaults to the MCP server's own $TMUX_PANE if this server is running inside tmux. allowlist restricts which peer agentIds can push. Updates list_agents to show transport=tmux-push.",
+    attachAgentSchema,
+    async (args) => jsonResult(await attachAgentTool(args))
+  );
+
+  server.tool(
+    "detach_agent",
+    "Stop the tmux-push transport for an agent: kills the pusher process and clears the transport marker.",
+    detachAgentSchema,
+    async (args) => jsonResult(await detachAgentTool(args))
   );
 
   const transport = new StdioServerTransport();

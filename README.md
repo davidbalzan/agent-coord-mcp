@@ -62,6 +62,8 @@ If you're building an agent with the official MCP SDKs (`@modelcontextprotocol/s
 | `read_messages({agentId, source, limit?, peek?, sinceTs?})` | Read new messages. `source` is `inbox`/`room`/`status`. Advances cursor unless `peek:true`. |
 | `post_status({agentId, status, detail?})` | Append to the shared status stream (separate from chat). |
 | `wait_for_message({agentId, source, timeoutMs?})` | Block (max 60s) until a new entry appears, then return it. |
+| `attach_agent({agentId, tmuxTarget?, includeRoom?, allowlist?, debounceMs?})` | Start the **tmux-push transport** for this agent — spawns `hooks/tmux-pusher.mjs` so peer DMs get typed into the agent's tmux pane in real time. `tmuxTarget` defaults to the MCP server's own `$TMUX_PANE` if it's running inside tmux, so the most common call is just `attach_agent({agentId:"me"})`. Updates `list_agents` to show `transport: "tmux-push"`. See [tmux push](#active-push-via-tmux-any-cli-agent). |
+| `detach_agent({agentId})` | Stop the tmux-push transport: kill the pusher and clear the transport marker. |
 | `prune({olderThanDays?, removeOrphanInboxes?, dryRun?})` | Trim room/status/inbox JSONL to entries newer than N days (default 7). Removes inbox files for agents no longer in the registry. Pass `dryRun:true` to preview. |
 
 ## Convention for agent IDs
@@ -164,6 +166,56 @@ Add to your project or user `settings.json`:
 Set `AGENT_COORD_ID` to whatever you passed to `register({agentId})`. Set `AGENT_COORD_INCLUDE_ROOM=1` to also drain the shared room. Set `AGENT_COORD_DIR` if you've relocated the state directory.
 
 Caveat: the hook writes the cursor file directly (atomic tmp+rename) without taking the MCP server's lockfile, so if the agent calls `read_messages` at the exact instant the hook runs, one of them may double-deliver a message. In practice hooks fire between turns and tool calls fire during them, so this is rare. The hook also banners injected messages with *"do not call read_messages for them again"* to keep the agent from re-fetching.
+
+## Active push via tmux (any CLI agent)
+
+Hooks are reactive — they only fire when the agent is already taking a turn. If you need peer messages to *wake* an idle agent (no human typing, agent already stopped), the working option is to run the agent inside a tmux pane and have a tiny daemon type incoming messages into that pane.
+
+This works with **any line-driven CLI agent** — Claude Code, Aider, codex, gemini-cli, opencode — because the daemon doesn't know what's on the receiving end, it just calls `tmux send-keys`.
+
+Three ways to wire it, pick whichever fits:
+
+**1. From inside the agent itself (cleanest).** If your agent is already running inside tmux (started by you, attached to your terminal), it can just call the MCP tool on itself:
+
+```
+attach_agent({ agentId: "me" })
+```
+
+With no `tmuxTarget`, the tool reads `$TMUX_PANE` from the MCP server's env — which works as long as the MCP server was spawned by a client running inside tmux. From that moment on, any `send_message({to:"me"})` from a peer gets typed into your pane within ~1s. Call `detach_agent({agentId:"me"})` to stop.
+
+**2. From another agent / script, targeting an existing pane.** Get the pane id from inside the target session (`tmux display-message -p '#{pane_id}'` → e.g. `%42`) and pass it explicitly:
+
+```
+attach_agent({ agentId: "frontend", tmuxTarget: "%42", allowlist: ["backend","worker"] })
+```
+
+**3. Spawn the agent CLI from scratch (for worker agents).** The included scripts create the tmux session, launch the agent CLI in it, and start the pusher:
+
+```sh
+# Claude Code
+scripts/spawn-agent.sh --id frontend --cmd "claude"
+
+# Aider, with peer allowlist
+scripts/spawn-agent.sh --id backend --cmd "aider --model sonnet" \
+  --include-room --allowlist frontend,worker
+
+# Attach to watch / interact
+tmux attach -t coord-frontend
+
+# Tear it all down
+scripts/stop-agent.sh --id frontend
+```
+
+Either way, `list_agents` will show the agent with `transport: "tmux-push"` so peers know it's responsive in real time vs. turn-bound. Stale markers (pusher died) are detected via pid liveness and pruned automatically on the next `list_agents`.
+
+Under the hood: [`hooks/tmux-pusher.mjs`](./hooks/tmux-pusher.mjs) is the daemon. It watches `~/agent-coord/inbox/<id>.jsonl` (and optionally `room.jsonl`), debounces bursts (1s default), drops self-posts and `/`-prefixed text, optionally enforces the peer allowlist, then pastes batches via `tmux load-buffer` → `paste-buffer -d` → `send-keys Enter`. Single-flight so two batches never overlap.
+
+**Caveats — read these.**
+
+- **Don't run the `peek-coord.mjs` hooks for the same agent** while the pusher is active. Both share the cursor file and will race / double-deliver.
+- The pusher pastes into the pane unconditionally. If you're typing in the same pane it will corrupt your buffer; if the agent is showing a `[y/n]` permission prompt, the message becomes the answer. Run the receiving agent in a pane you don't normally edit in.
+- Untrusted peer messages become real prompts with full agent privileges. Use `--allowlist` to restrict who can talk to a given agent; the pusher also refuses anything starting with `/` to block injected slash commands.
+- Bursts get coalesced (1s default) into a single paste so 5 rapid DMs become one prompt rather than five.
 
 ### Other clients
 

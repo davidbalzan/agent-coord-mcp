@@ -12,14 +12,35 @@ export const ROOM_FILE = path.join(ROOT, "room.jsonl");
 export const STATUS_FILE = path.join(ROOT, "status.jsonl");
 export const INBOX_DIR = path.join(ROOT, "inbox");
 export const CURSOR_DIR = path.join(ROOT, "cursors");
+export const TRANSPORT_DIR = path.join(ROOT, "transports");
+export const PID_DIR = path.join(ROOT, "pids");
+export const LOG_DIR = path.join(ROOT, "logs");
 
 export function ensureDirs(): void {
-  for (const d of [ROOT, INBOX_DIR, CURSOR_DIR]) {
+  for (const d of [ROOT, INBOX_DIR, CURSOR_DIR, TRANSPORT_DIR, PID_DIR, LOG_DIR]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
   }
   for (const f of [ROOM_FILE, STATUS_FILE]) {
     if (!existsSync(f)) mkdirSync(path.dirname(f), { recursive: true });
   }
+}
+
+export function transportFile(agentId: string): string {
+  return path.join(TRANSPORT_DIR, `${sanitize(agentId)}.json`);
+}
+
+export function pidFile(agentId: string, kind: string): string {
+  return path.join(PID_DIR, `${kind}-${sanitize(agentId)}.pid`);
+}
+
+export function logFile(agentId: string, kind: string): string {
+  return path.join(LOG_DIR, `${kind}-${sanitize(agentId)}.log`);
+}
+
+export async function listTransportFiles(): Promise<string[]> {
+  if (!existsSync(TRANSPORT_DIR)) return [];
+  const names = await fs.readdir(TRANSPORT_DIR);
+  return names.filter((n) => n.endsWith(".json"));
 }
 
 async function ensureFile(file: string): Promise<void> {
