@@ -98,6 +98,26 @@ export async function registerTool(args: { agentId: string; project?: string; ro
   return { ok: true, agent: reg[args.agentId] };
 }
 
+// ---------- unregister ----------
+
+export const unregisterSchema = { agentId: z.string().min(1) };
+
+export async function unregisterTool(args: { agentId: string }) {
+  // If a transport is attached, take it down first so the pusher doesn't keep
+  // re-publishing the marker after we drop the registry entry.
+  const detach = await detachAgentTool(args);
+
+  let existed = false;
+  await updateJson<AgentRegistry>(AGENTS_FILE, {}, (current) => {
+    if (current[args.agentId]) {
+      existed = true;
+      delete current[args.agentId];
+    }
+    return current;
+  });
+  return { ok: true, removed: existed, detach };
+}
+
 // ---------- heartbeat ----------
 
 export const heartbeatSchema = { agentId: z.string().min(1) };
@@ -123,8 +143,18 @@ export const listAgentsSchema = {} as const;
 export async function listAgentsTool() {
   const now = Date.now();
   const evicted: string[] = [];
+
+  // Load live transport markers first so we can refresh heartbeats for agents
+  // whose pusher (or other transport daemon) is alive — the live process IS
+  // the heartbeat, no separate ping needed.
+  const liveTransports = await loadLiveTransports();
+
   const reg = await updateJson<AgentRegistry>(AGENTS_FILE, {}, (current) => {
     for (const [id, entry] of Object.entries(current)) {
+      if (liveTransports.has(id)) {
+        entry.lastHeartbeat = now;
+        continue;
+      }
       if (now - entry.lastHeartbeat > EVICT_MS) {
         evicted.push(id);
         delete current[id];
@@ -133,17 +163,13 @@ export async function listAgentsTool() {
     return current;
   });
 
-  // Merge in live transport markers (e.g. tmux-push from the pusher daemon).
-  // A marker counts only if its pid is still alive; stale markers are pruned.
-  const liveTransports = await loadLiveTransports();
-
   const agents = Object.values(reg).map((a) => {
     const transport = liveTransports.get(a.agentId);
     const merged = [...(a.capabilities ?? [])];
     if (transport && !merged.includes(transport.transport)) merged.push(transport.transport);
     return {
       ...a,
-      online: now - a.lastHeartbeat < STALE_MS,
+      online: transport ? true : now - a.lastHeartbeat < STALE_MS,
       secondsSinceHeartbeat: Math.floor((now - a.lastHeartbeat) / 1000),
       capabilities: merged.length > 0 ? merged : undefined,
       transport: transport
@@ -556,7 +582,50 @@ export async function attachAgentTool(args: {
   // Use updateJson so it lockfile-protects and creates the file atomically.
   await updateJson<TransportMarker>(transportFile(args.agentId), marker, () => marker);
 
-  return { ok: true, agentId: args.agentId, transport: "tmux-push", tmuxTarget: target, pid, log };
+  // Best-effort scan for a peek-coord.mjs hook wired to the same agentId —
+  // both consumers share the cursor file and would race / double-deliver.
+  const conflictingHook = await detectPeekCoordHook(args.agentId);
+
+  return {
+    ok: true,
+    agentId: args.agentId,
+    transport: "tmux-push",
+    tmuxTarget: target,
+    pid,
+    log,
+    ...(conflictingHook
+      ? {
+          warnings: [
+            `peek-coord.mjs hook for agentId='${args.agentId}' detected in ${conflictingHook}. ` +
+              `Running both transports causes double-delivery — disable one. ` +
+              `Recommend removing the peek-coord hook entry since tmux-push supersedes it.`,
+          ],
+        }
+      : {}),
+  };
+}
+
+async function detectPeekCoordHook(agentId: string): Promise<string | undefined> {
+  const home = process.env.HOME ?? "";
+  const cwd = process.cwd();
+  const candidates = [
+    path.join(home, ".claude", "settings.json"),
+    path.join(home, ".claude", "settings.local.json"),
+    path.join(cwd, ".claude", "settings.json"),
+    path.join(cwd, ".claude", "settings.local.json"),
+  ];
+  for (const file of candidates) {
+    if (!existsSync(file)) continue;
+    try {
+      const raw = await fsp.readFile(file, "utf8");
+      if (raw.includes("peek-coord.mjs") && raw.includes(`AGENT_COORD_ID=${agentId}`)) {
+        return file;
+      }
+    } catch {
+      // unreadable, skip
+    }
+  }
+  return undefined;
 }
 
 export const detachAgentSchema = {
@@ -583,6 +652,93 @@ function resolvePusherPath(): string {
   // tools.js (compiled) lives in dist/; pusher lives in hooks/ at repo root.
   const here = path.dirname(fileURLToPath(import.meta.url));
   return path.resolve(here, "..", "hooks", "tmux-pusher.mjs");
+}
+
+// ---------- status / whoami ----------
+
+export const statusSchema = { agentId: z.string().min(1) };
+
+export async function statusTool(args: { agentId: string }) {
+  const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
+  const entry = reg[args.agentId];
+  const transports = await loadLiveTransports();
+  const transport = transports.get(args.agentId);
+  const inbox = await readJsonl<Message>(inboxFile(args.agentId));
+  const cursor = await readJson<Cursor>(cursorFile(args.agentId), {});
+  const inboxOffset = cursor.inboxOffset ?? 0;
+  const unread = Math.max(0, inbox.length - inboxOffset);
+  return {
+    agentId: args.agentId,
+    registered: !!entry,
+    entry,
+    attached: !!transport,
+    transport,
+    inboxDepth: inbox.length,
+    inboxUnread: unread,
+    inTmux: !!process.env.TMUX_PANE,
+    tmuxPane: process.env.TMUX_PANE,
+  };
+}
+
+// ---------- join (combo: register + auto-attach + read inbox) ----------
+
+const joinAttachOptionsSchema = z.object({
+  tmuxTarget: z.string().optional(),
+  includeRoom: z.boolean().optional(),
+  allowlist: z.array(z.string()).optional(),
+  debounceMs: z.number().int().positive().max(60_000).optional(),
+});
+
+export const joinSchema = {
+  agentId: z.string().min(1),
+  project: z.string().optional(),
+  role: z.string().optional(),
+  // attach: undefined → auto-attach if $TMUX_PANE is set; true → always try;
+  // false → never; object → attach with overrides.
+  attach: z.union([z.boolean(), joinAttachOptionsSchema]).optional(),
+  readInbox: z.boolean().optional(),
+};
+
+export async function joinTool(args: {
+  agentId: string;
+  project?: string;
+  role?: string;
+  attach?: boolean | { tmuxTarget?: string; includeRoom?: boolean; allowlist?: string[]; debounceMs?: number };
+  readInbox?: boolean;
+}) {
+  const reg = await registerTool({
+    agentId: args.agentId,
+    project: args.project,
+    role: args.role,
+  });
+
+  // Decide attach behavior.
+  const wantAttach = args.attach === false
+    ? false
+    : args.attach === true || typeof args.attach === "object"
+      ? true
+      : !!process.env.TMUX_PANE; // undefined → auto-detect
+
+  let attach: Awaited<ReturnType<typeof attachAgentTool>> | undefined;
+  if (wantAttach) {
+    const opts = typeof args.attach === "object" ? args.attach : {};
+    attach = await attachAgentTool({ agentId: args.agentId, ...opts });
+  }
+
+  const readInbox = args.readInbox ?? true;
+  let inbox: Awaited<ReturnType<typeof readMessagesTool>> | undefined;
+  if (readInbox) {
+    inbox = await readMessagesTool({ agentId: args.agentId, source: "inbox" });
+  }
+
+  return {
+    ok: true,
+    registered: reg.agent,
+    attached: !!attach && attach.ok !== false,
+    attach,
+    inbox,
+    inTmux: !!process.env.TMUX_PANE,
+  };
 }
 
 // ---------- helpers ----------

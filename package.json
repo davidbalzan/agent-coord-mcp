@@ -1,6 +1,6 @@
 {
   "name": "agent-coord-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "File-backed MCP server for coordinating multiple AI coding agents (Claude Code, Cursor, Cline, etc.) on the same machine.",
   "type": "module",
   "bin": {
@@ -16,6 +16,7 @@
     "dist",
     "src",
     "hooks",
+    "scripts",
     "README.md",
     "LICENSE"
   ],

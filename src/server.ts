@@ -9,6 +9,8 @@ import {
   detachAgentTool,
   heartbeatSchema,
   heartbeatTool,
+  joinSchema,
+  joinTool,
   listAgentsSchema,
   listAgentsTool,
   postStatusSchema,
@@ -21,6 +23,10 @@ import {
   registerTool,
   sendMessageSchema,
   sendMessageTool,
+  statusSchema,
+  statusTool,
+  unregisterSchema,
+  unregisterTool,
   waitForMessageSchema,
   waitForMessageTool,
 } from "./tools.js";
@@ -40,10 +46,31 @@ async function main() {
   });
 
   server.tool(
+    "join",
+    "Recommended session-start call. Does register + auto-attach (if running inside tmux) + read inbox in one round-trip. Pass attach=false to skip the transport, attach={...overrides} to customize, or omit it to let the server auto-detect $TMUX_PANE. Returns the registration, attach result, and any unread inbox messages.",
+    joinSchema,
+    async (args) => jsonResult(await joinTool(args))
+  );
+
+  server.tool(
     "register",
-    "Register this agent in the shared registry. Call once per session.",
+    "Register this agent in the shared registry. Lower-level than `join` — does not attach a transport or drain the inbox. Prefer `join` unless you need explicit control.",
     registerSchema,
     async (args) => jsonResult(await registerTool(args))
+  );
+
+  server.tool(
+    "unregister",
+    "Tear down this agent: detach any attached transport (kills the pusher) and remove the registry entry. Clean shutdown counterpart to `join`.",
+    unregisterSchema,
+    async (args) => jsonResult(await unregisterTool(args))
+  );
+
+  server.tool(
+    "status",
+    "Introspect this agent's coord state: registration, attached transport, inbox depth and unread count, and whether this MCP server is running inside tmux. Useful for debugging 'why isn't my DM landing'.",
+    statusSchema,
+    async (args) => jsonResult(await statusTool(args))
   );
 
   server.tool(

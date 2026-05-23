@@ -55,9 +55,12 @@ If you're building an agent with the official MCP SDKs (`@modelcontextprotocol/s
 
 | Tool | Purpose |
 | --- | --- |
-| `register({agentId, project?, role?})` | Announce yourself in `agents.json`. Call once per session. |
-| `heartbeat({agentId})` | Refresh your `lastHeartbeat`. |
-| `list_agents()` | See all known agents and which look online (heartbeat <5min). |
+| `join({agentId, project?, role?, attach?, readInbox?})` | **Recommended session-start call.** register + auto-attach (if `$TMUX_PANE` is set) + drain inbox in one round-trip. Pass `attach:false` to skip the transport, `attach:{...}` to override defaults, or omit to let the server auto-detect. |
+| `register({agentId, project?, role?})` | Lower-level: just the registry entry. Use `join` unless you need explicit control. |
+| `unregister({agentId})` | Clean shutdown: detaches any transport and drops the registry entry. |
+| `status({agentId})` | Introspect: registration, attached transport, inbox depth/unread, whether the MCP server is in tmux. Debug "why isn't my DM landing." |
+| `heartbeat({agentId})` | Manual heartbeat. Usually unnecessary — agents with a live transport get heartbeats auto-bumped on every `list_agents`. |
+| `list_agents()` | See all known agents, who looks online, and which `transport` (if any) they have attached. Validates transport pid liveness on every call. |
 | `send_message({from, to?, room?, text})` | If `to` set → that agent's inbox. Else → shared room. |
 | `read_messages({agentId, source, limit?, peek?, sinceTs?})` | Read new messages. `source` is `inbox`/`room`/`status`. Advances cursor unless `peek:true`. |
 | `post_status({agentId, status, detail?})` | Append to the shared status stream (separate from chat). |
@@ -66,11 +69,19 @@ If you're building an agent with the official MCP SDKs (`@modelcontextprotocol/s
 | `detach_agent({agentId})` | Stop the tmux-push transport: kill the pusher and clear the transport marker. |
 | `prune({olderThanDays?, removeOrphanInboxes?, dryRun?})` | Trim room/status/inbox JSONL to entries newer than N days (default 7). Removes inbox files for agents no longer in the registry. Pass `dryRun:true` to preview. |
 
-## Convention for agent IDs
+## First session checklist
 
-Use the project's directory name or a short stable slug (e.g. `frontend`, `api`, `worker`). Tell each agent — in its `CLAUDE.md`, system prompt, or however your client supports persistent instructions — something like:
+The ergonomic path is the `join` tool. Put this in each agent's `CLAUDE.md` (or equivalent persistent instruction):
 
-> Your coord agentId is `frontend`. On session start, call `register({agentId:"frontend"})` and `read_messages({agentId:"frontend", source:"inbox"})` to see if other agents have left you anything.
+> Your coord agentId is `frontend`. On session start, call `join({agentId:"frontend", project:"...", role:"..."})`. That registers you, drains any unread DMs, and — if you're running inside tmux — attaches the real-time `tmux-push` transport automatically so peers can wake you. On session end, call `unregister({agentId:"frontend"})`.
+
+That single call replaces the older three-step ritual (`register` + `read_messages` + `attach_agent`) and Just Works whether you're in tmux or not.
+
+If you need to override defaults (custom tmux target, peer allowlist, room delivery, etc.) pass an object: `join({agentId:"frontend", attach:{allowlist:["backend","worker"], includeRoom:true}})`. Pass `attach:false` to opt out entirely.
+
+### Convention for agent IDs
+
+Use the project's directory name or a short stable slug (e.g. `frontend`, `api`, `worker`).
 
 ## Tail it from a terminal
 
@@ -175,13 +186,15 @@ This works with **any line-driven CLI agent** — Claude Code, Aider, codex, gem
 
 Three ways to wire it, pick whichever fits:
 
-**1. From inside the agent itself (cleanest).** If your agent is already running inside tmux (started by you, attached to your terminal), it can just call the MCP tool on itself:
+**1. From inside the agent itself (cleanest).** If your agent is already running inside tmux (started by you, attached to your terminal), `join({agentId:"me"})` does this automatically. Or, if you've already registered and just want to add the transport:
 
 ```
 attach_agent({ agentId: "me" })
 ```
 
-With no `tmuxTarget`, the tool reads `$TMUX_PANE` from the MCP server's env — which works as long as the MCP server was spawned by a client running inside tmux. From that moment on, any `send_message({to:"me"})` from a peer gets typed into your pane within ~1s. Call `detach_agent({agentId:"me"})` to stop.
+With no `tmuxTarget`, the tool reads `$TMUX_PANE` from the MCP server's env. **Important:** this only works when the MCP server itself was launched from inside the same tmux pane as the agent — i.e. spawned as a stdio subprocess by your CLI client. If you're running the MCP server as a system daemon, under launchd/systemd, or under a different terminal multiplexer, `$TMUX_PANE` won't be set (or will point at the wrong pane) and you'll hit a confusing "attached but nothing arrives" failure mode. Pass `tmuxTarget` explicitly in those cases.
+
+From the moment attach succeeds, any `send_message({to:"me"})` from a peer gets typed into your pane within ~1s. Call `detach_agent({agentId:"me"})` (or just `unregister({agentId:"me"})`) to stop.
 
 **2. From another agent / script, targeting an existing pane.** Get the pane id from inside the target session (`tmux display-message -p '#{pane_id}'` → e.g. `%42`) and pass it explicitly:
 
