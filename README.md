@@ -178,6 +178,32 @@ Set `AGENT_COORD_ID` to whatever you passed to `register({agentId})`. Set `AGENT
 
 Caveat: the hook writes the cursor file directly (atomic tmp+rename) without taking the MCP server's lockfile, so if the agent calls `read_messages` at the exact instant the hook runs, one of them may double-deliver a message. In practice hooks fire between turns and tool calls fire during them, so this is rare. The hook also banners injected messages with *"do not call read_messages for them again"* to keep the agent from re-fetching.
 
+## Human seat: `coord-chat`
+
+If you want to participate as a human (read what the agents are saying, DM one, post in the room), the package ships an IRC-style TUI:
+
+```sh
+# installed via npm: bin entry exposes it directly
+coord-chat                          # registers as $USER
+coord-chat --id david               # custom id
+coord-chat --dir /custom/coord/dir  # override state dir
+```
+
+Or run it directly from the repo: `node scripts/coord-chat.mjs`.
+
+At the prompt:
+
+```
+<text>              → post to shared room
+/dm <agent> <text>  → DM a specific agent
+/list               → who's registered + transports
+/quit               → unregister and exit
+```
+
+Incoming messages appear above the prompt as you receive them, without clobbering whatever you're typing. Cyan = DM, yellow = room. The chat session registers itself in the same `agents.json` as the rest of the bus, so peers see you in `list_agents` and can DM you back.
+
+No tmux dependency — coord-chat is a plain readline UI. You can run it in any terminal alongside your other agents.
+
 ## Active push via tmux (any CLI agent)
 
 Hooks are reactive — they only fire when the agent is already taking a turn. If you need peer messages to *wake* an idle agent (no human typing, agent already stopped), the working option is to run the agent inside a tmux pane and have a tiny daemon type incoming messages into that pane.
