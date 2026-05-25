@@ -10,21 +10,31 @@
 // Optional env: AGENT_COORD_DIR (default ~/agent-coord)
 // Optional env: AGENT_COORD_INCLUDE_ROOM=1 to also drain the shared room
 
-import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
 const MODE = (process.argv.find((a) => a.startsWith("--mode="))?.slice(7)) ?? "user-prompt";
-const AGENT_ID = process.env.AGENT_COORD_ID;
-if (!AGENT_ID) {
-  // No agent id configured — silently no-op so the hook never blocks the user.
-  process.exit(0);
-}
 
 const ROOT =
   process.env.AGENT_COORD_DIR ??
   process.env.CLAUDE_COORD_DIR ??
   path.join(homedir(), "agent-coord");
+
+// Prefer the agentId that is actually attached to this tmux pane (via the
+// transports/ registry) over the env-provided one. This is what lets the
+// generic settings.json hook command — which derives AGENT_COORD_ID from the
+// cwd basename — still resolve to the agent that registered with a custom id
+// (e.g. "claude-david" rather than "linkaroo.io"). Without this, peek reads
+// the wrong cursor + inbox files and the m.from === AGENT_ID self-filter
+// below never matches the agent's own room posts.
+const AGENT_ID = resolveAgentId();
+if (!AGENT_ID) {
+  // No agent id configured and no tmux transport match — silently no-op so
+  // the hook never blocks the user.
+  process.exit(0);
+}
+
 const INBOX = path.join(ROOT, "inbox", `${sanitize(AGENT_ID)}.jsonl`);
 const ROOM = path.join(ROOT, "room.jsonl");
 const CURSOR = path.join(ROOT, "cursors", `${sanitize(AGENT_ID)}.json`);
@@ -106,4 +116,32 @@ function writeJsonAtomic(file, data) {
 
 function sanitize(id) {
   return id.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function resolveAgentId() {
+  const pane = process.env.TMUX_PANE;
+  if (pane) {
+    const fromTransport = lookupAgentByPane(pane);
+    if (fromTransport) return fromTransport;
+  }
+  return process.env.AGENT_COORD_ID || null;
+}
+
+function lookupAgentByPane(pane) {
+  const dir = path.join(ROOT, "transports");
+  if (!existsSync(dir)) return null;
+  let entries;
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    const data = readJson(path.join(dir, name), null);
+    if (data && data.tmuxTarget === pane && typeof data.agentId === "string") {
+      return data.agentId;
+    }
+  }
+  return null;
 }
