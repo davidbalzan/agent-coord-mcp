@@ -552,6 +552,10 @@ export async function attachAgentTool(args: {
   await fsp.mkdir(path.dirname(transportFile(args.agentId)), { recursive: true });
   const out = openSync(log, "a");
   const err = openSync(log, "a");
+  // Default: deliver room broadcasts too. The bus is chat-first — silence on
+  // a room post is a worse failure mode than a slightly noisier pane. Callers
+  // who want DM-only can pass includeRoom:false explicitly.
+  const includeRoom = args.includeRoom !== false;
   const child = spawn("node", [pusher], {
     detached: true,
     stdio: ["ignore", out, err],
@@ -559,7 +563,7 @@ export async function attachAgentTool(args: {
       ...process.env,
       AGENT_COORD_ID: args.agentId,
       AGENT_COORD_TMUX_TARGET: target,
-      ...(args.includeRoom ? { AGENT_COORD_INCLUDE_ROOM: "1" } : {}),
+      ...(includeRoom ? { AGENT_COORD_INCLUDE_ROOM: "1" } : {}),
       ...(args.allowlist && args.allowlist.length > 0
         ? { AGENT_COORD_ALLOWLIST: args.allowlist.join(",") }
         : {}),

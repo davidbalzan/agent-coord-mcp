@@ -14,7 +14,8 @@
 # Flags:
 #   --id <agentId>          coord agentId, also names the tmux session (coord-<id>)
 #   --cmd "<command>"       agent CLI to run in pane 0 (quote it)
-#   --include-room          also push shared-room messages into the pane
+#   --no-include-room       skip shared-room delivery (DMs only). Room is on by default.
+#   --include-room          deprecated no-op, kept for back-compat (room is on by default)
 #   --allowlist a,b,c       only deliver DMs from these peer agentIds
 #   --dir <path>            override AGENT_COORD_DIR
 #
@@ -25,7 +26,8 @@ set -euo pipefail
 
 ID=""
 CMD=""
-INCLUDE_ROOM=""
+# Room delivery is on by default; pass --no-include-room to opt out.
+INCLUDE_ROOM="1"
 ALLOWLIST=""
 COORD_DIR=""
 
@@ -33,7 +35,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --id) ID="$2"; shift 2 ;;
     --cmd) CMD="$2"; shift 2 ;;
-    --include-room) INCLUDE_ROOM="1"; shift ;;
+    --include-room) INCLUDE_ROOM="1"; shift ;;         # kept for back-compat
+    --no-include-room) INCLUDE_ROOM=""; shift ;;
     --allowlist) ALLOWLIST="$2"; shift 2 ;;
     --dir) COORD_DIR="$2"; shift 2 ;;
     -h|--help)

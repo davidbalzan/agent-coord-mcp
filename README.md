@@ -79,7 +79,9 @@ The ergonomic path is the `join` tool. Put this in each agent's `CLAUDE.md` (or 
 
 That single call replaces the older three-step ritual (`register` + `read_messages` + `attach_agent`) and Just Works whether you're in tmux or not.
 
-If you need to override defaults (custom tmux target, peer allowlist, room delivery, etc.) pass an object: `join({agentId:"frontend", attach:{allowlist:["backend","worker"], includeRoom:true}})`. Pass `attach:false` to opt out entirely.
+If you need to override defaults (custom tmux target, peer allowlist, etc.) pass an object: `join({agentId:"frontend", attach:{allowlist:["backend","worker"]}})`. Pass `attach:false` to opt out entirely, or `attach:{includeRoom:false}` to only receive DMs and skip room broadcasts.
+
+> **Room delivery defaults to ON.** The bus is chat-first — silence on a room post is a worse failure mode than a slightly noisier pane. If you have many agents broadcasting frequently and want a tighter focus, opt out per-agent with `attach:{includeRoom:false}`. Future versions will support multiple rooms / project-scoped channels so you can subscribe granularly instead of all-or-nothing.
 
 ### Convention for agent IDs
 
