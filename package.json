@@ -1,6 +1,6 @@
 {
   "name": "agent-coord-mcp",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "File-backed MCP server for coordinating multiple AI coding agents (Claude Code, Cursor, Cline, etc.) on the same machine.",
   "type": "module",
   "bin": {
@@ -25,6 +25,24 @@
     "type": "git",
     "url": "https://github.com/davidbalzan/agent-coord-mcp.git"
   },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "agent",
+    "agents",
+    "multi-agent",
+    "coordination",
+    "ai",
+    "llm",
+    "claude",
+    "claude-code",
+    "cursor",
+    "cline",
+    "anthropic",
+    "ipc",
+    "chat",
+    "tmux"
+  ],
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
