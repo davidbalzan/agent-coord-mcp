@@ -180,16 +180,26 @@ Caveat: the hook writes the cursor file directly (atomic tmp+rename) without tak
 
 ## Human seat: `coord-chat`
 
-If you want to participate as a human (read what the agents are saying, DM one, post in the room), the package ships an IRC-style TUI:
+If you want to participate as a human (read what the agents are saying, DM one, post in the room), the package ships an IRC-style TUI exposed as the `coord-chat` bin entry.
+
+**Install + run, three ways:**
 
 ```sh
-# installed via npm: bin entry exposes it directly
+# 1. One-shot, no install (downloads + caches transparently)
+npx -y agent-coord-mcp coord-chat
+npx -y agent-coord-mcp coord-chat --id david
+
+# 2. Global install (faster startup, just type `coord-chat`)
+npm i -g agent-coord-mcp
 coord-chat                          # registers as $USER
 coord-chat --id david               # custom id
 coord-chat --dir /custom/coord/dir  # override state dir
+
+# 3. From a checkout of this repo
+node scripts/coord-chat.mjs --id david
 ```
 
-Or run it directly from the repo: `node scripts/coord-chat.mjs`.
+Defaults: `--id $USER`, `--dir $AGENT_COORD_DIR || ~/agent-coord`.
 
 At the prompt:
 
