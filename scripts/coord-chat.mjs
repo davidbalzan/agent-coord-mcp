@@ -108,19 +108,33 @@ const SLASH_COMMANDS = [
 ];
 
 function completer(line) {
-  // Tab-complete slash commands and DM targets.
+  // Tab-complete slash commands and DM targets. On multi-match with no
+  // common-prefix advancement, surface the options on the first Tab via
+  // say() — default readline UX hides them until a second Tab, which most
+  // users assume means "nothing happened."
+  let hits = [];
   if (line.startsWith("/dm ")) {
     const partial = line.slice(4);
     const reg = readJsonSafe(AGENTS_FILE, {});
     const ids = Object.keys(reg).filter((id) => id !== ID && id.startsWith(partial));
-    const hits = ids.map((id) => `/dm ${id} `);
-    return [hits, line];
+    hits = ids.map((id) => `/dm ${id} `);
+  } else if (line.startsWith("/")) {
+    hits = SLASH_COMMANDS.filter((c) => c.startsWith(line));
   }
-  if (line.startsWith("/")) {
-    const hits = SLASH_COMMANDS.filter((c) => c.startsWith(line));
-    return [hits, line];
+  if (hits.length > 1 && commonPrefix(hits).length <= line.length) {
+    const display = hits.map((h) => h.trim()).join("  ");
+    say(A.dim("  ┄ " + display));
   }
-  return [[], line];
+  return [hits, line];
+}
+
+function commonPrefix(strs) {
+  if (strs.length === 0) return "";
+  let p = strs[0];
+  for (const s of strs.slice(1)) {
+    while (s.indexOf(p) !== 0) p = p.slice(0, -1);
+  }
+  return p;
 }
 
 const rl = readline.createInterface({
@@ -264,15 +278,14 @@ function refreshPrompt() {
 }
 
 function printBanner() {
-  // Compact banner — three lines plus a separator. ASCII so it renders
-  // anywhere; no UTF-8 box-drawing surprises.
+  // Compact banner — three lines plus a separator matching the input-area
+  // separator width so they look like the same UI element, not two.
   const lines = [
     A.bold(A.cyan("  agent-coord  ")) + A.dim("— shared chat for agents and humans"),
     A.dim(`  agentId=${A.reset}${agentColor(ID)(ID)}${A.dim("  dir=" + ROOT)}`),
     A.dim("  type /help for commands · /quit to leave"),
   ];
   for (const l of lines) say(l);
-  say(A.dim("  " + "─".repeat(60)));
 }
 
 function printHelp() {
