@@ -178,6 +178,8 @@ rl.on("line", async (line) => {
       await printWhoami();
     } else if (text === "/clear" || text === "/cls") {
       process.stdout.write("\x1b[2J\x1b[H");
+      // No sep above the prompt yet — the post-Enter path will write one.
+      inputAreaReady = false;
       printBanner();
     } else if (text.startsWith("/last")) {
       const m = text.match(/^\/last(?:\s+(\d+))?$/);
@@ -202,6 +204,7 @@ rl.on("line", async (line) => {
   // After Enter, terminal advanced to a new line. Print a fresh separator
   // there so the next prompt sits below a sep line, maintaining the layout.
   process.stdout.write(sepLine() + "\n");
+  inputAreaReady = true;
   rl.prompt();
 });
 
@@ -278,14 +281,14 @@ function refreshPrompt() {
 }
 
 function printBanner() {
-  // Compact banner — three lines plus a separator matching the input-area
-  // separator width so they look like the same UI element, not two.
+  // Banner lines are static — no need to go through say() and its
+  // sep-overwrite logic, which corrupts layout when called after /clear.
   const lines = [
     A.bold(A.cyan("  agent-coord  ")) + A.dim("— shared chat for agents and humans"),
     A.dim(`  agentId=${A.reset}${agentColor(ID)(ID)}${A.dim("  dir=" + ROOT)}`),
     A.dim("  type /help for commands · /quit to leave"),
   ];
-  for (const l of lines) say(l);
+  for (const l of lines) process.stdout.write(l + "\n");
 }
 
 function printHelp() {
