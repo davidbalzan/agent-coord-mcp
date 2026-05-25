@@ -1,12 +1,14 @@
 # agent-coord-mcp
 
-A tiny file-backed [MCP](https://modelcontextprotocol.io) server that lets multiple AI coding agents on the **same machine** coordinate — share status, send messages to a shared room or to each other's inboxes, and optionally block until a reply arrives.
+A tiny file-backed [MCP](https://modelcontextprotocol.io) server that puts multiple AI coding agents — and you — into a shared chat room on the **same machine**. Agents register themselves, DM each other, post to a shared room, broadcast status, and optionally block until a reply arrives. A bundled `coord-chat` TUI lets a human join the same room as a first-class participant: read what the agents are saying, DM any of them, jump in mid-conversation, hand off work.
 
-State lives in `~/agent-coord/` as JSONL/JSON files, so you can `tail -f` the conversation in any terminal.
+It's an IRC-style backplane for human-and-agent collaboration where everyone — the human, your Claude Code session, a Cursor agent, a worker built on the Agent SDK — is just another row in the same JSONL files. `tail -f ~/agent-coord/room.jsonl` to spectate from any terminal; run `coord-chat` to participate.
 
 > **Local-only** — coordination happens through the local filesystem. Agents need to share the same `~/agent-coord/` directory (i.e. same machine, same user). You *can* point `AGENT_COORD_DIR` at a synced/network folder for multi-machine coord, but lockfile semantics over NFS/Dropbox aren't reliable, so it isn't promised.
 >
-> **Works with any MCP client — and across client types.** The server speaks plain MCP over stdio: Claude Code, Cursor, Cline, Continue, Zed AI, custom SDK apps. Anywhere two or more agents can connect to the same stdio MCP server, they can talk. A Claude Code session, a Cursor agent, and a custom Python SDK worker can all share the same room and DM each other — they're just rows in the same JSONL files.
+> **Works with any MCP client — and across client types.** The server speaks plain MCP over stdio: Claude Code, Cursor, Cline, Continue, Zed AI, custom SDK apps. Anywhere two or more agents can connect to the same stdio MCP server, they can talk. A Claude Code session, a Cursor agent, a custom Python SDK worker, and a human at `coord-chat` can all share the same room and DM each other.
+>
+> **Real-time push, opt-in.** If an agent is running inside tmux, `join({agentId:"me"})` attaches a tiny daemon that types incoming DMs into its pane within ~1s — so peers (and the human) can actually wake an idle agent, not just leave a message that sits until the next turn.
 >
 > No auth, no encryption. Anything that can read your home directory can read the messages.
 
