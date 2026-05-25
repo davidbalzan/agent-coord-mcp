@@ -22,11 +22,13 @@
 
 import {
   existsSync,
+  readdirSync,
   readFileSync,
   writeFileSync,
   appendFileSync,
   renameSync,
   mkdirSync,
+  unlinkSync,
   watch,
 } from "node:fs";
 import { promises as fsp } from "node:fs";
@@ -87,10 +89,13 @@ const TTY = !!process.stdout.isTTY;
 let COLS = process.stdout.columns || 80;
 const sepLine = () => A.dim("─".repeat(Math.max(10, COLS)));
 
-// inputAreaReady flips to true after the banner + initial drain finish and
-// we lay down the first separator. From that point say() treats the line
-// above the prompt as a separator slot it owns.
-let inputAreaReady = false;
+// `lastLineWasSep` tracks whether the line directly above the cursor is a
+// separator that we own. When true, say() is delivering an async message —
+// it should move up, overwrite the sep with the message, drop a fresh sep,
+// re-prompt with preserved input. When false (e.g. just after the user
+// pressed Enter), say() is printing synchronous command output — it should
+// write naturally and let the post-Enter logic re-establish the input area.
+let lastLineWasSep = false;
 
 if (TTY) {
   process.stdout.on("resize", () => {
@@ -103,9 +108,12 @@ if (TTY) {
 }
 
 const SLASH_COMMANDS = [
-  "/dm", "/list", "/who", "/whoami", "/last", "/clear", "/cls",
-  "/me", "/help", "/?", "/quit", "/exit",
+  "/dm", "/list", "/who", "/whoami", "/last", "/find", "/clear", "/cls",
+  "/me", "/status", "/prune", "/kick", "/wipe-room",
+  "/help", "/?", "/quit", "/exit",
 ];
+
+const STATUS_FILE_PATH = path.join(ROOT, "status.jsonl");
 
 function completer(line) {
   // Tab-complete slash commands and DM targets. On multi-match with no
@@ -148,10 +156,11 @@ const rl = readline.createInterface({
 printBanner();
 await drainAndPrint();
 
-// Lay down the first separator, then activate input-area mode so subsequent
-// say() calls maintain a sep line directly above the prompt.
+// Lay down the first separator. From this point, async incoming messages
+// (via the watcher → drainAndPrint → say) know they can use the cursor
+// games to slot themselves above the prompt.
 process.stdout.write(sepLine() + "\n");
-inputAreaReady = true;
+lastLineWasSep = true;
 
 try { watch(INBOX_FILE, () => void drainAndPrint()); } catch {}
 try { watch(ROOM_FILE, () => void drainAndPrint()); } catch {}
@@ -164,6 +173,9 @@ rl.prompt();
 rl.on("line", async (line) => {
   const text = line.trim();
   if (!text) return rl.prompt();
+  // The user's typed-and-submitted line is now in scrollback; it is NOT a
+  // separator slot we own. Sync output from commands should write naturally.
+  lastLineWasSep = false;
   try {
     if (text === "/quit" || text === "/exit") {
       await unregister();
@@ -178,8 +190,8 @@ rl.on("line", async (line) => {
       await printWhoami();
     } else if (text === "/clear" || text === "/cls") {
       process.stdout.write("\x1b[2J\x1b[H");
-      // No sep above the prompt yet — the post-Enter path will write one.
-      inputAreaReady = false;
+      // The post-Enter sep write below re-establishes the input area.
+      lastLineWasSep = false;
       printBanner();
     } else if (text.startsWith("/last")) {
       const m = text.match(/^\/last(?:\s+(\d+))?$/);
@@ -193,6 +205,24 @@ rl.on("line", async (line) => {
       const m = text.match(/^\/dm\s+(\S+)\s+([\s\S]+)$/);
       if (!m) say(A.red("usage: /dm <agentId> <text>"));
       else await sendDm(m[1], m[2]);
+    } else if (text.startsWith("/status")) {
+      const status = text.slice(7).trim();
+      if (!status) say(A.red("usage: /status <text>"));
+      else await postStatus(status);
+    } else if (text.startsWith("/prune")) {
+      const m = text.match(/^\/prune(?:\s+(\d+))?$/);
+      const days = m && m[1] ? parseInt(m[1], 10) : 7;
+      await pruneOld(days);
+    } else if (text.startsWith("/kick ")) {
+      const target = text.slice(6).trim();
+      if (!target) say(A.red("usage: /kick <agentId>"));
+      else await kickAgent(target);
+    } else if (text === "/wipe-room") {
+      await wipeRoom();
+    } else if (text.startsWith("/find ")) {
+      const term = text.slice(6).trim();
+      if (!term) say(A.red("usage: /find <text>"));
+      else await findInHistory(term);
     } else if (text.startsWith("/")) {
       say(A.red(`unknown command: ${text.split(" ")[0]}`) + A.dim("  (try /help)"));
     } else {
@@ -201,10 +231,11 @@ rl.on("line", async (line) => {
   } catch (e) {
     say(A.red(`error: ${e?.message ?? e}`));
   }
-  // After Enter, terminal advanced to a new line. Print a fresh separator
-  // there so the next prompt sits below a sep line, maintaining the layout.
+  // Re-establish the input area: separator above, prompt below. Sets
+  // lastLineWasSep so any async incoming messages from here on can use the
+  // cursor-game path to slot in above the prompt.
   process.stdout.write(sepLine() + "\n");
-  inputAreaReady = true;
+  lastLineWasSep = true;
   rl.prompt();
 });
 
@@ -242,17 +273,22 @@ function sanitize(s) {
 }
 
 function say(line) {
-  if (!inputAreaReady) {
+  if (lastLineWasSep) {
+    // Async path: a separator we own sits directly above the prompt; we own
+    // that line. Replace it with the incoming message, drop a new sep, and
+    // re-render the prompt so user input is preserved.
+    process.stdout.write("\x1b[1A\r\x1b[2K");
     process.stdout.write(line + "\n");
-    return;
+    process.stdout.write(sepLine() + "\n");
+    if (typeof rl !== "undefined") rl.prompt(true);
+    // lastLineWasSep stays true — there's still a sep above the prompt.
+  } else {
+    // Sync path: no separator above us (startup banner, post-Enter command
+    // output). Just write the line at the current cursor.
+    readline.clearLine(process.stdout, 0);
+    readline.cursorTo(process.stdout, 0);
+    process.stdout.write(line + "\n");
   }
-  // We're on the prompt line. The line above is the current separator.
-  // Move up to it, clear it, drop our message there, then a fresh separator,
-  // then re-render the prompt on the next line.
-  process.stdout.write("\x1b[1A\r\x1b[2K");
-  process.stdout.write(line + "\n");
-  process.stdout.write(sepLine() + "\n");
-  if (typeof rl !== "undefined") rl.prompt(true);
 }
 
 function makePrompt() {
@@ -296,10 +332,17 @@ function printHelp() {
     ["<text>",              "post to the shared room"],
     ["/dm <agent> <text>",  "send a direct message"],
     ["/me <action>",        "post an IRC-style action (* you wave)"],
+    ["/status <text>",      "post to the status broadcast channel"],
     ["/list, /who",         "show registered agents + transports"],
     ["/whoami",             "show your registration + transport"],
     ["/last [n]",           "show last n messages (default 20)"],
+    ["/find <text>",        "search recent inbox + room history"],
     ["/clear",              "clear the screen"],
+    [A.dim("--- admin ---"), ""],
+    ["/prune [days]",       "drop messages older than N days (default 7)"],
+    ["/kick <agent>",       "unregister an agent + kill their pusher"],
+    ["/wipe-room",          "truncate the shared room (destructive)"],
+    [A.dim("---"),          ""],
     ["/help, /?",           "this list"],
     ["/quit, /exit",        "unregister and leave"],
   ];
@@ -374,6 +417,85 @@ async function sendDm(to, text) {
   const target = path.join(INBOX_DIR, `${sanitize(to)}.jsonl`);
   await appendMessage(target, { from: ID, to, text });
   say(A.dim(`→ DM sent to ${to}`));
+}
+
+async function postStatus(status) {
+  await ensureFile(STATUS_FILE_PATH);
+  const entry = { id: randomUUID(), ts: Date.now(), agentId: ID, status };
+  appendFileSync(STATUS_FILE_PATH, JSON.stringify(entry) + "\n");
+  say(A.dim(`→ status posted: ${status}`));
+}
+
+async function pruneOld(days) {
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  let total = 0;
+  const files = [ROOM_FILE, STATUS_FILE_PATH];
+  if (existsSync(INBOX_DIR)) {
+    for (const n of readdirSync(INBOX_DIR)) {
+      if (n.endsWith(".jsonl")) files.push(path.join(INBOX_DIR, n));
+    }
+  }
+  for (const file of files) {
+    if (!existsSync(file)) continue;
+    const all = readJsonl(file);
+    const kept = all.filter((e) => e && e.ts > cutoff);
+    if (kept.length < all.length) {
+      const body = kept.length ? kept.map((e) => JSON.stringify(e)).join("\n") + "\n" : "";
+      writeFileSync(file, body);
+      total += all.length - kept.length;
+    }
+  }
+  say(A.dim(`→ pruned ${total} entries older than ${days}d`));
+}
+
+async function kickAgent(target) {
+  let existed = false;
+  await withLock(AGENTS_FILE, async () => {
+    const reg = readJsonSafe(AGENTS_FILE, {});
+    if (reg[target]) {
+      existed = true;
+      delete reg[target];
+      writeJsonAtomic(AGENTS_FILE, reg);
+    }
+  });
+  if (!existed) {
+    say(A.red(`agent '${target}' not registered`));
+    return;
+  }
+  // Best-effort: kill their pusher and remove the transport marker so they
+  // disappear immediately from list_agents instead of hanging around with a
+  // live transport pointer.
+  const markerPath = path.join(TRANSPORT_DIR, `${sanitize(target)}.json`);
+  const marker = readJsonSafe(markerPath, null);
+  if (marker?.pid) {
+    try { process.kill(marker.pid, "SIGTERM"); } catch {}
+  }
+  try { if (existsSync(markerPath)) unlinkSync(markerPath); } catch {}
+  say(A.dim(`→ kicked ${target} (registry + transport cleared)`));
+}
+
+async function wipeRoom() {
+  await ensureFile(ROOM_FILE);
+  writeFileSync(ROOM_FILE, "");
+  // Reset cursors so prior offsets don't point past the now-shorter file.
+  const cur = readJsonSafe(CURSOR_FILE, {});
+  if (cur.roomOffset !== undefined) {
+    delete cur.roomOffset;
+    writeJsonAtomic(CURSOR_FILE, cur);
+  }
+  say(A.dim("→ room wiped"));
+}
+
+async function findInHistory(term) {
+  const t = term.toLowerCase();
+  const inbox = readJsonl(INBOX_FILE).map((m) => ({ ...m, _kind: "DM" }));
+  const room = readJsonl(ROOM_FILE).map((m) => ({ ...m, _kind: "room" }));
+  const matches = [...inbox, ...room]
+    .filter((m) => (m.text ?? "").toLowerCase().includes(t))
+    .sort((a, b) => a.ts - b.ts);
+  if (!matches.length) return say(A.dim(`(no matches for "${term}")`));
+  say(A.bold(`${matches.length} match(es) for "${term}":`));
+  for (const m of matches.slice(-20)) printMsg(m._kind, m, { history: true });
 }
 
 async function sendRoom(text) {
