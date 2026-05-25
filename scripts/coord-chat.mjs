@@ -53,6 +53,29 @@ const CURSOR_FILE = path.join(CURSOR_DIR, `${sanitize(ID)}.json`);
 mkdirSync(INBOX_DIR, { recursive: true });
 mkdirSync(CURSOR_DIR, { recursive: true });
 
+// ---------- ANSI helpers ----------
+
+const A = {
+  reset: "\x1b[0m",
+  bold: (s) => `\x1b[1m${s}\x1b[0m`,
+  dim: (s) => `\x1b[2m${s}\x1b[0m`,
+  red: (s) => `\x1b[31m${s}\x1b[0m`,
+  green: (s) => `\x1b[32m${s}\x1b[0m`,
+  yellow: (s) => `\x1b[33m${s}\x1b[0m`,
+  blue: (s) => `\x1b[34m${s}\x1b[0m`,
+  magenta: (s) => `\x1b[35m${s}\x1b[0m`,
+  cyan: (s) => `\x1b[36m${s}\x1b[0m`,
+};
+
+// Stable per-agent color from agentId hash. Skip red (reserved for errors)
+// and white/black; cycle the remaining 5 bright colors.
+const AGENT_COLORS = [A.green, A.yellow, A.blue, A.magenta, A.cyan];
+function agentColor(id) {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return AGENT_COLORS[h % AGENT_COLORS.length];
+}
+
 // ---------- register and start UI ----------
 
 await register();
@@ -60,22 +83,18 @@ await register();
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
-  prompt: `${ID}> `,
+  prompt: makePrompt(),
 });
 
-const dim = (s) => `\x1b[2m${s}\x1b[0m`;
-const cyan = (s) => `\x1b[36m${s}\x1b[0m`;
-const yellow = (s) => `\x1b[33m${s}\x1b[0m`;
-const red = (s) => `\x1b[31m${s}\x1b[0m`;
-
-say(dim(`coord-chat — agentId=${ID}  dir=${ROOT}`));
-say(dim("commands: <text>=room  /dm <id> <text>  /list  /help  /quit"));
-
+// Banner — printed once on launch. Keep it tight; this is a CLI, not a poster.
+printBanner();
 await drainAndPrint();
 
 try { watch(INBOX_FILE, () => void drainAndPrint()); } catch {}
 try { watch(ROOM_FILE, () => void drainAndPrint()); } catch {}
+try { watch(AGENTS_FILE, () => refreshPrompt()); } catch {}
 setInterval(() => void drainAndPrint(), 1000);
+setInterval(refreshPrompt, 5000);
 
 rl.prompt();
 
@@ -85,23 +104,36 @@ rl.on("line", async (line) => {
   try {
     if (text === "/quit" || text === "/exit") {
       await unregister();
-      say("bye.");
+      say(A.dim("bye."));
       process.exit(0);
-    } else if (text === "/help") {
-      say("commands: <text>=room  /dm <id> <text>  /list  /help  /quit");
-    } else if (text === "/list") {
+    } else if (text === "/help" || text === "/?") {
+      printHelp();
+    } else if (text === "/list" || text === "/who") {
       await printAgents();
+    } else if (text === "/whoami") {
+      await printWhoami();
+    } else if (text === "/clear" || text === "/cls") {
+      process.stdout.write("\x1b[2J\x1b[H");
+      printBanner();
+    } else if (text.startsWith("/last")) {
+      const m = text.match(/^\/last(?:\s+(\d+))?$/);
+      const n = m && m[1] ? parseInt(m[1], 10) : 20;
+      await printRecent(n);
+    } else if (text.startsWith("/me ")) {
+      const action = text.slice(4).trim();
+      if (!action) say(A.red("usage: /me <action>"));
+      else await sendRoom(`* ${ID} ${action}`);
     } else if (text.startsWith("/dm ")) {
       const m = text.match(/^\/dm\s+(\S+)\s+([\s\S]+)$/);
-      if (!m) say(red("usage: /dm <agentId> <text>"));
+      if (!m) say(A.red("usage: /dm <agentId> <text>"));
       else await sendDm(m[1], m[2]);
     } else if (text.startsWith("/")) {
-      say(red(`unknown command: ${text.split(" ")[0]}`));
+      say(A.red(`unknown command: ${text.split(" ")[0]}`) + A.dim("  (try /help)"));
     } else {
       await sendRoom(text);
     }
   } catch (e) {
-    say(red(`error: ${e?.message ?? e}`));
+    say(A.red(`error: ${e?.message ?? e}`));
   }
   rl.prompt();
 });
@@ -140,6 +172,80 @@ function say(line) {
   readline.cursorTo(process.stdout, 0);
   process.stdout.write(line + "\n");
   if (typeof rl !== "undefined") rl.prompt(true);
+}
+
+function makePrompt() {
+  const reg = readJsonSafe(AGENTS_FILE, {});
+  const now = Date.now();
+  const STALE = 5 * 60 * 1000;
+  let online = 0;
+  for (const id of Object.keys(reg)) {
+    if (id === ID) continue;
+    const a = reg[id];
+    const marker = readJsonSafe(path.join(TRANSPORT_DIR, `${sanitize(id)}.json`), null);
+    const live = marker && marker.pid && pidAlive(marker.pid);
+    if (live || now - a.lastHeartbeat < STALE) online++;
+  }
+  const peers = online === 1 ? "1 peer" : `${online} peers`;
+  return `${agentColor(ID)(ID)} ${A.dim(`(${peers})`)}${A.dim(">")} `;
+}
+
+function refreshPrompt() {
+  if (typeof rl === "undefined") return;
+  rl.setPrompt(makePrompt());
+  rl.prompt(true);
+}
+
+function printBanner() {
+  // Compact banner — three lines plus a separator. ASCII so it renders
+  // anywhere; no UTF-8 box-drawing surprises.
+  const lines = [
+    A.bold(A.cyan("  agent-coord  ")) + A.dim("— shared chat for agents and humans"),
+    A.dim(`  agentId=${A.reset}${agentColor(ID)(ID)}${A.dim("  dir=" + ROOT)}`),
+    A.dim("  type /help for commands · /quit to leave"),
+  ];
+  for (const l of lines) say(l);
+  say(A.dim("  " + "─".repeat(60)));
+}
+
+function printHelp() {
+  const rows = [
+    ["<text>",              "post to the shared room"],
+    ["/dm <agent> <text>",  "send a direct message"],
+    ["/me <action>",        "post an IRC-style action (* you wave)"],
+    ["/list, /who",         "show registered agents + transports"],
+    ["/whoami",             "show your registration + transport"],
+    ["/last [n]",           "show last n messages (default 20)"],
+    ["/clear",              "clear the screen"],
+    ["/help, /?",           "this list"],
+    ["/quit, /exit",        "unregister and leave"],
+  ];
+  say(A.bold("commands:"));
+  for (const [cmd, desc] of rows) {
+    say(`  ${A.cyan(cmd.padEnd(22))} ${A.dim(desc)}`);
+  }
+}
+
+async function printWhoami() {
+  const reg = readJsonSafe(AGENTS_FILE, {});
+  const a = reg[ID];
+  const marker = readJsonSafe(path.join(TRANSPORT_DIR, `${sanitize(ID)}.json`), null);
+  const live = marker && marker.pid && pidAlive(marker.pid);
+  say(A.bold("you:"));
+  say(`  ${A.cyan("id")}        ${agentColor(ID)(ID)}`);
+  say(`  ${A.cyan("role")}      ${a?.role ?? "-"}`);
+  say(`  ${A.cyan("dir")}       ${A.dim(ROOT)}`);
+  say(`  ${A.cyan("transport")} ${live ? A.green(marker.transport) : A.dim("none")}`);
+  say(`  ${A.cyan("registered")} ${a ? A.green("yes") : A.red("no")}`);
+}
+
+async function printRecent(n) {
+  const inbox = readJsonl(INBOX_FILE).slice(-n).map((m) => ({ ...m, _kind: "DM" }));
+  const room = readJsonl(ROOM_FILE).slice(-n).map((m) => ({ ...m, _kind: "room" }));
+  const all = [...inbox, ...room].sort((a, b) => a.ts - b.ts).slice(-n);
+  if (!all.length) return say(A.dim("(no history)"));
+  say(A.bold(`last ${all.length} message(s):`));
+  for (const m of all) printMsg(m._kind, m, { history: true });
 }
 
 async function withLock(file, fn) {
@@ -184,7 +290,7 @@ async function unregister() {
 async function sendDm(to, text) {
   const target = path.join(INBOX_DIR, `${sanitize(to)}.jsonl`);
   await appendMessage(target, { from: ID, to, text });
-  say(dim(`→ DM sent to ${to}`));
+  say(A.dim(`→ DM sent to ${to}`));
 }
 
 async function sendRoom(text) {
@@ -226,10 +332,21 @@ async function drainAndPrint() {
   if (changed) writeJsonAtomic(CURSOR_FILE, cursor);
 }
 
-function printMsg(kind, m) {
-  const t = new Date(m.ts).toLocaleTimeString();
-  const color = kind === "DM" ? cyan : yellow;
-  say(`${color(`[${kind} ${t} ${m.from}]`)} ${m.text ?? ""}`);
+function printMsg(kind, m, opts = {}) {
+  const d = new Date(m.ts);
+  const t = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const who = m.from ?? "?";
+  const tag = kind === "DM" ? A.bold(A.cyan("DM")) : A.dim("room");
+  const meta = `${A.dim(t)} ${tag} ${agentColor(who)(who)}`;
+  // Multi-line bodies: first line on the meta row, subsequent lines indented
+  // to the body column for readability.
+  const body = (m.text ?? "").split("\n");
+  const indent = "       ";
+  const first = body[0] ?? "";
+  const rest = body.slice(1).map((l) => indent + A.dim("│ ") + l);
+  const prefix = opts.history ? A.dim("  ") : "";
+  say(`${prefix}${meta} ${first}`);
+  for (const line of rest) say(`${prefix}${line}`);
 }
 
 async function printAgents() {
@@ -237,14 +354,28 @@ async function printAgents() {
   const now = Date.now();
   const STALE = 5 * 60 * 1000;
   const ids = Object.keys(reg).sort();
-  if (!ids.length) return say(dim("(no agents)"));
+  if (!ids.length) return say(A.dim("(no agents)"));
+  // Compute column widths from data so things line up.
+  const idW = Math.max(8, ...ids.map((i) => i.length));
+  const roleW = Math.max(4, ...ids.map((i) => (reg[i].role ?? "-").length));
+  say(A.bold(`agents (${ids.length}):`));
+  say(
+    "  " +
+      A.dim(
+        `${"id".padEnd(idW)}  ${"status".padEnd(7)}  ${"role".padEnd(roleW)}  transport`,
+      ),
+  );
   for (const id of ids) {
     const a = reg[id];
     const marker = readJsonSafe(path.join(TRANSPORT_DIR, `${sanitize(id)}.json`), null);
     const live = marker && marker.pid && pidAlive(marker.pid);
-    const status = live || now - a.lastHeartbeat < STALE ? "online " : "offline";
-    const trans = live ? ` transport=${marker.transport}` : "";
-    say(`  ${id.padEnd(20)} ${status}${trans}  role=${a.role ?? "-"}`);
+    const onlineNow = live || now - a.lastHeartbeat < STALE;
+    const dot = onlineNow ? A.green("●") : A.dim("○");
+    const status = onlineNow ? "online " : "offline";
+    const role = (a.role ?? "-").padEnd(roleW);
+    const trans = live ? A.green(marker.transport) : A.dim("none");
+    const me = id === ID ? A.dim(" (you)") : "";
+    say(`  ${dot} ${agentColor(id)(id.padEnd(idW))}  ${A.dim(status)}  ${role}  ${trans}${me}`);
   }
 }
 
