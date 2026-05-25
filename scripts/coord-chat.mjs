@@ -80,15 +80,64 @@ function agentColor(id) {
 
 await register();
 
+// Visual separator above the prompt — delimits "typing area starts here."
+// Embedded in the prompt string itself so readline owns the redraw; no
+// scroll-region gymnastics needed (those don't survive tmux cleanly).
+const TTY = !!process.stdout.isTTY;
+let COLS = process.stdout.columns || 80;
+const sepLine = () => A.dim("─".repeat(Math.max(10, COLS)));
+
+// inputAreaReady flips to true after the banner + initial drain finish and
+// we lay down the first separator. From that point say() treats the line
+// above the prompt as a separator slot it owns.
+let inputAreaReady = false;
+
+if (TTY) {
+  process.stdout.on("resize", () => {
+    COLS = process.stdout.columns || 80;
+    if (typeof rl !== "undefined") {
+      rl.setPrompt(makePrompt());
+      rl.prompt(true);
+    }
+  });
+}
+
+const SLASH_COMMANDS = [
+  "/dm", "/list", "/who", "/whoami", "/last", "/clear", "/cls",
+  "/me", "/help", "/?", "/quit", "/exit",
+];
+
+function completer(line) {
+  // Tab-complete slash commands and DM targets.
+  if (line.startsWith("/dm ")) {
+    const partial = line.slice(4);
+    const reg = readJsonSafe(AGENTS_FILE, {});
+    const ids = Object.keys(reg).filter((id) => id !== ID && id.startsWith(partial));
+    const hits = ids.map((id) => `/dm ${id} `);
+    return [hits, line];
+  }
+  if (line.startsWith("/")) {
+    const hits = SLASH_COMMANDS.filter((c) => c.startsWith(line));
+    return [hits, line];
+  }
+  return [[], line];
+}
+
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
   prompt: makePrompt(),
+  completer,
 });
 
 // Banner — printed once on launch. Keep it tight; this is a CLI, not a poster.
 printBanner();
 await drainAndPrint();
+
+// Lay down the first separator, then activate input-area mode so subsequent
+// say() calls maintain a sep line directly above the prompt.
+process.stdout.write(sepLine() + "\n");
+inputAreaReady = true;
 
 try { watch(INBOX_FILE, () => void drainAndPrint()); } catch {}
 try { watch(ROOM_FILE, () => void drainAndPrint()); } catch {}
@@ -104,7 +153,8 @@ rl.on("line", async (line) => {
   try {
     if (text === "/quit" || text === "/exit") {
       await unregister();
-      say(A.dim("bye."));
+      teardownFooter();
+      process.stdout.write(A.dim("bye.\n"));
       process.exit(0);
     } else if (text === "/help" || text === "/?") {
       printHelp();
@@ -135,14 +185,22 @@ rl.on("line", async (line) => {
   } catch (e) {
     say(A.red(`error: ${e?.message ?? e}`));
   }
+  // After Enter, terminal advanced to a new line. Print a fresh separator
+  // there so the next prompt sits below a sep line, maintaining the layout.
+  process.stdout.write(sepLine() + "\n");
   rl.prompt();
 });
 
 process.on("SIGINT", async () => {
   try { await unregister(); } catch {}
-  process.stdout.write("\n");
-  say("bye.");
+  teardownFooter();
+  process.stdout.write("\n" + A.dim("bye.\n"));
   process.exit(0);
+});
+
+process.on("exit", () => {
+  // Final safety net — restore terminal state if we exit via any path.
+  teardownFooter();
 });
 
 // ---------- helpers ----------
@@ -166,11 +224,17 @@ function sanitize(s) {
   return s.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-// Write output without clobbering whatever the user is typing.
 function say(line) {
-  readline.clearLine(process.stdout, 0);
-  readline.cursorTo(process.stdout, 0);
+  if (!inputAreaReady) {
+    process.stdout.write(line + "\n");
+    return;
+  }
+  // We're on the prompt line. The line above is the current separator.
+  // Move up to it, clear it, drop our message there, then a fresh separator,
+  // then re-render the prompt on the next line.
+  process.stdout.write("\x1b[1A\r\x1b[2K");
   process.stdout.write(line + "\n");
+  process.stdout.write(sepLine() + "\n");
   if (typeof rl !== "undefined") rl.prompt(true);
 }
 
@@ -189,6 +253,9 @@ function makePrompt() {
   const peers = online === 1 ? "1 peer" : `${online} peers`;
   return `${agentColor(ID)(ID)} ${A.dim(`(${peers})`)}${A.dim(">")} `;
 }
+
+// No-op stubs kept so the exit paths don't reference deleted functions.
+function teardownFooter() {}
 
 function refreshPrompt() {
   if (typeof rl === "undefined") return;
