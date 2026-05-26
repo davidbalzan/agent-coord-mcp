@@ -613,22 +613,48 @@ function printMsg(kind, m, opts = {}) {
   const t = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   const who = m.from ?? "?";
   const color = agentColor(who);
-  // Colored gutter bar at the very start of each line so you can scan rows
-  // by sender without parsing meta. Same color carries through to the
-  // boldened nickname.
   const gutter = color("▎");
   const tag = kind === "DM" ? A.bold(A.cyan("DM")) : A.dim("room");
   const nick = A.bold(color(who));
   const meta = `${A.dim(t)} ${tag} ${nick}`;
-  // Multi-line bodies: first line on the meta row, subsequent lines indented
-  // to the body column under the gutter for visual continuity.
-  const body = (m.text ?? "").split("\n");
+  const body = (m.text ?? "").split("\n").map(formatBody);
   const indent = "         ";
   const first = body[0] ?? "";
   const rest = body.slice(1).map((l) => `${gutter} ${indent}${A.dim("│ ")}${l}`);
   const prefix = opts.history ? A.dim("  ") : "";
   say(`${prefix}${gutter} ${meta} ${first}`);
   for (const line of rest) say(`${prefix}${line}`);
+}
+
+// Lightweight inline-only "chat markdown" formatter — no dep. Handles bold,
+// italic, inline code, links, and @mentions. Order matters: pull out inline
+// code spans first so we don't touch their contents, then run the rest.
+function formatBody(text) {
+  return text.split(/(`[^`\n]+`)/).map((part) => {
+    if (part.startsWith("`") && part.endsWith("`") && part.length >= 2) {
+      return A.dim("`") + A.cyan(part.slice(1, -1)) + A.dim("`");
+    }
+    let s = part;
+    // @mentions first — colored in the mentioned agent's hash color, bold if
+    // it's the current user (so you can spot pings at a glance).
+    s = s.replace(/@([A-Za-z0-9._-]+)/g, (_, name) => {
+      const colored = agentColor(name)(`@${name}`);
+      return name === ID ? A.bold(colored) : colored;
+    });
+    // **bold**
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, (_, t) => A.bold(t));
+    // *italic* and _italic_ (avoid matching inside **bold** by requiring
+    // non-asterisk neighbors)
+    s = s.replace(/(?<![*\w])\*([^*\n]+)\*(?![*\w])/g, (_, t) => `\x1b[3m${t}\x1b[0m`);
+    s = s.replace(/(?<![_\w])_([^_\n]+)_(?![_\w])/g, (_, t) => `\x1b[3m${t}\x1b[0m`);
+    // [text](url) — show text underlined with a dim trailing (url)
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, t, u) =>
+      `\x1b[4m${t}\x1b[0m${A.dim(` (${u})`)}`,
+    );
+    // Bare URLs — underline only the URL itself
+    s = s.replace(/\bhttps?:\/\/[^\s)]+/g, (u) => `\x1b[4m${u}\x1b[0m`);
+    return s;
+  }).join("");
 }
 
 async function printAgents() {
