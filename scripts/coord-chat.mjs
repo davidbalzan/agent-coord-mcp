@@ -74,17 +74,15 @@ const A = {
   brightCyan:    (s) => `\x1b[96m${s}\x1b[0m`,
 };
 
-// Stable per-agent color from agentId hash. 10 colors (standard + bright)
-// to reduce collisions. Red is reserved for errors so we skip it.
+// Stable per-agent color via a persistent registry shared by all coord-chat
+// sessions. First time we see an agentId we pick the next unused palette
+// slot — guarantees no collisions until the palette is exhausted. After that
+// we fall back to hashing so behavior stays deterministic.
 const AGENT_COLORS = [
   A.green, A.yellow, A.blue, A.magenta, A.cyan,
   A.brightGreen, A.brightYellow, A.brightBlue, A.brightMagenta, A.brightCyan,
 ];
-function agentColor(id) {
-  let h = 0;
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-  return AGENT_COLORS[h % AGENT_COLORS.length];
-}
+// Will be initialized after ROOT is set, just below.
 
 // ---------- register and start UI ----------
 
@@ -122,6 +120,7 @@ const SLASH_COMMANDS = [
 ];
 
 const STATUS_FILE_PATH = path.join(ROOT, "status.jsonl");
+const COLOR_MAP_FILE = path.join(ROOT, "chat-colors.json");
 
 function completer(line) {
   // Tab-complete slash commands, DM targets, and @mentions mid-message.
@@ -174,7 +173,10 @@ const rl = readline.createInterface({
 
 // Banner — printed once on launch. Keep it tight; this is a CLI, not a poster.
 printBanner();
-await drainAndPrint();
+// Show recent context (last 3 messages from inbox + room) then fast-forward
+// the cursor so the same entries don't show up again via the watcher path.
+fastForwardCursors();
+await printRecent(3);
 
 // Lay down the first separator. From this point, async incoming messages
 // (via the watcher → drainAndPrint → say) know they can use the cursor
@@ -292,6 +294,34 @@ function sanitize(s) {
   return s.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
+function agentColor(id) {
+  const map = readJsonSafe(COLOR_MAP_FILE, {});
+  const existing = map[id];
+  if (typeof existing === "number" && existing >= 0 && existing < AGENT_COLORS.length) {
+    return AGENT_COLORS[existing];
+  }
+  // First sighting — pick the first unused palette slot.
+  const used = new Set(Object.values(map).filter((v) => typeof v === "number"));
+  let idx = -1;
+  for (let i = 0; i < AGENT_COLORS.length; i++) {
+    if (!used.has(i)) { idx = i; break; }
+  }
+  if (idx === -1) {
+    // Palette exhausted — deterministic hash fallback. No persist (don't
+    // pollute the map with hash assignments that could be wrong).
+    let h = 0;
+    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+    return AGENT_COLORS[h % AGENT_COLORS.length];
+  }
+  // Persist. Re-read from disk first to merge any concurrent assignments
+  // by other coord-chat processes; last-writer-wins for a single agentId
+  // is fine since colors are cosmetic.
+  const onDisk = readJsonSafe(COLOR_MAP_FILE, {});
+  onDisk[id] = idx;
+  try { writeJsonAtomic(COLOR_MAP_FILE, onDisk); } catch { /* best effort */ }
+  return AGENT_COLORS[idx];
+}
+
 function say(line) {
   if (lastLineWasSep) {
     // Async path: a separator we own sits directly above the prompt; we own
@@ -383,6 +413,17 @@ async function printWhoami() {
   say(`  ${A.cyan("dir")}       ${A.dim(ROOT)}`);
   say(`  ${A.cyan("transport")} ${live ? A.green(marker.transport) : A.dim("none")}`);
   say(`  ${A.cyan("registered")} ${a ? A.green("yes") : A.red("no")}`);
+}
+
+function fastForwardCursors() {
+  // Move our cursor offsets to end-of-file so anything that existed before
+  // launch is treated as already-seen. printRecent(N) then shows the last N
+  // as historical context, and the watcher path only fires for genuinely
+  // new messages going forward.
+  const cur = readJsonSafe(CURSOR_FILE, {});
+  cur.inboxOffset = readJsonl(INBOX_FILE).length;
+  cur.roomOffset = readJsonl(ROOM_FILE).length;
+  writeJsonAtomic(CURSOR_FILE, cur);
 }
 
 async function printRecent(n) {
