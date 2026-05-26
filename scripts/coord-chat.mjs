@@ -429,23 +429,92 @@ async function postStatus(status) {
 async function pruneOld(days) {
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
   let total = 0;
-  const files = [ROOM_FILE, STATUS_FILE_PATH];
+  // Per-file removal counts so we can shift the corresponding cursor
+  // offsets — without this, every other agent's roomOffset/statusOffset/
+  // inboxOffset would point past the now-shorter file and they'd silently
+  // miss messages until enough new ones piled up to overtake the stale offset.
+  let roomRemoved = 0;
+  let statusRemoved = 0;
+  const inboxRemoved = {}; // agentId → count
+
+  const files = [
+    { path: ROOM_FILE, kind: "room" },
+    { path: STATUS_FILE_PATH, kind: "status" },
+  ];
   if (existsSync(INBOX_DIR)) {
     for (const n of readdirSync(INBOX_DIR)) {
-      if (n.endsWith(".jsonl")) files.push(path.join(INBOX_DIR, n));
+      if (n.endsWith(".jsonl")) {
+        files.push({ path: path.join(INBOX_DIR, n), kind: "inbox", agentId: n.replace(/\.jsonl$/, "") });
+      }
     }
   }
-  for (const file of files) {
-    if (!existsSync(file)) continue;
-    const all = readJsonl(file);
+  for (const f of files) {
+    if (!existsSync(f.path)) continue;
+    const all = readJsonl(f.path);
     const kept = all.filter((e) => e && e.ts > cutoff);
-    if (kept.length < all.length) {
+    const removed = all.length - kept.length;
+    if (removed > 0) {
       const body = kept.length ? kept.map((e) => JSON.stringify(e)).join("\n") + "\n" : "";
-      writeFileSync(file, body);
-      total += all.length - kept.length;
+      writeFileSync(f.path, body);
+      total += removed;
+      if (f.kind === "room") roomRemoved += removed;
+      else if (f.kind === "status") statusRemoved += removed;
+      else inboxRemoved[f.agentId] = (inboxRemoved[f.agentId] ?? 0) + removed;
     }
   }
-  say(A.dim(`→ pruned ${total} entries older than ${days}d`));
+  if (roomRemoved || statusRemoved || Object.keys(inboxRemoved).length) {
+    shiftAllCursors({ roomRemoved, statusRemoved, inboxRemoved });
+  }
+  say(A.dim(`→ pruned ${total} entries older than ${days}d (cursors adjusted)`));
+}
+
+async function wipeRoom() {
+  await ensureFile(ROOM_FILE);
+  writeFileSync(ROOM_FILE, "");
+  // Reset every agent's roomOffset to 0 so they start reading the (now empty)
+  // file from the beginning. Otherwise their stale offsets point past EOF.
+  resetAllRoomOffsets();
+  say(A.dim("→ room wiped (all room cursors reset)"));
+}
+
+// Walk every cursor file and shift offsets down by the per-channel removed
+// counts. Mirrors what the MCP prune tool does server-side.
+function shiftAllCursors({ roomRemoved = 0, statusRemoved = 0, inboxRemoved = {} }) {
+  if (!existsSync(CURSOR_DIR)) return;
+  for (const name of readdirSync(CURSOR_DIR)) {
+    if (!name.endsWith(".json")) continue;
+    const cursorPath = path.join(CURSOR_DIR, name);
+    const cur = readJsonSafe(cursorPath, {});
+    const id = name.replace(/\.json$/, "");
+    let touched = false;
+    if (cur.roomOffset !== undefined && roomRemoved > 0) {
+      cur.roomOffset = Math.max(0, cur.roomOffset - roomRemoved);
+      touched = true;
+    }
+    if (cur.statusOffset !== undefined && statusRemoved > 0) {
+      cur.statusOffset = Math.max(0, cur.statusOffset - statusRemoved);
+      touched = true;
+    }
+    const myInbox = inboxRemoved[id] ?? 0;
+    if (cur.inboxOffset !== undefined && myInbox > 0) {
+      cur.inboxOffset = Math.max(0, cur.inboxOffset - myInbox);
+      touched = true;
+    }
+    if (touched) writeJsonAtomic(cursorPath, cur);
+  }
+}
+
+function resetAllRoomOffsets() {
+  if (!existsSync(CURSOR_DIR)) return;
+  for (const name of readdirSync(CURSOR_DIR)) {
+    if (!name.endsWith(".json")) continue;
+    const cursorPath = path.join(CURSOR_DIR, name);
+    const cur = readJsonSafe(cursorPath, {});
+    if (cur.roomOffset !== undefined && cur.roomOffset !== 0) {
+      cur.roomOffset = 0;
+      writeJsonAtomic(cursorPath, cur);
+    }
+  }
 }
 
 async function kickAgent(target) {
@@ -471,19 +540,13 @@ async function kickAgent(target) {
     try { process.kill(marker.pid, "SIGTERM"); } catch {}
   }
   try { if (existsSync(markerPath)) unlinkSync(markerPath); } catch {}
-  say(A.dim(`→ kicked ${target} (registry + transport cleared)`));
-}
-
-async function wipeRoom() {
-  await ensureFile(ROOM_FILE);
-  writeFileSync(ROOM_FILE, "");
-  // Reset cursors so prior offsets don't point past the now-shorter file.
-  const cur = readJsonSafe(CURSOR_FILE, {});
-  if (cur.roomOffset !== undefined) {
-    delete cur.roomOffset;
-    writeJsonAtomic(CURSOR_FILE, cur);
-  }
-  say(A.dim("→ room wiped"));
+  // Remove the kicked agent's inbox + cursor so they don't sit orphaned in
+  // ~/agent-coord/ taking up listing space and confusing future bookkeeping.
+  const inboxPath = path.join(INBOX_DIR, `${sanitize(target)}.jsonl`);
+  const cursorPath = path.join(CURSOR_DIR, `${sanitize(target)}.json`);
+  try { if (existsSync(inboxPath)) unlinkSync(inboxPath); } catch {}
+  try { if (existsSync(cursorPath)) unlinkSync(cursorPath); } catch {}
+  say(A.dim(`→ kicked ${target} (registry, transport, inbox, cursor all cleared)`));
 }
 
 async function findInHistory(term) {
