@@ -67,11 +67,19 @@ const A = {
   blue: (s) => `\x1b[34m${s}\x1b[0m`,
   magenta: (s) => `\x1b[35m${s}\x1b[0m`,
   cyan: (s) => `\x1b[36m${s}\x1b[0m`,
+  brightGreen:   (s) => `\x1b[92m${s}\x1b[0m`,
+  brightYellow:  (s) => `\x1b[93m${s}\x1b[0m`,
+  brightBlue:    (s) => `\x1b[94m${s}\x1b[0m`,
+  brightMagenta: (s) => `\x1b[95m${s}\x1b[0m`,
+  brightCyan:    (s) => `\x1b[96m${s}\x1b[0m`,
 };
 
-// Stable per-agent color from agentId hash. Skip red (reserved for errors)
-// and white/black; cycle the remaining 5 bright colors.
-const AGENT_COLORS = [A.green, A.yellow, A.blue, A.magenta, A.cyan];
+// Stable per-agent color from agentId hash. 10 colors (standard + bright)
+// to reduce collisions. Red is reserved for errors so we skip it.
+const AGENT_COLORS = [
+  A.green, A.yellow, A.blue, A.magenta, A.cyan,
+  A.brightGreen, A.brightYellow, A.brightBlue, A.brightMagenta, A.brightCyan,
+];
 function agentColor(id) {
   let h = 0;
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
@@ -604,16 +612,22 @@ function printMsg(kind, m, opts = {}) {
   const d = new Date(m.ts);
   const t = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   const who = m.from ?? "?";
+  const color = agentColor(who);
+  // Colored gutter bar at the very start of each line so you can scan rows
+  // by sender without parsing meta. Same color carries through to the
+  // boldened nickname.
+  const gutter = color("▎");
   const tag = kind === "DM" ? A.bold(A.cyan("DM")) : A.dim("room");
-  const meta = `${A.dim(t)} ${tag} ${agentColor(who)(who)}`;
+  const nick = A.bold(color(who));
+  const meta = `${A.dim(t)} ${tag} ${nick}`;
   // Multi-line bodies: first line on the meta row, subsequent lines indented
-  // to the body column for readability.
+  // to the body column under the gutter for visual continuity.
   const body = (m.text ?? "").split("\n");
-  const indent = "       ";
+  const indent = "         ";
   const first = body[0] ?? "";
-  const rest = body.slice(1).map((l) => indent + A.dim("│ ") + l);
+  const rest = body.slice(1).map((l) => `${gutter} ${indent}${A.dim("│ ")}${l}`);
   const prefix = opts.history ? A.dim("  ") : "";
-  say(`${prefix}${meta} ${first}`);
+  say(`${prefix}${gutter} ${meta} ${first}`);
   for (const line of rest) say(`${prefix}${line}`);
 }
 
