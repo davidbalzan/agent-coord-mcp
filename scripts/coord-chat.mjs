@@ -124,12 +124,24 @@ const SLASH_COMMANDS = [
 const STATUS_FILE_PATH = path.join(ROOT, "status.jsonl");
 
 function completer(line) {
-  // Tab-complete slash commands and DM targets. On multi-match with no
-  // common-prefix advancement, surface the options on the first Tab via
-  // say() — default readline UX hides them until a second Tab, which most
-  // users assume means "nothing happened."
+  // Tab-complete slash commands, DM targets, and @mentions mid-message.
+  // On multi-match with no common-prefix advancement, surface the options
+  // on the first Tab via say() — default readline UX hides them until a
+  // second Tab, which most users assume means "nothing happened."
   let hits = [];
-  if (line.startsWith("/dm ")) {
+  let substr = line;
+
+  // @mention completion takes priority — checked first because it can
+  // appear inside a slash command argument (e.g. `/dm bob hey @ali`) or
+  // in a plain room message.
+  const mentionMatch = line.match(/@([A-Za-z0-9._-]*)$/);
+  if (mentionMatch) {
+    const partial = mentionMatch[1];
+    const reg = readJsonSafe(AGENTS_FILE, {});
+    const ids = Object.keys(reg).filter((id) => id.startsWith(partial));
+    hits = ids.map((id) => `@${id} `);
+    substr = mentionMatch[0]; // tell readline to replace just the @partial part
+  } else if (line.startsWith("/dm ")) {
     const partial = line.slice(4);
     const reg = readJsonSafe(AGENTS_FILE, {});
     const ids = Object.keys(reg).filter((id) => id !== ID && id.startsWith(partial));
@@ -137,11 +149,11 @@ function completer(line) {
   } else if (line.startsWith("/")) {
     hits = SLASH_COMMANDS.filter((c) => c.startsWith(line));
   }
-  if (hits.length > 1 && commonPrefix(hits).length <= line.length) {
+  if (hits.length > 1 && commonPrefix(hits).length <= substr.length) {
     const display = hits.map((h) => h.trim()).join("  ");
     say(A.dim("  ┄ " + display));
   }
-  return [hits, line];
+  return [hits, substr];
 }
 
 function commonPrefix(strs) {
