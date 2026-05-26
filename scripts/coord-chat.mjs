@@ -670,13 +670,49 @@ function printMsg(kind, m, opts = {}) {
   const tag = kind === "DM" ? A.bold(A.cyan("DM")) : A.dim("room");
   const nick = A.bold(color(who));
   const meta = `${A.dim(t)} ${tag} ${nick}`;
-  const body = (m.text ?? "").split("\n").map(formatBody);
-  const indent = "         ";
-  const first = body[0] ?? "";
-  const rest = body.slice(1).map((l) => `${gutter} ${indent}${A.dim("│ ")}${l}`);
   const prefix = opts.history ? A.dim("  ") : "";
-  say(`${prefix}${gutter} ${meta} ${first}`);
-  for (const line of rest) say(`${prefix}${line}`);
+
+  // Visible widths: prefix + "▎ " + meta + " " on the first line;
+  // prefix + "▎ " on continuation lines. We wrap manually so the
+  // colored gutter prepends every wrapped line — terminal auto-wrap
+  // would lose it.
+  const prefixW = visibleLength(prefix);
+  const firstChrome = prefixW + visibleLength(`▎ ${meta} `);
+  const restChrome = prefixW + visibleLength(`▎ `);
+  const firstWidth = Math.max(20, COLS - firstChrome);
+  const restWidth = Math.max(20, COLS - restChrome);
+
+  const text = (m.text ?? "").split("\n").map(formatBody).join("\n");
+  const lines = wrapText(text, firstWidth, restWidth);
+  say(`${prefix}${gutter} ${meta} ${lines[0] ?? ""}`);
+  for (const line of lines.slice(1)) say(`${prefix}${gutter} ${line}`);
+}
+
+function visibleLength(s) {
+  // Strip ANSI SGR sequences so we measure on-screen width, not raw bytes.
+  return s.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+function wrapText(text, firstWidth, restWidth) {
+  if (firstWidth <= 0 || restWidth <= 0) return [text];
+  const out = [];
+  for (const para of text.split("\n")) {
+    const words = para.split(" ");
+    let line = "";
+    let currentWidth = out.length === 0 ? firstWidth : restWidth;
+    for (const word of words) {
+      const proposed = line ? line + " " + word : word;
+      if (visibleLength(proposed) > currentWidth && line) {
+        out.push(line);
+        line = word;
+        currentWidth = restWidth;
+      } else {
+        line = proposed;
+      }
+    }
+    if (line || words.length === 0) out.push(line);
+  }
+  return out;
 }
 
 // Lightweight inline-only "chat markdown" formatter — no dep. Handles bold,
