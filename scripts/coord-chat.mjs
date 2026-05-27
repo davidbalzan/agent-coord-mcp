@@ -314,6 +314,14 @@ printBanner();
 fastForwardCursors();
 await printRecent(3);
 
+// Surface the focused channel's topic + MOTD (room rules) on launch — same
+// banner /join shows — so the rules are seen on connect, not just on switch.
+// Skip the bare header when neither is set, to avoid noise.
+{
+  const e = getRooms()[normalizeRoom(currentRoom)];
+  if (e?.topic || e?.motd) showRoomBanner(currentRoom);
+}
+
 // Lay down the first separator. From this point, async incoming messages
 // (via the watcher → drainAndPrint → say) know they can use the cursor
 // games to slot themselves above the prompt.

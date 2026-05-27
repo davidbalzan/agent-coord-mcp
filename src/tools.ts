@@ -828,12 +828,18 @@ export async function joinTool(args: {
     inbox = await readMessagesTool({ agentId: args.agentId, source: "inbox" });
   }
 
+  // Surface the default channel's topic + MOTD (room rules) in the same
+  // round-trip, so a connecting agent sees them without a separate call.
+  const rooms = await getRooms();
+  const def = rooms[DEFAULT_ROOM];
+
   return {
     ok: true,
     registered: reg.agent,
     attached: !!attach && attach.ok !== false,
     attach,
     inbox,
+    defaultRoom: { room: DEFAULT_ROOM, topic: def?.topic, motd: def?.motd },
     inTmux: !!process.env.TMUX_PANE,
   };
 }
