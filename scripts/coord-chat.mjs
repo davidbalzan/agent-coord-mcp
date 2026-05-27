@@ -44,6 +44,33 @@ const args = parseArgs(process.argv.slice(2));
 const ID = args.id ?? process.env.USER ?? "human";
 const ROOT = args.dir ?? process.env.AGENT_COORD_DIR ?? path.join(homedir(), "agent-coord");
 
+// Message-rendering state + helpers. Declared up here (above the top-level
+// printRecent() call) so they're initialized before first use — const/let
+// don't hoist the way function declarations do.
+
+// Consecutive messages from the same sender within this window are visually
+// grouped: the second one drops its header/blank line and just continues the
+// gutter, Slack-style.
+const GROUP_WINDOW = 2 * 60 * 1000;
+let lastBlock = { who: null, ts: 0, kind: null };
+
+// Matches "@<this agent>" not followed by a name char, so we can flag messages
+// that ping the current user. ID may contain regex metachars — escape it.
+const SELF_MENTION_RE = new RegExp(
+  "@" + ID.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(?![A-Za-z0-9._-])",
+);
+const mentionsSelf = (text) => SELF_MENTION_RE.test(text ?? "");
+
+// Recency at a glance: "now" / "5m" for fresh messages, falling back to a wall
+// clock for anything over an hour (a stale "63m" reads worse than "08:34").
+function relTime(ts) {
+  const mins = Math.floor((Date.now() - ts) / 60000);
+  if (mins < 1) return "now";
+  if (mins < 60) return `${mins}m`;
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
 const INBOX_DIR = path.join(ROOT, "inbox");
 const CURSOR_DIR = path.join(ROOT, "cursors");
 const TRANSPORT_DIR = path.join(ROOT, "transports");
@@ -662,30 +689,40 @@ async function drainAndPrint() {
 }
 
 function printMsg(kind, m, opts = {}) {
-  const d = new Date(m.ts);
-  const t = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   const who = m.from ?? "?";
   const color = agentColor(who);
   const gutter = color("▎");
-  const tag = kind === "DM" ? A.bold(A.cyan("DM")) : A.dim("room");
-  const nick = A.bold(color(who));
-  const meta = `${A.dim(t)} ${tag} ${nick}`;
   const prefix = opts.history ? A.dim("  ") : "";
 
-  // Visible widths: prefix + "▎ " + meta + " " on the first line;
-  // prefix + "▎ " on continuation lines. We wrap manually so the
-  // colored gutter prepends every wrapped line — terminal auto-wrap
-  // would lose it.
+  // Body wraps manually under a continuous gutter — terminal auto-wrap would
+  // lose the colored gutter on continuation lines.
   const prefixW = visibleLength(prefix);
-  const firstChrome = prefixW + visibleLength(`▎ ${meta} `);
-  const restChrome = prefixW + visibleLength(`▎ `);
-  const firstWidth = Math.max(20, COLS - firstChrome);
-  const restWidth = Math.max(20, COLS - restChrome);
-
+  const bodyWidth = Math.max(20, COLS - prefixW - visibleLength(`▎ `));
   const text = (m.text ?? "").split("\n").map(formatBody).join("\n");
-  const lines = wrapText(text, firstWidth, restWidth);
-  say(`${prefix}${gutter} ${meta} ${lines[0] ?? ""}`);
-  for (const line of lines.slice(1)) say(`${prefix}${gutter} ${line}`);
+  const lines = wrapBody(text, bodyWidth);
+
+  // Group onto the previous block when it's the same live sender within the
+  // window — skip the blank line + header, just keep the gutter going.
+  const grouped = !opts.history
+    && lastBlock.who === who && lastBlock.kind === kind
+    && (m.ts - lastBlock.ts) < GROUP_WINDOW;
+
+  if (!grouped) {
+    // Header on its own line so the sender is a scannable anchor and the body
+    // always starts at a fixed column. "room" is the default and stays
+    // implied; only DMs get a badge. A ping to the current user brightens the
+    // gutter and adds a ► marker so it pops out of the firehose.
+    const pinged = mentionsSelf(m.text);
+    const badge = kind === "DM" ? A.bold(A.cyan("DM ")) : "";
+    const marker = pinged ? A.bold(A.yellow("► ")) : "";
+    const headGutter = pinged ? A.bold(color("▌")) : gutter;
+    const header = `${marker}${badge}${A.bold(color(who))} ${A.dim(`· ${relTime(m.ts)}`)}`;
+    say("");
+    say(`${prefix}${headGutter} ${header}`);
+  }
+  for (const line of lines) say(`${prefix}${gutter} ${line}`);
+
+  if (!opts.history) lastBlock = { who, ts: m.ts, kind };
 }
 
 function visibleLength(s) {
@@ -693,24 +730,31 @@ function visibleLength(s) {
   return s.replace(/\x1b\[[0-9;]*m/g, "").length;
 }
 
-function wrapText(text, firstWidth, restWidth) {
-  if (firstWidth <= 0 || restWidth <= 0) return [text];
+// Wrap one message's text, preserving list/indent structure: a leading bullet
+// ("- ", "* ", "1. ", "2) ") or whitespace indent is detected so wrapped
+// continuation lines hang-indent under the text rather than re-flowing as flat
+// prose.
+function wrapBody(text, width) {
+  if (width <= 0) return [text];
   const out = [];
-  for (const para of text.split("\n")) {
-    const words = para.split(" ");
-    let line = "";
-    let currentWidth = out.length === 0 ? firstWidth : restWidth;
-    for (const word of words) {
-      const proposed = line ? line + " " + word : word;
-      if (visibleLength(proposed) > currentWidth && line) {
+  for (const raw of text.split("\n")) {
+    const mk = raw.match(/^(\s*(?:[-*•]\s+|\d+[.)]\s+)?)([\s\S]*)$/);
+    const lead = mk ? mk[1] : "";
+    const body = mk ? mk[2] : raw;
+    const indent = " ".repeat(visibleLength(lead));
+    const words = body.length ? body.split(/\s+/) : [];
+    if (!words.length) { out.push(lead.trimEnd()); continue; }
+    let line = lead + words[0];
+    for (let i = 1; i < words.length; i++) {
+      const proposed = line + " " + words[i];
+      if (visibleLength(proposed) > width) {
         out.push(line);
-        line = word;
-        currentWidth = restWidth;
+        line = indent + words[i];
       } else {
         line = proposed;
       }
     }
-    if (line || words.length === 0) out.push(line);
+    out.push(line);
   }
   return out;
 }
@@ -736,14 +780,29 @@ function formatBody(text) {
     // non-asterisk neighbors)
     s = s.replace(/(?<![*\w])\*([^*\n]+)\*(?![*\w])/g, (_, t) => `\x1b[3m${t}\x1b[0m`);
     s = s.replace(/(?<![_\w])_([^_\n]+)_(?![_\w])/g, (_, t) => `\x1b[3m${t}\x1b[0m`);
-    // [text](url) — show text underlined with a dim trailing (url)
+    // [text](url) — show text underlined with a dim, shortened trailing (url)
     s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, t, u) =>
-      `\x1b[4m${t}\x1b[0m${A.dim(` (${u})`)}`,
+      `\x1b[4m${t}\x1b[0m${A.dim(` (${shortenUrl(u)})`)}`,
     );
-    // Bare URLs — underline only the URL itself
-    s = s.replace(/\bhttps?:\/\/[^\s)]+/g, (u) => `\x1b[4m${u}\x1b[0m`);
+    // Bare URLs — underline only the URL itself, shortened if long
+    s = s.replace(/\bhttps?:\/\/[^\s)]+/g, (u) => `\x1b[4m${shortenUrl(u)}\x1b[0m`);
     return s;
   }).join("");
+}
+
+// Long URLs eat a whole wrapped line. Collapse to "host/…/last-segment" so the
+// link stays recognizable without dominating the message. Short URLs are left
+// intact (and remain copy-pasteable).
+function shortenUrl(u) {
+  if (u.length <= 48) return u;
+  try {
+    const { host, pathname } = new URL(u);
+    const tail = pathname.split("/").filter(Boolean).pop() ?? "";
+    const short = tail ? `${host}/…/${tail}` : host;
+    return short.length < u.length ? short : u.slice(0, 45) + "…";
+  } catch {
+    return u.slice(0, 45) + "…";
+  }
 }
 
 async function printAgents() {
