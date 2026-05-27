@@ -54,6 +54,11 @@ const ROOT = args.dir ?? process.env.AGENT_COORD_DIR ?? path.join(homedir(), "ag
 const GROUP_WINDOW = 2 * 60 * 1000;
 let lastBlock = { who: null, ts: 0, kind: null };
 
+// Whether the ephemeral suggestion hint is currently occupying the slot above
+// the prompt (see drawHint/clearHint). Declared early so say(), called during
+// startup replay, can reference it without tripping the const/let TDZ.
+let hintActive = false;
+
 // Matches "@<this agent>" not followed by a name char, so we can flag messages
 // that ping the current user. ID may contain regex metachars — escape it.
 const SELF_MENTION_RE = new RegExp(
@@ -173,9 +178,14 @@ function completer(line) {
   } else if (line.startsWith("/")) {
     hits = SLASH_COMMANDS.filter((c) => c.startsWith(line));
   }
-  if (hits.length > 1 && commonPrefix(hits).length <= substr.length) {
+  if (hits.length > 1) {
+    // Show the options as an ephemeral hint and hand readline only the common
+    // prefix — a single-element completion means its native multi-column dump
+    // never lands in scrollback. Tab still advances to the shared prefix.
     const display = hits.map((h) => h.trim()).join("  ");
-    say(A.dim("  ┄ " + display));
+    drawHint(A.dim("  ┄ " + display));
+    const cp = commonPrefix(hits);
+    return [[cp.length >= substr.length ? cp : substr], substr];
   }
   return [hits, substr];
 }
@@ -202,8 +212,14 @@ const rl = readline.createInterface({
 // the "@" into its line buffer before we inspect it.
 if (process.stdin.isTTY) {
   readline.emitKeypressEvents(process.stdin);
-  process.stdin.on("keypress", (str) => {
-    if (str === "@") setImmediate(showMentionPicker);
+  process.stdin.on("keypress", (str, key) => {
+    // setImmediate lets readline mutate its line buffer first, then we inspect
+    // it / redraw the slot above the prompt.
+    if (str === "@") { setImmediate(showMentionPicker); return; }
+    // Tab is the completer's — it draws/keeps the hint itself. Every other key
+    // dismisses a showing hint so the view snaps back to a clean separator.
+    if (key && key.name === "tab") return;
+    if (hintActive) setImmediate(clearHint);
   });
 }
 
@@ -358,7 +374,28 @@ function agentColor(id) {
   return AGENT_COLORS[idx];
 }
 
+// Ephemeral suggestion line (the @mention / completion picker). It borrows the
+// separator slot directly above the prompt: drawn there, then wiped back to a
+// real separator on the next keystroke — so it never piles up in scrollback.
+function drawHint(content) {
+  if (typeof rl === "undefined" || !lastLineWasSep) return;
+  process.stdout.write("\x1b[1A\r\x1b[2K");  // up to the slot, clear it
+  process.stdout.write(content + "\n");       // draw the hint in place of the sep
+  rl.prompt(true);                            // redraw prompt + preserved input
+  hintActive = true;
+}
+
+function clearHint() {
+  if (typeof rl === "undefined" || !lastLineWasSep) { hintActive = false; return; }
+  if (!hintActive) return;
+  process.stdout.write("\x1b[1A\r\x1b[2K");  // up to the hint slot, clear it
+  process.stdout.write(sepLine() + "\n");     // restore the separator
+  rl.prompt(true);
+  hintActive = false;
+}
+
 function say(line) {
+  hintActive = false; // any real output reclaims the slot the hint borrowed
   if (lastLineWasSep) {
     // Async path: a separator we own sits directly above the prompt; we own
     // that line. Replace it with the incoming message, drop a new sep, and
@@ -878,7 +915,7 @@ function showMentionPicker() {
   const ids = onlineAgentIds().filter((id) => id !== ID);
   if (!ids.length) return;
   const list = ids.map((id) => A.green("●") + agentColor(id)(`@${id}`)).join("  ");
-  say(A.dim("  ┄ ") + list + A.dim("   · Tab to complete"));
+  drawHint(A.dim("  ┄ ") + list + A.dim("   · Tab to complete"));
 }
 
 function readJsonl(file) {
