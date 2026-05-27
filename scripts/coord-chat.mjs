@@ -163,14 +163,12 @@ function completer(line) {
   const mentionMatch = line.match(/@([A-Za-z0-9._-]*)$/);
   if (mentionMatch) {
     const partial = mentionMatch[1];
-    const reg = readJsonSafe(AGENTS_FILE, {});
-    const ids = Object.keys(reg).filter((id) => id.startsWith(partial));
+    const ids = onlineAgentIds().filter((id) => id !== ID && id.startsWith(partial));
     hits = ids.map((id) => `@${id} `);
     substr = mentionMatch[0]; // tell readline to replace just the @partial part
   } else if (line.startsWith("/dm ")) {
     const partial = line.slice(4);
-    const reg = readJsonSafe(AGENTS_FILE, {});
-    const ids = Object.keys(reg).filter((id) => id !== ID && id.startsWith(partial));
+    const ids = onlineAgentIds().filter((id) => id !== ID && id.startsWith(partial));
     hits = ids.map((id) => `/dm ${id} `);
   } else if (line.startsWith("/")) {
     hits = SLASH_COMMANDS.filter((c) => c.startsWith(line));
@@ -197,6 +195,17 @@ const rl = readline.createInterface({
   prompt: makePrompt(),
   completer,
 });
+
+// Auto-offer the logged-in agents the instant "@" is typed (editor-style),
+// so you don't have to press Tab to discover who's reachable. We only observe
+// keypresses — readline still owns input. setImmediate lets readline insert
+// the "@" into its line buffer before we inspect it.
+if (process.stdin.isTTY) {
+  readline.emitKeypressEvents(process.stdin);
+  process.stdin.on("keypress", (str) => {
+    if (str === "@") setImmediate(showMentionPicker);
+  });
+}
 
 // Banner — printed once on launch. Keep it tight; this is a CLI, not a poster.
 printBanner();
@@ -838,6 +847,38 @@ async function printAgents() {
 function pidAlive(pid) {
   try { process.kill(pid, 0); return true; }
   catch (e) { return e?.code === "EPERM"; }
+}
+
+// Agents considered "logged in": a live transport process, or a heartbeat
+// within the stale window. Shared by the @mention picker and completer so we
+// only ever offer reachable agents.
+function onlineAgentIds() {
+  const reg = readJsonSafe(AGENTS_FILE, {});
+  const now = Date.now();
+  const STALE = 5 * 60 * 1000;
+  return Object.keys(reg)
+    .filter((id) => {
+      const a = reg[id];
+      const marker = readJsonSafe(path.join(TRANSPORT_DIR, `${sanitize(id)}.json`), null);
+      const live = marker && marker.pid && pidAlive(marker.pid);
+      return live || now - (a?.lastHeartbeat ?? 0) < STALE;
+    })
+    .sort();
+}
+
+// Pop the list of logged-in agents the moment "@" starts a mention token, so
+// you can see who's reachable without hunting through /list. The list is
+// dim/cosmetic and re-renders above the preserved input line.
+function showMentionPicker() {
+  if (typeof rl === "undefined") return;
+  const before = (rl.line ?? "").slice(0, rl.cursor ?? (rl.line ?? "").length);
+  // Only when the just-typed "@" opens a fresh token (start of line or after
+  // whitespace) — avoids firing inside emails or mid-word.
+  if (!/(^|\s)@$/.test(before)) return;
+  const ids = onlineAgentIds().filter((id) => id !== ID);
+  if (!ids.length) return;
+  const list = ids.map((id) => A.green("●") + agentColor(id)(`@${id}`)).join("  ");
+  say(A.dim("  ┄ ") + list + A.dim("   · Tab to complete"));
 }
 
 function readJsonl(file) {
