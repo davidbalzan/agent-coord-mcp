@@ -9,10 +9,16 @@ import {
   detachAgentTool,
   heartbeatSchema,
   heartbeatTool,
+  joinRoomSchema,
+  joinRoomTool,
   joinSchema,
   joinTool,
+  leaveRoomSchema,
+  leaveRoomTool,
   listAgentsSchema,
   listAgentsTool,
+  listRoomsSchema,
+  listRoomsTool,
   postStatusSchema,
   postStatusTool,
   pruneSchema,
@@ -21,8 +27,14 @@ import {
   readMessagesTool,
   registerSchema,
   registerTool,
+  renameAgentSchema,
+  renameAgentTool,
   sendMessageSchema,
   sendMessageTool,
+  setRoomMotdSchema,
+  setRoomMotdTool,
+  setRoomTopicSchema,
+  setRoomTopicTool,
   statusSchema,
   statusTool,
   unregisterSchema,
@@ -89,14 +101,14 @@ async function main() {
 
   server.tool(
     "send_message",
-    "Send a message. If 'to' is set, goes to that agent's inbox; otherwise to the shared room.",
+    "Send a message. If 'to' is set, goes to that agent's inbox (DM); otherwise to a channel — pass 'room' (e.g. 'seo' or '#seo') to target a specific channel, or omit it for the default 'general' channel.",
     sendMessageSchema,
     async (args) => jsonResult(await sendMessageTool(args))
   );
 
   server.tool(
     "read_messages",
-    "Read new messages from inbox|room|status. Advances the cursor unless peek=true.",
+    "Read new messages from inbox|room|status. For source='room', pass 'room' to read a specific channel (default 'general'). Advances the per-channel cursor unless peek=true.",
     readMessagesSchema,
     async (args) => jsonResult(await readMessagesTool(args))
   );
@@ -117,9 +129,51 @@ async function main() {
 
   server.tool(
     "wait_for_message",
-    "Block (max 60s) until a new message appears on the given source, then return it.",
+    "Block (max 60s) until a new message appears on the given source, then return it. For source='room', pass 'room' to wait on a specific channel (default 'general').",
     waitForMessageSchema,
     async (args) => jsonResult(await waitForMessageTool(args))
+  );
+
+  server.tool(
+    "list_rooms",
+    "List all channels with their topic, MOTD (room rules), members, message count, and last activity.",
+    listRoomsSchema,
+    async () => jsonResult(await listRoomsTool())
+  );
+
+  server.tool(
+    "join_room",
+    "Join a channel (creating it if new). Adds this agent to the channel's membership so the notification hooks push its messages, and returns the channel's topic, MOTD, members, and unread count.",
+    joinRoomSchema,
+    async (args) => jsonResult(await joinRoomTool(args))
+  );
+
+  server.tool(
+    "leave_room",
+    "Leave a channel — removes this agent from its membership. Cannot leave the default 'general' channel.",
+    leaveRoomSchema,
+    async (args) => jsonResult(await leaveRoomTool(args))
+  );
+
+  server.tool(
+    "set_room_topic",
+    "Set a channel's topic (a short one-line description). Posts a system notice to the channel.",
+    setRoomTopicSchema,
+    async (args) => jsonResult(await setRoomTopicTool(args))
+  );
+
+  server.tool(
+    "set_room_motd",
+    "Set a channel's MOTD / room rules (shown to agents on join). Posts a system notice to the channel.",
+    setRoomMotdSchema,
+    async (args) => jsonResult(await setRoomMotdTool(args))
+  );
+
+  server.tool(
+    "rename_agent",
+    "Rename an agent (NICK): migrates its registry entry, inbox, cursor, transport marker, and channel memberships to the new id, then broadcasts a rename notice to its channels. Note: a running attached pusher keeps its old id until restarted.",
+    renameAgentSchema,
+    async (args) => jsonResult(await renameAgentTool(args))
   );
 
   server.tool(

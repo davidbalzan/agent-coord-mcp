@@ -21,6 +21,10 @@ const ROOT =
   process.env.CLAUDE_COORD_DIR ??
   path.join(homedir(), "agent-coord");
 
+// Default channel — declared up here so the hoisted joinedRooms()/roomFile()
+// helpers, called during the top-level drain below, don't trip the const TDZ.
+const DEFAULT_ROOM = "general";
+
 // Prefer the agentId that is actually attached to this tmux pane (via the
 // transports/ registry) over the env-provided one. This is what lets the
 // generic settings.json hook command — which derives AGENT_COORD_ID from the
@@ -36,7 +40,6 @@ if (!AGENT_ID) {
 }
 
 const INBOX = path.join(ROOT, "inbox", `${sanitize(AGENT_ID)}.jsonl`);
-const ROOM = path.join(ROOT, "room.jsonl");
 const CURSOR = path.join(ROOT, "cursors", `${sanitize(AGENT_ID)}.json`);
 const INCLUDE_ROOM = process.env.AGENT_COORD_INCLUDE_ROOM === "1";
 
@@ -44,13 +47,17 @@ const cursor = readJson(CURSOR, {});
 const out = [];
 
 const inbox = drain(INBOX, cursor, "inboxOffset");
-for (const m of inbox) out.push(fmt("inbox", m));
+for (const m of inbox) out.push(fmt("dm", null, m));
 
 if (INCLUDE_ROOM) {
-  const room = drain(ROOM, cursor, "roomOffset");
-  for (const m of room) {
-    if (m.from === AGENT_ID) continue; // don't echo our own room posts back
-    out.push(fmt("room", m));
+  // Drain every channel this agent has joined, each against its own offset
+  // (general → roomOffset, others → roomOffsets[chan]).
+  for (const chan of joinedRooms()) {
+    const room = drainRoom(chan, cursor);
+    for (const m of room) {
+      if (m.from === AGENT_ID) continue; // don't echo our own posts back
+      out.push(fmt("room", chan, m));
+    }
   }
 }
 
@@ -89,11 +96,62 @@ function drain(file, cursor, key) {
   return parsed;
 }
 
-function fmt(source, m) {
+// Drain a channel against its per-channel offset, reading from the file the
+// channel maps to (general → room.jsonl, others → rooms/<chan>.jsonl).
+function drainRoom(chan, cursor) {
+  const c = normalizeRoom(chan);
+  const file = roomFile(c);
+  if (!existsSync(file)) return [];
+  const raw = readFileSync(file, "utf8");
+  const lines = raw.split("\n").filter((l) => l.trim());
+  const start = getRoomOffset(cursor, c);
+  const slice = lines.slice(start);
+  const parsed = [];
+  for (const line of slice) {
+    try { parsed.push(JSON.parse(line)); } catch { /* skip */ }
+  }
+  if (slice.length > 0) setRoomOffset(cursor, c, start + slice.length);
+  return parsed;
+}
+
+function fmt(source, chan, m) {
   const ts = new Date(m.ts ?? Date.now()).toISOString();
   const who = m.from ?? "?";
-  const tag = source === "room" ? "room" : "dm";
+  const tag = source === "room" ? `room #${normalizeRoom(chan)}` : "dm";
   return `  [${tag} ${ts} from=${who}] ${m.text ?? ""}`;
+}
+
+// ---------- channel helpers (mirror src/store.ts) ----------
+
+function normalizeRoom(name) {
+  if (!name) return DEFAULT_ROOM;
+  const n = String(name).trim().replace(/^#+/, "").toLowerCase().replace(/[^a-z0-9._-]/g, "");
+  return n || DEFAULT_ROOM;
+}
+
+function roomFile(chan) {
+  const c = normalizeRoom(chan);
+  return c === DEFAULT_ROOM ? path.join(ROOT, "room.jsonl") : path.join(ROOT, "rooms", `${sanitize(c)}.jsonl`);
+}
+
+function getRoomOffset(cursor, chan) {
+  const c = normalizeRoom(chan);
+  return c === DEFAULT_ROOM ? cursor.roomOffset ?? 0 : cursor.roomOffsets?.[c] ?? 0;
+}
+
+function setRoomOffset(cursor, chan, n) {
+  const c = normalizeRoom(chan);
+  if (c === DEFAULT_ROOM) cursor.roomOffset = n;
+  else (cursor.roomOffsets ??= {})[c] = n;
+}
+
+function joinedRooms() {
+  const reg = readJson(path.join(ROOT, "rooms.json"), {});
+  const out = new Set([DEFAULT_ROOM]);
+  for (const [chan, e] of Object.entries(reg)) {
+    if (e && Array.isArray(e.members) && e.members.includes(AGENT_ID)) out.add(chan);
+  }
+  return [...out];
 }
 
 function readJson(file, fallback) {

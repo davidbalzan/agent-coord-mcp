@@ -8,24 +8,34 @@ import path from "node:path";
 import {
   AGENTS_FILE,
   CURSOR_DIR,
+  DEFAULT_ROOM,
   INBOX_DIR,
-  ROOM_FILE,
+  ROOMS_FILE,
   STATUS_FILE,
+  addMember,
   appendJsonl,
   cursorFile,
   deleteFile,
+  ensureRoom,
   fileSize,
+  getRooms,
   inboxFile,
   listCursorFiles,
   listInboxFiles,
   listTransportFiles,
   logFile,
+  memberRooms,
+  normalizeRoom,
   pidFile,
   readJson,
   readJsonl,
+  removeMember,
   rewriteJsonl,
+  roomFile,
+  setRoomMeta,
   transportFile,
   updateJson,
+  type RoomRegistry,
 } from "./store.js";
 
 type AgentEntry = {
@@ -54,6 +64,8 @@ type Message = {
   to?: string;
   room?: string;
   text: string;
+  // System notices (join/part/topic/nick) — rendered distinctly by clients.
+  system?: boolean;
 };
 
 type StatusEntry = {
@@ -66,9 +78,41 @@ type StatusEntry = {
 
 type Cursor = {
   inboxOffset?: number;
-  roomOffset?: number;
+  roomOffset?: number; // the default channel (`general` → room.jsonl)
   statusOffset?: number;
+  // Per-channel read offsets for every non-default channel.
+  roomOffsets?: Record<string, number>;
 };
+
+type Source = "inbox" | "room" | "status";
+
+// Resolve the physical file for a (source, agent, channel) tuple.
+function sourceFile(source: Source, agentId: string, room?: string): string {
+  if (source === "inbox") return inboxFile(agentId);
+  if (source === "status") return STATUS_FILE;
+  return roomFile(room ?? DEFAULT_ROOM);
+}
+
+// Read/write the cursor offset for a (source, channel). `general` keeps using
+// the flat roomOffset key (hook compat); other channels use roomOffsets[chan].
+function getOffset(cursor: Cursor, source: Source, room?: string): number {
+  if (source === "inbox") return cursor.inboxOffset ?? 0;
+  if (source === "status") return cursor.statusOffset ?? 0;
+  const chan = normalizeRoom(room);
+  return chan === DEFAULT_ROOM ? cursor.roomOffset ?? 0 : cursor.roomOffsets?.[chan] ?? 0;
+}
+
+function setOffset(cursor: Cursor, source: Source, room: string | undefined, n: number): void {
+  if (source === "inbox") { cursor.inboxOffset = n; return; }
+  if (source === "status") { cursor.statusOffset = n; return; }
+  const chan = normalizeRoom(room);
+  if (chan === DEFAULT_ROOM) cursor.roomOffset = n;
+  else (cursor.roomOffsets ??= {})[chan] = n;
+}
+
+function sysMsg(from: string, room: string, text: string): Message {
+  return { id: randomUUID(), ts: Date.now(), from, room, text, system: true };
+}
 
 const STALE_MS = 5 * 60 * 1000;
 const EVICT_MS = 24 * 60 * 60 * 1000;
@@ -224,17 +268,33 @@ export async function sendMessageTool(args: {
   room?: string;
   text: string;
 }) {
+  // DM → inbox. Otherwise resolve the channel (default `general`), make sure it
+  // exists in the registry, and tag the message with its channel.
+  if (args.to) {
+    const msg: Message = {
+      id: randomUUID(),
+      ts: Date.now(),
+      from: args.from,
+      to: args.to,
+      text: args.text,
+    };
+    const target = inboxFile(args.to);
+    await appendJsonl(target, msg);
+    return { ok: true, id: msg.id, target, room: undefined };
+  }
+
+  const chan = normalizeRoom(args.room);
+  if (chan !== DEFAULT_ROOM) await ensureRoom(chan, args.from);
   const msg: Message = {
     id: randomUUID(),
     ts: Date.now(),
     from: args.from,
-    to: args.to,
-    room: args.room,
+    room: chan,
     text: args.text,
   };
-  const target = args.to ? inboxFile(args.to) : ROOM_FILE;
+  const target = roomFile(chan);
   await appendJsonl(target, msg);
-  return { ok: true, id: msg.id, target };
+  return { ok: true, id: msg.id, target, room: chan };
 }
 
 // ---------- read_messages ----------
@@ -242,6 +302,7 @@ export async function sendMessageTool(args: {
 export const readMessagesSchema = {
   agentId: z.string().min(1),
   source: z.enum(["inbox", "room", "status"]),
+  room: z.string().optional(),
   limit: z.number().int().positive().max(500).optional(),
   peek: z.boolean().optional(),
   sinceTs: z.number().optional(),
@@ -249,13 +310,13 @@ export const readMessagesSchema = {
 
 export async function readMessagesTool(args: {
   agentId: string;
-  source: "inbox" | "room" | "status";
+  source: Source;
+  room?: string;
   limit?: number;
   peek?: boolean;
   sinceTs?: number;
 }) {
-  const file = sourceFile(args.source, args.agentId);
-  const offsetKey = offsetKeyFor(args.source);
+  const file = sourceFile(args.source, args.agentId, args.room);
   const all = await readJsonl<Message | StatusEntry>(file);
 
   let limited: (Message | StatusEntry)[] = [];
@@ -263,19 +324,19 @@ export async function readMessagesTool(args: {
 
   if (args.peek) {
     const cursor = await readJson<Cursor>(cursorFile(args.agentId), {});
-    const startOffset = cursor[offsetKey] ?? 0;
+    const startOffset = getOffset(cursor, args.source, args.room);
     let entries = all.slice(startOffset);
     if (args.sinceTs !== undefined) entries = entries.filter((e) => e.ts > args.sinceTs!);
     totalNew = entries.length;
     limited = args.limit ? entries.slice(0, args.limit) : entries;
   } else {
     await updateJson<Cursor>(cursorFile(args.agentId), {}, (current) => {
-      const startOffset = current[offsetKey] ?? 0;
+      const startOffset = getOffset(current, args.source, args.room);
       let entries = all.slice(startOffset);
       if (args.sinceTs !== undefined) entries = entries.filter((e) => e.ts > args.sinceTs!);
       totalNew = entries.length;
       limited = args.limit ? entries.slice(0, args.limit) : entries;
-      if (limited.length > 0) current[offsetKey] = startOffset + limited.length;
+      if (limited.length > 0) setOffset(current, args.source, args.room, startOffset + limited.length);
       return current;
     });
   }
@@ -288,7 +349,12 @@ export async function readMessagesTool(args: {
       ? limited.filter((e) => entryAuthor(e) !== args.agentId)
       : limited;
 
-  return { messages: visible, totalNew, returned: visible.length };
+  return {
+    messages: visible,
+    totalNew,
+    returned: visible.length,
+    room: args.source === "room" ? normalizeRoom(args.room) : undefined,
+  };
 }
 
 function entryAuthor(e: Message | StatusEntry): string | undefined {
@@ -320,16 +386,18 @@ export async function postStatusTool(args: { agentId: string; status: string; de
 export const waitForMessageSchema = {
   agentId: z.string().min(1),
   source: z.enum(["inbox", "room", "status"]),
+  room: z.string().optional(),
   timeoutMs: z.number().int().positive().max(MAX_WAIT_MS).optional(),
 };
 
 export async function waitForMessageTool(args: {
   agentId: string;
-  source: "inbox" | "room" | "status";
+  source: Source;
+  room?: string;
   timeoutMs?: number;
 }) {
   const totalTimeout = Math.min(args.timeoutMs ?? 30_000, MAX_WAIT_MS);
-  const file = sourceFile(args.source, args.agentId);
+  const file = sourceFile(args.source, args.agentId, args.room);
   const deadline = Date.now() + totalTimeout;
 
   // Loop so that file growth caused only by the agent's own self-posts (which
@@ -373,7 +441,7 @@ export async function waitForMessageTool(args: {
     });
 
     if (!changed) break;
-    const result = await readMessagesTool({ agentId: args.agentId, source: args.source });
+    const result = await readMessagesTool({ agentId: args.agentId, source: args.source, room: args.room });
     if (result.returned > 0) return result;
     // otherwise, only self-posts arrived; keep waiting on the remaining budget
   }
@@ -401,8 +469,14 @@ export async function pruneTool(args: {
   const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
   const knownAgents = new Set(Object.keys(reg));
 
+  const channels = Object.keys(await getRooms());
+
   if (dryRun) {
-    const room = await readJsonl<Message>(ROOM_FILE);
+    let roomMessages = 0;
+    for (const chan of channels) {
+      const msgs = await readJsonl<Message>(roomFile(chan));
+      roomMessages += msgs.filter((e) => e.ts <= cutoff).length;
+    }
     const status = await readJsonl<StatusEntry>(STATUS_FILE);
     const inboxFiles = await listInboxFiles();
     let inboxRemoved = 0;
@@ -418,7 +492,7 @@ export async function pruneTool(args: {
       cutoff,
       olderThanDays: days,
       wouldRemove: {
-        roomMessages: room.filter((e) => e.ts <= cutoff).length,
+        roomMessages,
         statusEntries: status.filter((e) => e.ts <= cutoff).length,
         inboxMessages: inboxRemoved,
         orphanInboxes: orphans,
@@ -426,7 +500,17 @@ export async function pruneTool(args: {
     };
   }
 
-  const roomResult = await rewriteJsonl<Message>(ROOM_FILE, (e) => e.ts > cutoff);
+  // Per-channel removed counts so we can shift the matching offset in each
+  // cursor (default channel → roomOffset, others → roomOffsets[chan]).
+  const roomRemovedByChan: Record<string, number> = {};
+  let roomRemovedTotal = 0;
+  for (const chan of channels) {
+    const r = await rewriteJsonl<Message>(roomFile(chan), (e) => e.ts > cutoff);
+    if (r.removed > 0) {
+      roomRemovedByChan[chan] = r.removed;
+      roomRemovedTotal += r.removed;
+    }
+  }
   const statusResult = await rewriteJsonl<StatusEntry>(STATUS_FILE, (e) => e.ts > cutoff);
 
   const inboxFiles = await listInboxFiles();
@@ -460,9 +544,16 @@ export async function pruneTool(args: {
     const cursorPath = path.join(CURSOR_DIR, cname);
     let touched = false;
     await updateJson<Cursor>(cursorPath, {}, (current) => {
-      if (current.roomOffset !== undefined && roomResult.removed > 0) {
-        current.roomOffset = Math.max(0, current.roomOffset - roomResult.removed);
-        touched = true;
+      for (const [chan, removed] of Object.entries(roomRemovedByChan)) {
+        if (chan === DEFAULT_ROOM) {
+          if (current.roomOffset !== undefined) {
+            current.roomOffset = Math.max(0, current.roomOffset - removed);
+            touched = true;
+          }
+        } else if (current.roomOffsets?.[chan] !== undefined) {
+          current.roomOffsets[chan] = Math.max(0, current.roomOffsets[chan] - removed);
+          touched = true;
+        }
       }
       if (current.statusOffset !== undefined && statusResult.removed > 0) {
         current.statusOffset = Math.max(0, current.statusOffset - statusResult.removed);
@@ -483,7 +574,7 @@ export async function pruneTool(args: {
     cutoff,
     olderThanDays: days,
     removed: {
-      roomMessages: roomResult.removed,
+      roomMessages: roomRemovedTotal,
       statusEntries: statusResult.removed,
       inboxMessages: inboxRemoved,
       orphanInboxes: deletedOrphans,
@@ -747,16 +838,156 @@ export async function joinTool(args: {
   };
 }
 
-// ---------- helpers ----------
+// ---------- room / channel tools ----------
 
-function sourceFile(source: "inbox" | "room" | "status", agentId: string): string {
-  if (source === "inbox") return inboxFile(agentId);
-  if (source === "room") return ROOM_FILE;
-  return STATUS_FILE;
+export const listRoomsSchema = {} as const;
+
+export async function listRoomsTool() {
+  const reg = await getRooms();
+  const rooms = [];
+  for (const [room, e] of Object.entries(reg)) {
+    const msgs = await readJsonl<Message>(roomFile(room));
+    rooms.push({
+      room,
+      topic: e.topic,
+      motd: e.motd,
+      members: e.members ?? [],
+      memberCount: (e.members ?? []).length,
+      messageCount: msgs.length,
+      lastTs: msgs.length ? msgs[msgs.length - 1].ts : undefined,
+      createdAt: e.createdAt,
+      createdBy: e.createdBy,
+    });
+  }
+  return { rooms };
 }
 
-function offsetKeyFor(source: "inbox" | "room" | "status"): keyof Cursor {
-  if (source === "inbox") return "inboxOffset";
-  if (source === "room") return "roomOffset";
-  return "statusOffset";
+export const joinRoomSchema = {
+  agentId: z.string().min(1),
+  room: z.string().min(1),
+};
+
+export async function joinRoomTool(args: { agentId: string; room: string }) {
+  const chan = normalizeRoom(args.room);
+  await ensureRoom(chan, args.agentId);
+  await addMember(chan, args.agentId);
+  const reg = await getRooms();
+  const e = reg[chan];
+  const all = await readJsonl<Message>(roomFile(chan));
+  const cursor = await readJson<Cursor>(cursorFile(args.agentId), {});
+  const unread = Math.max(0, all.length - getOffset(cursor, "room", chan));
+  return {
+    ok: true,
+    room: chan,
+    topic: e?.topic,
+    motd: e?.motd,
+    members: e?.members ?? [],
+    unread,
+  };
+}
+
+export const leaveRoomSchema = {
+  agentId: z.string().min(1),
+  room: z.string().min(1),
+};
+
+export async function leaveRoomTool(args: { agentId: string; room: string }) {
+  const chan = normalizeRoom(args.room);
+  if (chan === DEFAULT_ROOM) {
+    return { ok: false, error: "cannot leave the default channel" };
+  }
+  await removeMember(chan, args.agentId);
+  return { ok: true, room: chan };
+}
+
+export const setRoomTopicSchema = {
+  agentId: z.string().min(1),
+  room: z.string().min(1),
+  topic: z.string(),
+};
+
+export async function setRoomTopicTool(args: { agentId: string; room: string; topic: string }) {
+  const chan = normalizeRoom(args.room);
+  await ensureRoom(chan, args.agentId);
+  await setRoomMeta(chan, { topic: args.topic }, args.agentId);
+  await appendJsonl(roomFile(chan), sysMsg(args.agentId, chan, `changed topic to: ${args.topic}`));
+  return { ok: true, room: chan, topic: args.topic };
+}
+
+export const setRoomMotdSchema = {
+  agentId: z.string().min(1),
+  room: z.string().min(1),
+  motd: z.string(),
+};
+
+export async function setRoomMotdTool(args: { agentId: string; room: string; motd: string }) {
+  const chan = normalizeRoom(args.room);
+  await ensureRoom(chan, args.agentId);
+  await setRoomMeta(chan, { motd: args.motd }, args.agentId);
+  await appendJsonl(roomFile(chan), sysMsg(args.agentId, chan, `updated the room rules (MOTD)`));
+  return { ok: true, room: chan, motd: args.motd };
+}
+
+// ---------- rename_agent (NICK) ----------
+
+export const renameAgentSchema = {
+  agentId: z.string().min(1),
+  newAgentId: z.string().min(1),
+};
+
+export async function renameAgentTool(args: { agentId: string; newAgentId: string }) {
+  const oldId = args.agentId;
+  const newId = args.newAgentId;
+  if (oldId === newId) return { ok: false, error: "new id is identical to the current id" };
+
+  const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
+  if (!reg[oldId]) return { ok: false, error: `agent '${oldId}' not registered` };
+  if (reg[newId]) return { ok: false, error: `agent '${newId}' already exists` };
+
+  const joined = await memberRooms(oldId);
+
+  // Registry: move the entry under the new key.
+  await updateJson<AgentRegistry>(AGENTS_FILE, {}, (current) => {
+    if (current[oldId]) {
+      current[newId] = { ...current[oldId], agentId: newId };
+      delete current[oldId];
+    }
+    return current;
+  });
+
+  // Channel memberships: rename in place.
+  await updateJson<RoomRegistry>(ROOMS_FILE, {}, (current) => {
+    for (const e of Object.values(current)) {
+      if (e.members?.includes(oldId)) e.members = e.members.map((m) => (m === oldId ? newId : m));
+    }
+    return current;
+  });
+
+  // Per-agent files: inbox, cursor, transport marker.
+  await moveFile(inboxFile(oldId), inboxFile(newId));
+  await moveFile(cursorFile(oldId), cursorFile(newId));
+  await moveFile(transportFile(oldId), transportFile(newId));
+
+  // Broadcast a NICK notice to every channel the agent was in.
+  for (const chan of joined) {
+    await appendJsonl(roomFile(chan), sysMsg(newId, chan, `is now known as ${newId} (was ${oldId})`));
+  }
+
+  return { ok: true, from: oldId, to: newId, rooms: joined };
+}
+
+// ---------- helpers ----------
+
+async function moveFile(from: string, to: string): Promise<boolean> {
+  if (!existsSync(from)) return false;
+  await fsp.mkdir(path.dirname(to), { recursive: true });
+  try {
+    await fsp.rename(from, to);
+  } catch {
+    // Cross-device or other rename failure — fall back to copy + unlink.
+    const data = await fsp.readFile(from);
+    await fsp.writeFile(to, data);
+    await fsp.unlink(from);
+  }
+  return true;
 }

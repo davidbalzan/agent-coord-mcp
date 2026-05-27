@@ -41,7 +41,7 @@ import lockfile from "proper-lockfile";
 // ---------- args ----------
 
 const args = parseArgs(process.argv.slice(2));
-const ID = args.id ?? process.env.USER ?? "human";
+let ID = args.id ?? process.env.USER ?? "human"; // reassignable so /nick can rebind it
 const ROOT = args.dir ?? process.env.AGENT_COORD_DIR ?? path.join(homedir(), "agent-coord");
 
 // Message-rendering state + helpers. Declared up here (above the top-level
@@ -61,7 +61,7 @@ let hintActive = false;
 
 // Matches "@<this agent>" not followed by a name char, so we can flag messages
 // that ping the current user. ID may contain regex metachars — escape it.
-const SELF_MENTION_RE = new RegExp(
+let SELF_MENTION_RE = new RegExp(
   "@" + ID.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(?![A-Za-z0-9._-])",
 );
 const mentionsSelf = (text) => SELF_MENTION_RE.test(text ?? "");
@@ -81,11 +81,81 @@ const CURSOR_DIR = path.join(ROOT, "cursors");
 const TRANSPORT_DIR = path.join(ROOT, "transports");
 const AGENTS_FILE = path.join(ROOT, "agents.json");
 const ROOM_FILE = path.join(ROOT, "room.jsonl");
-const INBOX_FILE = path.join(INBOX_DIR, `${sanitize(ID)}.jsonl`);
-const CURSOR_FILE = path.join(CURSOR_DIR, `${sanitize(ID)}.json`);
+const ROOMS_DIR = path.join(ROOT, "rooms");
+const ROOMS_FILE = path.join(ROOT, "rooms.json");
+let INBOX_FILE = path.join(INBOX_DIR, `${sanitize(ID)}.jsonl`);
+let CURSOR_FILE = path.join(CURSOR_DIR, `${sanitize(ID)}.json`);
 
 mkdirSync(INBOX_DIR, { recursive: true });
 mkdirSync(CURSOR_DIR, { recursive: true });
+mkdirSync(ROOMS_DIR, { recursive: true });
+
+// ---------- channels ----------
+// Mirrors src/store.ts: `general` keeps using room.jsonl + the flat roomOffset
+// cursor key (hook/back-compat); other channels live in rooms/<chan>.jsonl with
+// their offset under cursor.roomOffsets[chan]. currentRoom is the focused
+// channel that plain text posts to; we tail every channel we've joined.
+const DEFAULT_ROOM = "general";
+let currentRoom = DEFAULT_ROOM;
+const ignored = new Set(); // session-local /ignore — agentIds whose msgs we hide
+
+function normalizeRoom(name) {
+  if (!name) return DEFAULT_ROOM;
+  const n = String(name).trim().replace(/^#+/, "").toLowerCase().replace(/[^a-z0-9._-]/g, "");
+  return n || DEFAULT_ROOM;
+}
+
+function roomFile(chan) {
+  const c = normalizeRoom(chan);
+  return c === DEFAULT_ROOM ? ROOM_FILE : path.join(ROOMS_DIR, `${sanitize(c)}.jsonl`);
+}
+
+function getRoomOffset(cursor, chan) {
+  const c = normalizeRoom(chan);
+  return c === DEFAULT_ROOM ? cursor.roomOffset ?? 0 : cursor.roomOffsets?.[c] ?? 0;
+}
+
+function setRoomOffset(cursor, chan, n) {
+  const c = normalizeRoom(chan);
+  if (c === DEFAULT_ROOM) cursor.roomOffset = n;
+  else (cursor.roomOffsets ??= {})[c] = n;
+}
+
+function getRooms() {
+  const reg = readJsonSafe(ROOMS_FILE, {});
+  if (!reg[DEFAULT_ROOM]) reg[DEFAULT_ROOM] = { createdAt: 0, createdBy: "system", members: [] };
+  return reg;
+}
+
+// Channels this agent has joined (always includes the default channel).
+function joinedRooms() {
+  const reg = getRooms();
+  const out = new Set([DEFAULT_ROOM]);
+  for (const [chan, e] of Object.entries(reg)) {
+    if (e.members?.includes(ID)) out.add(chan);
+  }
+  return [...out];
+}
+
+async function updateRooms(mutate) {
+  await withLock(ROOMS_FILE, async () => {
+    const reg = readJsonSafe(ROOMS_FILE, {});
+    mutate(reg);
+    writeJsonAtomic(ROOMS_FILE, reg);
+  });
+}
+
+const watchedRooms = new Set();
+function watchRoom(chan) {
+  const f = roomFile(chan);
+  if (watchedRooms.has(f)) return;
+  try {
+    watch(f, () => void drainAndPrint());
+    watchedRooms.add(f);
+  } catch {
+    // file may not exist yet; the 1s interval drain covers it until it does
+  }
+}
 
 // ---------- ANSI helpers ----------
 
@@ -146,8 +216,10 @@ if (TTY) {
 }
 
 const SLASH_COMMANDS = [
-  "/dm", "/list", "/who", "/whoami", "/last", "/find", "/clear", "/cls",
-  "/me", "/status", "/prune", "/kick", "/wipe-room",
+  "/dm", "/msg", "/list", "/who", "/whoami", "/whois", "/last", "/find",
+  "/clear", "/cls", "/me", "/status", "/away", "/back", "/ignore", "/unignore",
+  "/nick", "/join", "/part", "/leave", "/rooms", "/channels", "/topic", "/motd",
+  "/rules", "/prune", "/kick", "/wipe-room",
   "/help", "/?", "/quit", "/exit",
 ];
 
@@ -175,8 +247,20 @@ function completer(line) {
     const partial = line.slice(4);
     const ids = onlineAgentIds().filter((id) => id !== ID && id.startsWith(partial));
     hits = ids.map((id) => `/dm ${id} `);
-  } else if (line.startsWith("/")) {
-    hits = SLASH_COMMANDS.filter((c) => c.startsWith(line));
+  } else if (/^\/whois\s/.test(line)) {
+    const partial = line.replace(/^\/whois\s+/, "");
+    hits = onlineAgentIds().filter((id) => id.startsWith(partial)).map((id) => `/whois ${id} `);
+  } else {
+    // Channel-name completion for the channel-taking commands.
+    const cm = line.match(/^\/(join|part|leave|msg)\s+#?(\S*)$/);
+    if (cm) {
+      const cmd = cm[1];
+      const partial = cm[2];
+      const chans = Object.keys(getRooms()).filter((c) => c.startsWith(partial));
+      hits = chans.map((c) => `/${cmd} #${c} `);
+    } else if (line.startsWith("/")) {
+      hits = SLASH_COMMANDS.filter((c) => c.startsWith(line));
+    }
   }
   if (hits.length > 1) {
     // Show the options as an ephemeral hint and hand readline only the common
@@ -237,21 +321,32 @@ process.stdout.write(sepLine() + "\n");
 lastLineWasSep = true;
 
 try { watch(INBOX_FILE, () => void drainAndPrint()); } catch {}
-try { watch(ROOM_FILE, () => void drainAndPrint()); } catch {}
+for (const chan of joinedRooms()) watchRoom(chan);
 try { watch(AGENTS_FILE, () => refreshPrompt()); } catch {}
 setInterval(() => void drainAndPrint(), 1000);
 setInterval(refreshPrompt, 5000);
 
 rl.prompt();
 
-rl.on("line", async (line) => {
+// Serialize line handling: readline fires 'line' events back-to-back for
+// pasted/piped input, and our handlers are async (channel switches, file RMW).
+// Chaining them guarantees e.g. "/join #x" fully completes — currentRoom set —
+// before the next line posts, so a message can't leak into the old channel.
+let lineChain = Promise.resolve();
+rl.on("line", (line) => {
+  lineChain = lineChain.then(() => handleLine(line)).catch(() => {});
+});
+
+async function handleLine(line) {
   const text = line.trim();
   if (!text) return rl.prompt();
   // The user's typed-and-submitted line is now in scrollback; it is NOT a
   // separator slot we own. Sync output from commands should write naturally.
   lastLineWasSep = false;
   try {
-    if (text === "/quit" || text === "/exit") {
+    if (text === "/quit" || text === "/exit" || text.startsWith("/quit ") || text.startsWith("/exit ")) {
+      const msg = text.replace(/^\/(quit|exit)\s*/, "").trim();
+      for (const chan of joinedRooms()) await sendSystem(chan, msg ? `has quit (${msg})` : "has quit");
       await unregister();
       teardownFooter();
       process.stdout.write(A.dim("bye.\n"));
@@ -260,6 +355,36 @@ rl.on("line", async (line) => {
       printHelp();
     } else if (text === "/list" || text === "/who") {
       await printAgents();
+    } else if (text === "/rooms" || text === "/channels") {
+      listRooms();
+    } else if (text.startsWith("/join ") || text === "/join") {
+      const chan = text.slice(5).trim();
+      if (!chan) say(A.red("usage: /join <#channel>"));
+      else await joinRoom(chan);
+    } else if (text === "/part" || text.startsWith("/part ") || text === "/leave" || text.startsWith("/leave ")) {
+      await partRoom(text.replace(/^\/(part|leave)\s*/, "").trim());
+    } else if (text === "/topic" || text.startsWith("/topic ")) {
+      await setTopic(text.slice(6).trim());
+    } else if (text === "/motd" || text.startsWith("/motd ") || text === "/rules" || text.startsWith("/rules ")) {
+      await setMotd(text.replace(/^\/(motd|rules)\s*/, "").trim());
+    } else if (text.startsWith("/msg ")) {
+      const m = text.match(/^\/msg\s+(\S+)\s+([\s\S]+)$/);
+      if (!m) say(A.red("usage: /msg <#channel> <text>"));
+      else { await sendRoom(m[2], m[1]); say(A.dim(`→ sent to #${normalizeRoom(m[1])}`)); }
+    } else if (text.startsWith("/whois ")) {
+      const target = text.slice(7).trim();
+      if (!target) say(A.red("usage: /whois <agent>"));
+      else whois(target);
+    } else if (text === "/away" || text.startsWith("/away ")) {
+      await setAway(text.slice(5).trim());
+    } else if (text === "/back") {
+      await setBack();
+    } else if (text.startsWith("/ignore")) {
+      ignoreAgent(text.slice(7).trim());
+    } else if (text.startsWith("/unignore")) {
+      unignoreAgent(text.slice(9).trim());
+    } else if (text === "/nick" || text.startsWith("/nick ")) {
+      await nick(text.slice(5).trim());
     } else if (text === "/whoami") {
       await printWhoami();
     } else if (text === "/clear" || text === "/cls") {
@@ -311,7 +436,7 @@ rl.on("line", async (line) => {
   process.stdout.write(sepLine() + "\n");
   lastLineWasSep = true;
   rl.prompt();
-});
+}
 
 process.on("SIGINT", async () => {
   try { await unregister(); } catch {}
@@ -427,7 +552,8 @@ function makePrompt() {
     if (live || now - a.lastHeartbeat < STALE) online++;
   }
   const peers = online === 1 ? "1 peer" : `${online} peers`;
-  return `${agentColor(ID)(ID)} ${A.dim(`(${peers})`)}${A.dim(">")} `;
+  const chan = A.dim("#") + normalizeRoom(currentRoom);
+  return `${agentColor(ID)(ID)} ${agentColor(currentRoom)(chan)} ${A.dim(`(${peers})`)}${A.dim(">")} `;
 }
 
 // No-op stubs kept so the exit paths don't reference deleted functions.
@@ -452,22 +578,35 @@ function printBanner() {
 
 function printHelp() {
   const rows = [
-    ["<text>",              "post to the shared room"],
+    ["<text>",              "post to the current channel"],
     ["/dm <agent> <text>",  "send a direct message"],
+    ["/msg <#chan> <text>", "post to a channel without switching to it"],
     ["/me <action>",        "post an IRC-style action (* you wave)"],
     ["/status <text>",      "post to the status broadcast channel"],
+    [A.dim("--- channels ---"), ""],
+    ["/join <#chan>",       "join (and switch to) a channel, creating it if new"],
+    ["/part [#chan]",       "leave the current (or named) channel"],
+    ["/rooms",              "list all channels (topic + members)"],
+    ["/topic [text]",       "show or set the current channel's topic"],
+    ["/motd [text]",        "show or set the channel rules (MOTD)"],
+    [A.dim("--- people ---"), ""],
     ["/list, /who",         "show registered agents + transports"],
+    ["/whois <agent>",      "show an agent's detail (role, channels, status)"],
     ["/whoami",             "show your registration + transport"],
+    ["/nick <name>",        "rename yourself (migrates inbox/history)"],
+    ["/away [msg], /back",  "set or clear your away status"],
+    ["/ignore <agent>",     "mute an agent for this session (/unignore to undo)"],
+    [A.dim("--- history ---"), ""],
     ["/last [n]",           "show last n messages (default 20)"],
-    ["/find <text>",        "search recent inbox + room history"],
+    ["/find <text>",        "search recent inbox + channel history"],
     ["/clear",              "clear the screen"],
     [A.dim("--- admin ---"), ""],
     ["/prune [days]",       "drop messages older than N days (default 7)"],
     ["/kick <agent>",       "unregister an agent + kill their pusher"],
-    ["/wipe-room",          "truncate the shared room (destructive)"],
+    ["/wipe-room",          "truncate the current channel (destructive)"],
     [A.dim("---"),          ""],
     ["/help, /?",           "this list"],
-    ["/quit, /exit",        "unregister and leave"],
+    ["/quit [msg], /exit",  "unregister and leave"],
   ];
   say(A.bold("commands:"));
   for (const [cmd, desc] of rows) {
@@ -495,14 +634,19 @@ function fastForwardCursors() {
   // new messages going forward.
   const cur = readJsonSafe(CURSOR_FILE, {});
   cur.inboxOffset = readJsonl(INBOX_FILE).length;
-  cur.roomOffset = readJsonl(ROOM_FILE).length;
+  for (const chan of joinedRooms()) setRoomOffset(cur, chan, readJsonl(roomFile(chan)).length);
   writeJsonAtomic(CURSOR_FILE, cur);
 }
 
 async function printRecent(n) {
   const inbox = readJsonl(INBOX_FILE).slice(-n).map((m) => ({ ...m, _kind: "DM" }));
-  const room = readJsonl(ROOM_FILE).slice(-n).map((m) => ({ ...m, _kind: "room" }));
-  const all = [...inbox, ...room].sort((a, b) => a.ts - b.ts).slice(-n);
+  let rooms = [];
+  for (const chan of joinedRooms()) {
+    rooms = rooms.concat(
+      readJsonl(roomFile(chan)).slice(-n).map((m) => ({ ...m, _kind: "room", room: m.room ?? chan })),
+    );
+  }
+  const all = [...inbox, ...rooms].sort((a, b) => a.ts - b.ts).slice(-n);
   if (!all.length) return say(A.dim("(no history)"));
   say(A.bold(`last ${all.length} message(s):`));
   for (const m of all) printMsg(m._kind, m, { history: true });
@@ -534,8 +678,14 @@ async function register() {
       role: existing?.role ?? "human",
       registeredAt: existing?.registeredAt ?? now,
       lastHeartbeat: now,
+      away: existing?.away,
     };
     writeJsonAtomic(AGENTS_FILE, reg);
+  });
+  // Record default-channel membership so /rooms + the hooks see us there.
+  await updateRooms((reg) => {
+    const e = (reg[DEFAULT_ROOM] ??= { createdAt: 0, createdBy: "system", members: [] });
+    if (!e.members.includes(ID)) e.members.push(ID);
   });
 }
 
@@ -544,6 +694,11 @@ async function unregister() {
     const reg = readJsonSafe(AGENTS_FILE, {});
     delete reg[ID];
     writeJsonAtomic(AGENTS_FILE, reg);
+  });
+  await updateRooms((reg) => {
+    for (const e of Object.values(reg)) {
+      if (e.members?.includes(ID)) e.members = e.members.filter((m) => m !== ID);
+    }
   });
 }
 
@@ -563,18 +718,17 @@ async function postStatus(status) {
 async function pruneOld(days) {
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
   let total = 0;
-  // Per-file removal counts so we can shift the corresponding cursor
-  // offsets — without this, every other agent's roomOffset/statusOffset/
-  // inboxOffset would point past the now-shorter file and they'd silently
-  // miss messages until enough new ones piled up to overtake the stale offset.
-  let roomRemoved = 0;
+  // Per-channel removal counts so we can shift the corresponding cursor
+  // offsets — without this, every other agent's offsets would point past the
+  // now-shorter file and they'd silently miss messages until enough new ones
+  // piled up to overtake the stale offset.
+  const roomRemovedByChan = {};
   let statusRemoved = 0;
   const inboxRemoved = {}; // agentId → count
 
-  const files = [
-    { path: ROOM_FILE, kind: "room" },
-    { path: STATUS_FILE_PATH, kind: "status" },
-  ];
+  const files = [];
+  for (const chan of Object.keys(getRooms())) files.push({ path: roomFile(chan), kind: "room", chan });
+  files.push({ path: STATUS_FILE_PATH, kind: "status" });
   if (existsSync(INBOX_DIR)) {
     for (const n of readdirSync(INBOX_DIR)) {
       if (n.endsWith(".jsonl")) {
@@ -591,29 +745,32 @@ async function pruneOld(days) {
       const body = kept.length ? kept.map((e) => JSON.stringify(e)).join("\n") + "\n" : "";
       writeFileSync(f.path, body);
       total += removed;
-      if (f.kind === "room") roomRemoved += removed;
-      else if (f.kind === "status") statusRemoved += removed;
+      if (f.kind === "room") {
+        const c = normalizeRoom(f.chan);
+        roomRemovedByChan[c] = (roomRemovedByChan[c] ?? 0) + removed;
+      } else if (f.kind === "status") statusRemoved += removed;
       else inboxRemoved[f.agentId] = (inboxRemoved[f.agentId] ?? 0) + removed;
     }
   }
-  if (roomRemoved || statusRemoved || Object.keys(inboxRemoved).length) {
-    shiftAllCursors({ roomRemoved, statusRemoved, inboxRemoved });
+  if (Object.keys(roomRemovedByChan).length || statusRemoved || Object.keys(inboxRemoved).length) {
+    shiftAllCursors({ roomRemovedByChan, statusRemoved, inboxRemoved });
   }
   say(A.dim(`→ pruned ${total} entries older than ${days}d (cursors adjusted)`));
 }
 
 async function wipeRoom() {
-  await ensureFile(ROOM_FILE);
-  writeFileSync(ROOM_FILE, "");
-  // Reset every agent's roomOffset to 0 so they start reading the (now empty)
-  // file from the beginning. Otherwise their stale offsets point past EOF.
-  resetAllRoomOffsets();
-  say(A.dim("→ room wiped (all room cursors reset)"));
+  const chan = normalizeRoom(currentRoom);
+  await ensureFile(roomFile(chan));
+  writeFileSync(roomFile(chan), "");
+  // Reset every agent's offset for this channel so they re-read from the start
+  // of the (now empty) file rather than pointing past EOF.
+  resetRoomOffsets(chan);
+  say(A.dim(`→ #${chan} wiped (channel cursors reset)`));
 }
 
 // Walk every cursor file and shift offsets down by the per-channel removed
 // counts. Mirrors what the MCP prune tool does server-side.
-function shiftAllCursors({ roomRemoved = 0, statusRemoved = 0, inboxRemoved = {} }) {
+function shiftAllCursors({ roomRemovedByChan = {}, statusRemoved = 0, inboxRemoved = {} }) {
   if (!existsSync(CURSOR_DIR)) return;
   for (const name of readdirSync(CURSOR_DIR)) {
     if (!name.endsWith(".json")) continue;
@@ -621,9 +778,13 @@ function shiftAllCursors({ roomRemoved = 0, statusRemoved = 0, inboxRemoved = {}
     const cur = readJsonSafe(cursorPath, {});
     const id = name.replace(/\.json$/, "");
     let touched = false;
-    if (cur.roomOffset !== undefined && roomRemoved > 0) {
-      cur.roomOffset = Math.max(0, cur.roomOffset - roomRemoved);
-      touched = true;
+    for (const [chan, removed] of Object.entries(roomRemovedByChan)) {
+      if (removed <= 0) continue;
+      const has = chan === DEFAULT_ROOM ? cur.roomOffset !== undefined : cur.roomOffsets?.[chan] !== undefined;
+      if (has) {
+        setRoomOffset(cur, chan, Math.max(0, getRoomOffset(cur, chan) - removed));
+        touched = true;
+      }
     }
     if (cur.statusOffset !== undefined && statusRemoved > 0) {
       cur.statusOffset = Math.max(0, cur.statusOffset - statusRemoved);
@@ -638,14 +799,15 @@ function shiftAllCursors({ roomRemoved = 0, statusRemoved = 0, inboxRemoved = {}
   }
 }
 
-function resetAllRoomOffsets() {
+function resetRoomOffsets(chan) {
   if (!existsSync(CURSOR_DIR)) return;
+  const c = normalizeRoom(chan);
   for (const name of readdirSync(CURSOR_DIR)) {
     if (!name.endsWith(".json")) continue;
     const cursorPath = path.join(CURSOR_DIR, name);
     const cur = readJsonSafe(cursorPath, {});
-    if (cur.roomOffset !== undefined && cur.roomOffset !== 0) {
-      cur.roomOffset = 0;
+    if (getRoomOffset(cur, c) !== 0) {
+      setRoomOffset(cur, c, 0);
       writeJsonAtomic(cursorPath, cur);
     }
   }
@@ -686,8 +848,11 @@ async function kickAgent(target) {
 async function findInHistory(term) {
   const t = term.toLowerCase();
   const inbox = readJsonl(INBOX_FILE).map((m) => ({ ...m, _kind: "DM" }));
-  const room = readJsonl(ROOM_FILE).map((m) => ({ ...m, _kind: "room" }));
-  const matches = [...inbox, ...room]
+  let rooms = [];
+  for (const chan of joinedRooms()) {
+    rooms = rooms.concat(readJsonl(roomFile(chan)).map((m) => ({ ...m, _kind: "room", room: m.room ?? chan })));
+  }
+  const matches = [...inbox, ...rooms]
     .filter((m) => (m.text ?? "").toLowerCase().includes(t))
     .sort((a, b) => a.ts - b.ts);
   if (!matches.length) return say(A.dim(`(no matches for "${term}")`));
@@ -695,8 +860,214 @@ async function findInHistory(term) {
   for (const m of matches.slice(-20)) printMsg(m._kind, m, { history: true });
 }
 
-async function sendRoom(text) {
-  await appendMessage(ROOM_FILE, { from: ID, text });
+// ---------- channel commands ----------
+
+function showRoomBanner(chan) {
+  const c = normalizeRoom(chan);
+  const e = getRooms()[c];
+  say(A.bold(agentColor(c)(`#${c}`)) + (e?.topic ? A.dim(" — " + e.topic) : ""));
+  if (e?.motd) say(A.dim("  rules: ") + e.motd);
+  const members = e?.members ?? [];
+  if (members.length) say(A.dim(`  members: ${members.join(", ")}`));
+}
+
+async function joinRoom(arg) {
+  const chan = normalizeRoom(arg);
+  await updateRooms((reg) => {
+    const e = (reg[chan] ??= { createdAt: Date.now(), createdBy: ID, members: [] });
+    if (!e.members.includes(ID)) e.members.push(ID);
+  });
+  // Fast-forward this channel's offset so we don't replay its whole backlog.
+  const cur = readJsonSafe(CURSOR_FILE, {});
+  setRoomOffset(cur, chan, readJsonl(roomFile(chan)).length);
+  writeJsonAtomic(CURSOR_FILE, cur);
+  await sendSystem(chan, `joined #${chan}`);
+  currentRoom = chan;
+  watchRoom(chan);
+  refreshPrompt();
+  say(A.dim("→ now in ") + A.bold(agentColor(chan)(`#${chan}`)));
+  showRoomBanner(chan);
+}
+
+async function partRoom(arg) {
+  const chan = normalizeRoom(arg || currentRoom);
+  if (chan === DEFAULT_ROOM) return say(A.red("cannot leave #general"));
+  if (!joinedRooms().includes(chan)) return say(A.red(`not in #${chan}`));
+  await sendSystem(chan, `left #${chan}`);
+  await updateRooms((reg) => {
+    if (reg[chan]) reg[chan].members = (reg[chan].members ?? []).filter((m) => m !== ID);
+  });
+  if (normalizeRoom(currentRoom) === chan) {
+    currentRoom = DEFAULT_ROOM;
+    refreshPrompt();
+  }
+  say(A.dim("→ left ") + A.bold(`#${chan}`));
+}
+
+function listRooms() {
+  const reg = getRooms();
+  const joined = new Set(joinedRooms());
+  const names = Object.keys(reg).sort();
+  say(A.bold(`channels (${names.length}):`));
+  for (const c of names) {
+    const e = reg[c];
+    const here =
+      normalizeRoom(currentRoom) === c ? A.green("*") : joined.has(c) ? A.dim("·") : " ";
+    const count = readJsonl(roomFile(c)).length;
+    const topic = e.topic ? A.dim(" — " + e.topic) : "";
+    say(`  ${here} ${agentColor(c)(("#" + c).padEnd(16))} ${A.dim(`${(e.members ?? []).length} member(s), ${count} msg`)}${topic}`);
+  }
+}
+
+async function setTopic(arg) {
+  const chan = normalizeRoom(currentRoom);
+  if (!arg) {
+    const e = getRooms()[chan];
+    return say(e?.topic ? A.bold(`#${chan} topic: `) + e.topic : A.dim(`#${chan} has no topic`));
+  }
+  await updateRooms((reg) => {
+    (reg[chan] ??= { createdAt: Date.now(), createdBy: ID, members: [] }).topic = arg;
+  });
+  await sendSystem(chan, `changed topic to: ${arg}`);
+  say(A.dim(`→ topic set for #${chan}`));
+}
+
+async function setMotd(arg) {
+  const chan = normalizeRoom(currentRoom);
+  if (!arg) {
+    const e = getRooms()[chan];
+    return say(e?.motd ? A.bold(`#${chan} rules: `) + e.motd : A.dim(`#${chan} has no rules (MOTD)`));
+  }
+  await updateRooms((reg) => {
+    (reg[chan] ??= { createdAt: Date.now(), createdBy: ID, members: [] }).motd = arg;
+  });
+  await sendSystem(chan, `updated the room rules (MOTD)`);
+  say(A.dim(`→ rules (MOTD) set for #${chan}`));
+}
+
+// ---------- phase-1 parity commands ----------
+
+function whois(target) {
+  const reg = readJsonSafe(AGENTS_FILE, {});
+  const a = reg[target];
+  if (!a) return say(A.red(`no such agent: ${target}`));
+  const marker = readJsonSafe(path.join(TRANSPORT_DIR, `${sanitize(target)}.json`), null);
+  const live = marker && marker.pid && pidAlive(marker.pid);
+  const online = live || Date.now() - a.lastHeartbeat < 5 * 60 * 1000;
+  const rooms = Object.entries(getRooms())
+    .filter(([, e]) => e.members?.includes(target))
+    .map(([c]) => `#${c}`);
+  say(A.bold("whois ") + agentColor(target)(target) + ":");
+  say(`  ${A.cyan("status")}     ${online ? A.green("online") : A.dim("offline")}${a.away ? A.yellow(` (away: ${a.away})`) : ""}`);
+  say(`  ${A.cyan("role")}       ${a.role ?? "-"}`);
+  say(`  ${A.cyan("seen")}       ${A.dim(relTime(a.lastHeartbeat))}`);
+  say(`  ${A.cyan("channels")}   ${rooms.length ? rooms.join(" ") : A.dim("(general)")}`);
+  say(`  ${A.cyan("transport")}  ${live ? A.green(marker.transport) : A.dim("none")}`);
+}
+
+async function setAway(msg) {
+  await withLock(AGENTS_FILE, async () => {
+    const reg = readJsonSafe(AGENTS_FILE, {});
+    if (reg[ID]) {
+      reg[ID].away = msg || "away";
+      writeJsonAtomic(AGENTS_FILE, reg);
+    }
+  });
+  say(A.dim(`→ marked away${msg ? ": " + msg : ""}`));
+}
+
+async function setBack() {
+  await withLock(AGENTS_FILE, async () => {
+    const reg = readJsonSafe(AGENTS_FILE, {});
+    if (reg[ID]) {
+      delete reg[ID].away;
+      writeJsonAtomic(AGENTS_FILE, reg);
+    }
+  });
+  say(A.dim("→ welcome back (away cleared)"));
+}
+
+function ignoreAgent(target) {
+  if (!target) return say(A.red("usage: /ignore <agent>"));
+  ignored.add(target);
+  say(A.dim(`→ ignoring ${target} (this session)`));
+}
+
+function unignoreAgent(target) {
+  if (target) {
+    ignored.delete(target);
+    say(A.dim(`→ no longer ignoring ${target}`));
+  } else {
+    ignored.clear();
+    say(A.dim("→ cleared ignore list"));
+  }
+}
+
+function moveFileSync(from, to) {
+  if (!existsSync(from) || from === to) return;
+  try {
+    renameSync(from, to);
+  } catch {
+    try {
+      writeFileSync(to, readFileSync(from));
+      unlinkSync(from);
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+// Full rename (NICK): migrate registry, channel membership, inbox, cursor,
+// transport marker, and color, then rebind the in-session identity. Mirrors
+// the MCP rename_agent tool.
+async function nick(arg) {
+  const oldId = ID;
+  const newId = (arg || "").trim();
+  if (!newId || newId === oldId) return say(A.red("usage: /nick <newname>"));
+  if (readJsonSafe(AGENTS_FILE, {})[newId]) return say(A.red(`'${newId}' already exists`));
+  const joined = joinedRooms();
+
+  await withLock(AGENTS_FILE, async () => {
+    const r = readJsonSafe(AGENTS_FILE, {});
+    if (r[oldId]) {
+      r[newId] = { ...r[oldId], agentId: newId };
+      delete r[oldId];
+    }
+    writeJsonAtomic(AGENTS_FILE, r);
+  });
+  await updateRooms((r) => {
+    for (const e of Object.values(r)) {
+      if (e.members?.includes(oldId)) e.members = e.members.map((m) => (m === oldId ? newId : m));
+    }
+  });
+  moveFileSync(path.join(INBOX_DIR, `${sanitize(oldId)}.jsonl`), path.join(INBOX_DIR, `${sanitize(newId)}.jsonl`));
+  moveFileSync(path.join(CURSOR_DIR, `${sanitize(oldId)}.json`), path.join(CURSOR_DIR, `${sanitize(newId)}.json`));
+  moveFileSync(path.join(TRANSPORT_DIR, `${sanitize(oldId)}.json`), path.join(TRANSPORT_DIR, `${sanitize(newId)}.json`));
+  const cmap = readJsonSafe(COLOR_MAP_FILE, {});
+  if (cmap[oldId] !== undefined && cmap[newId] === undefined) {
+    cmap[newId] = cmap[oldId];
+    writeJsonAtomic(COLOR_MAP_FILE, cmap);
+  }
+
+  // Rebind in-session identity, then broadcast under the new name.
+  ID = newId;
+  INBOX_FILE = path.join(INBOX_DIR, `${sanitize(ID)}.jsonl`);
+  CURSOR_FILE = path.join(CURSOR_DIR, `${sanitize(ID)}.json`);
+  SELF_MENTION_RE = new RegExp("@" + ID.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(?![A-Za-z0-9._-])");
+  for (const chan of joined) await sendSystem(chan, `is now known as ${newId} (was ${oldId})`);
+  refreshPrompt();
+  say(A.dim("→ you are now ") + agentColor(ID)(ID));
+}
+
+async function sendRoom(text, chan = currentRoom) {
+  const c = normalizeRoom(chan);
+  await appendMessage(roomFile(c), { from: ID, room: c, text });
+}
+
+// Post a system notice (join/part/topic/nick) to a channel.
+async function sendSystem(chan, text) {
+  const c = normalizeRoom(chan);
+  await appendMessage(roomFile(c), { from: ID, room: c, text, system: true });
 }
 
 async function appendMessage(file, partial) {
@@ -713,22 +1084,25 @@ async function drainAndPrint() {
   const inboxOff = cursor.inboxOffset ?? 0;
   for (let i = inboxOff; i < inboxAll.length; i++) {
     const m = inboxAll[i];
-    if (m && m.from !== ID) printMsg("DM", m);
+    if (m && m.from !== ID && !ignored.has(m.from)) printMsg("DM", m);
   }
   if (inboxAll.length > inboxOff) {
     cursor.inboxOffset = inboxAll.length;
     changed = true;
   }
 
-  const roomAll = readJsonl(ROOM_FILE);
-  const roomOff = cursor.roomOffset ?? 0;
-  for (let i = roomOff; i < roomAll.length; i++) {
-    const m = roomAll[i];
-    if (m && m.from !== ID) printMsg("room", m);
-  }
-  if (roomAll.length > roomOff) {
-    cursor.roomOffset = roomAll.length;
-    changed = true;
+  // Drain every joined channel against its own per-channel offset.
+  for (const chan of joinedRooms()) {
+    const all = readJsonl(roomFile(chan));
+    const off = getRoomOffset(cursor, chan);
+    for (let i = off; i < all.length; i++) {
+      const m = all[i];
+      if (m && m.from !== ID && !ignored.has(m.from)) printMsg("room", { ...m, room: m.room ?? chan });
+    }
+    if (all.length > off) {
+      setRoomOffset(cursor, chan, all.length);
+      changed = true;
+    }
   }
 
   if (changed) writeJsonAtomic(CURSOR_FILE, cursor);
@@ -739,6 +1113,20 @@ function printMsg(kind, m, opts = {}) {
   const color = agentColor(who);
   const gutter = color("▎");
   const prefix = opts.history ? A.dim("  ") : "";
+
+  // A channel tag when the message isn't from the focused channel, so cross-
+  // channel traffic stays legible without cluttering the common single-room case.
+  const otherChan = kind === "room" && m.room && normalizeRoom(m.room) !== normalizeRoom(currentRoom);
+  const chanTag = otherChan ? agentColor(m.room)(`#${normalizeRoom(m.room)}`) + " " : "";
+
+  // System notices (join/part/topic/nick) render as a dim italic one-liner.
+  if (m.system) {
+    const tag = chanTag ? `#${normalizeRoom(m.room)} ` : "";
+    say("");
+    say(`${prefix}\x1b[2;3m  — ${tag}${who} ${m.text ?? ""} —\x1b[0m`);
+    if (!opts.history) lastBlock = { who: null, ts: m.ts, kind: null };
+    return;
+  }
 
   // Body wraps manually under a continuous gutter — terminal auto-wrap would
   // lose the colored gutter on continuation lines.
@@ -762,7 +1150,7 @@ function printMsg(kind, m, opts = {}) {
     const badge = kind === "DM" ? A.bold(A.cyan("DM ")) : "";
     const marker = pinged ? A.bold(A.yellow("► ")) : "";
     const headGutter = pinged ? A.bold(color("▌")) : gutter;
-    const header = `${marker}${badge}${A.bold(color(who))} ${A.dim(`· ${relTime(m.ts)}`)}`;
+    const header = `${marker}${badge}${chanTag}${A.bold(color(who))} ${A.dim(`· ${relTime(m.ts)}`)}`;
     say("");
     say(`${prefix}${headGutter} ${header}`);
   }

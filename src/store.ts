@@ -16,13 +16,102 @@ export const TRANSPORT_DIR = path.join(ROOT, "transports");
 export const PID_DIR = path.join(ROOT, "pids");
 export const LOG_DIR = path.join(ROOT, "logs");
 
+// Channels. The default channel `general` keeps using the legacy single-room
+// file (room.jsonl) + the flat `roomOffset` cursor key, so existing agents and
+// the notification hooks keep working with zero migration. Every other channel
+// lives in rooms/<chan>.jsonl with its offset under cursor.roomOffsets[chan].
+export const ROOMS_DIR = path.join(ROOT, "rooms");
+export const ROOMS_FILE = path.join(ROOT, "rooms.json");
+export const DEFAULT_ROOM = "general";
+
 export function ensureDirs(): void {
-  for (const d of [ROOT, INBOX_DIR, CURSOR_DIR, TRANSPORT_DIR, PID_DIR, LOG_DIR]) {
+  for (const d of [ROOT, INBOX_DIR, CURSOR_DIR, TRANSPORT_DIR, PID_DIR, LOG_DIR, ROOMS_DIR]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
   }
   for (const f of [ROOM_FILE, STATUS_FILE]) {
     if (!existsSync(f)) mkdirSync(path.dirname(f), { recursive: true });
   }
+}
+
+export type RoomEntry = {
+  topic?: string;
+  motd?: string;
+  createdAt: number;
+  createdBy: string;
+  members: string[];
+};
+export type RoomRegistry = Record<string, RoomEntry>;
+
+// Normalize a channel name: strip leading '#', lowercase, restrict to a safe
+// charset, empty → the default channel. Display layers re-add the '#'.
+export function normalizeRoom(name?: string): string {
+  if (!name) return DEFAULT_ROOM;
+  const n = name.trim().replace(/^#+/, "").toLowerCase().replace(/[^a-z0-9._-]/g, "");
+  return n || DEFAULT_ROOM;
+}
+
+// Resolve a channel to its physical JSONL file. `general` maps to the legacy
+// room.jsonl for backward compatibility; everything else to rooms/<chan>.jsonl.
+export function roomFile(chan: string): string {
+  const c = normalizeRoom(chan);
+  return c === DEFAULT_ROOM ? ROOM_FILE : path.join(ROOMS_DIR, `${sanitize(c)}.jsonl`);
+}
+
+function blankRoom(createdBy: string): RoomEntry {
+  return { createdAt: Date.now(), createdBy, members: [] };
+}
+
+// Read the channel registry, always surfacing `general` even before it has been
+// explicitly persisted (it exists implicitly via room.jsonl).
+export async function getRooms(): Promise<RoomRegistry> {
+  const reg = await readJson<RoomRegistry>(ROOMS_FILE, {});
+  if (!reg[DEFAULT_ROOM]) reg[DEFAULT_ROOM] = { createdAt: 0, createdBy: "system", members: [] };
+  return reg;
+}
+
+export async function ensureRoom(chan: string, createdBy: string): Promise<void> {
+  const c = normalizeRoom(chan);
+  await updateJson<RoomRegistry>(ROOMS_FILE, {}, (cur) => {
+    if (!cur[c]) cur[c] = blankRoom(createdBy);
+    return cur;
+  });
+}
+
+export async function setRoomMeta(chan: string, meta: { topic?: string; motd?: string }, by = "system"): Promise<void> {
+  const c = normalizeRoom(chan);
+  await updateJson<RoomRegistry>(ROOMS_FILE, {}, (cur) => {
+    const e = (cur[c] ??= blankRoom(by));
+    if (meta.topic !== undefined) e.topic = meta.topic;
+    if (meta.motd !== undefined) e.motd = meta.motd;
+    return cur;
+  });
+}
+
+export async function addMember(chan: string, agentId: string): Promise<void> {
+  const c = normalizeRoom(chan);
+  await updateJson<RoomRegistry>(ROOMS_FILE, {}, (cur) => {
+    const e = (cur[c] ??= blankRoom(agentId));
+    if (!e.members.includes(agentId)) e.members.push(agentId);
+    return cur;
+  });
+}
+
+export async function removeMember(chan: string, agentId: string): Promise<void> {
+  const c = normalizeRoom(chan);
+  await updateJson<RoomRegistry>(ROOMS_FILE, {}, (cur) => {
+    if (cur[c]) cur[c].members = cur[c].members.filter((m) => m !== agentId);
+    return cur;
+  });
+}
+
+// Channels this agent has joined (always includes the default channel).
+export async function memberRooms(agentId: string): Promise<string[]> {
+  const reg = await getRooms();
+  const out = new Set<string>([DEFAULT_ROOM]);
+  for (const [chan, e] of Object.entries(reg)) {
+    if (e.members?.includes(agentId)) out.add(chan);
+  }
+  return [...out];
 }
 
 export function transportFile(agentId: string): string {

@@ -59,6 +59,10 @@ if (!TMUX_TARGET) die("AGENT_COORD_TMUX_TARGET is required");
 
 const ROOT = process.env.AGENT_COORD_DIR || path.join(homedir(), "agent-coord");
 const INCLUDE_ROOM = process.env.AGENT_COORD_INCLUDE_ROOM === "1";
+// Default channel + watch registry — declared up here so the hoisted channel
+// helpers, called from the top-level checkOnce(), don't trip the const TDZ.
+const DEFAULT_ROOM = "general";
+const watchedRooms = new Set();
 const ALLOWLIST = (process.env.AGENT_COORD_ALLOWLIST || "")
   .split(",")
   .map((s) => s.trim())
@@ -68,7 +72,6 @@ const POLL_MS = parseInt(process.env.AGENT_COORD_POLL_MS || "1000", 10);
 
 const SAFE_ID = AGENT_ID.replace(/[^a-zA-Z0-9._-]/g, "_");
 const INBOX_FILE = path.join(ROOT, "inbox", `${SAFE_ID}.jsonl`);
-const ROOM_FILE = path.join(ROOT, "room.jsonl");
 const CURSOR_FILE = path.join(ROOT, "cursors", `${SAFE_ID}.json`);
 const TRANSPORT_FILE = path.join(ROOT, "transports", `${SAFE_ID}.json`);
 const BUFFER_NAME = `coord-${SAFE_ID}`;
@@ -135,11 +138,33 @@ function drainSource(label, file, cursorKey, cur) {
   return true;
 }
 
+// Drain one channel against its per-channel offset (general → roomOffset,
+// others → roomOffsets[chan]); tag injected lines with the channel name.
+function drainRoomChannel(chan, cur) {
+  const c = normalizeRoom(chan);
+  const all = readJsonl(roomFile(c));
+  const off = getRoomOffset(cur, c);
+  const fresh = all.slice(off);
+  if (fresh.length === 0) return false;
+  for (const m of fresh) {
+    if (shouldInject(m)) pending.push({ kind: `room #${c}`, ...m });
+  }
+  setRoomOffset(cur, c, off + fresh.length);
+  return true;
+}
+
 function checkOnce() {
   const cur = readCursor();
   let changed = false;
   if (drainSource("DM", INBOX_FILE, "inboxOffset", cur)) changed = true;
-  if (INCLUDE_ROOM && drainSource("ROOM", ROOM_FILE, "roomOffset", cur)) changed = true;
+  if (INCLUDE_ROOM) {
+    // Tail every channel the agent has joined. checkOnce runs on each poll, so
+    // channels joined after startup are picked up automatically.
+    for (const chan of joinedRooms()) {
+      if (drainRoomChannel(chan, cur)) changed = true;
+      watchRoom(chan);
+    }
+  }
   if (changed) writeCursor(cur);
   if (pending.length > 0) scheduleFlush();
 }
@@ -255,11 +280,7 @@ try {
   // file may not exist yet; polling covers it
 }
 if (INCLUDE_ROOM) {
-  try {
-    if (existsSync(ROOM_FILE)) watch(ROOM_FILE, () => checkOnce());
-  } catch {
-    // ignore
-  }
+  for (const chan of joinedRooms()) watchRoom(chan);
 }
 setInterval(checkOnce, POLL_MS);
 
@@ -270,4 +291,57 @@ process.stderr.write(
 function die(msg) {
   process.stderr.write(`[tmux-pusher] ${msg}\n`);
   process.exit(1);
+}
+
+// ---------- channel helpers (mirror src/store.ts) ----------
+
+function normalizeRoom(name) {
+  if (!name) return DEFAULT_ROOM;
+  const n = String(name).trim().replace(/^#+/, "").toLowerCase().replace(/[^a-z0-9._-]/g, "");
+  return n || DEFAULT_ROOM;
+}
+
+function roomFile(chan) {
+  const c = normalizeRoom(chan);
+  // c is already normalized to a filesystem-safe charset.
+  return c === DEFAULT_ROOM ? path.join(ROOT, "room.jsonl") : path.join(ROOT, "rooms", `${c}.jsonl`);
+}
+
+function getRoomOffset(cursor, chan) {
+  const c = normalizeRoom(chan);
+  return c === DEFAULT_ROOM ? cursor.roomOffset ?? 0 : cursor.roomOffsets?.[c] ?? 0;
+}
+
+function setRoomOffset(cursor, chan, n) {
+  const c = normalizeRoom(chan);
+  if (c === DEFAULT_ROOM) cursor.roomOffset = n;
+  else (cursor.roomOffsets ??= {})[c] = n;
+}
+
+function joinedRooms() {
+  let reg = {};
+  try {
+    const raw = readFileSync(path.join(ROOT, "rooms.json"), "utf8");
+    if (raw.trim()) reg = JSON.parse(raw);
+  } catch {
+    // no registry yet → just the default channel
+  }
+  const out = new Set([DEFAULT_ROOM]);
+  for (const [chan, e] of Object.entries(reg)) {
+    if (e && Array.isArray(e.members) && e.members.includes(AGENT_ID)) out.add(chan);
+  }
+  return [...out];
+}
+
+function watchRoom(chan) {
+  const f = roomFile(chan);
+  if (watchedRooms.has(f)) return;
+  try {
+    if (existsSync(f)) {
+      watch(f, () => checkOnce());
+      watchedRooms.add(f);
+    }
+  } catch {
+    // polling covers it until the file exists
+  }
 }

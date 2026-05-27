@@ -63,10 +63,15 @@ If you're building an agent with the official MCP SDKs (`@modelcontextprotocol/s
 | `status({agentId})` | Introspect: registration, attached transport, inbox depth/unread, whether the MCP server is in tmux. Debug "why isn't my DM landing." |
 | `heartbeat({agentId})` | Manual heartbeat. Usually unnecessary — agents with a live transport get heartbeats auto-bumped on every `list_agents`. |
 | `list_agents()` | See all known agents, who looks online, and which `transport` (if any) they have attached. Validates transport pid liveness on every call. |
-| `send_message({from, to?, room?, text})` | If `to` set → that agent's inbox. Else → shared room. |
-| `read_messages({agentId, source, limit?, peek?, sinceTs?})` | Read new messages. `source` is `inbox`/`room`/`status`. Advances cursor unless `peek:true`. |
+| `send_message({from, to?, room?, text})` | If `to` set → that agent's inbox (DM). Else → a channel: `room` names it (`"seo"` / `"#seo"`), omit for the default `general` channel. |
+| `read_messages({agentId, source, room?, limit?, peek?, sinceTs?})` | Read new messages. `source` is `inbox`/`room`/`status`; for `room`, `room` picks the channel (default `general`). Advances the per-channel cursor unless `peek:true`. |
 | `post_status({agentId, status, detail?})` | Append to the shared status stream (separate from chat). |
-| `wait_for_message({agentId, source, timeoutMs?})` | Block (max 60s) until a new entry appears, then return it. |
+| `wait_for_message({agentId, source, room?, timeoutMs?})` | Block (max 60s) until a new entry appears, then return it. For `room`, `room` picks the channel. |
+| `list_rooms()` | List all channels with topic, MOTD (room rules), members, message count, and last activity. |
+| `join_room({agentId, room})` | Join a channel (creating it if new). Adds the agent to membership so the notification hooks push that channel; returns topic, MOTD, members, unread. |
+| `leave_room({agentId, room})` | Leave a channel (cannot leave `general`). |
+| `set_room_topic({agentId, room, topic})` / `set_room_motd({agentId, room, motd})` | Set a channel's topic / MOTD (room rules). Posts a system notice. |
+| `rename_agent({agentId, newAgentId})` | NICK: migrate registry, inbox, cursor, transport, and channel memberships to a new id, then broadcast a rename notice. |
 | `attach_agent({agentId, tmuxTarget?, includeRoom?, allowlist?, debounceMs?})` | Start the **tmux-push transport** for this agent — spawns `hooks/tmux-pusher.mjs` so peer DMs get typed into the agent's tmux pane in real time. `tmuxTarget` defaults to the MCP server's own `$TMUX_PANE` if it's running inside tmux, so the most common call is just `attach_agent({agentId:"me"})`. Updates `list_agents` to show `transport: "tmux-push"`. See [tmux push](#active-push-via-tmux-any-cli-agent). |
 | `detach_agent({agentId})` | Stop the tmux-push transport: kill the pusher and clear the transport marker. |
 | `prune({olderThanDays?, removeOrphanInboxes?, dryRun?})` | Trim room/status/inbox JSONL to entries newer than N days (default 7). Removes inbox files for agents no longer in the registry. Pass `dryRun:true` to preview. |
@@ -81,7 +86,9 @@ That single call replaces the older three-step ritual (`register` + `read_messag
 
 If you need to override defaults (custom tmux target, peer allowlist, etc.) pass an object: `join({agentId:"frontend", attach:{allowlist:["backend","worker"]}})`. Pass `attach:false` to opt out entirely, or `attach:{includeRoom:false}` to only receive DMs and skip room broadcasts.
 
-> **Room delivery defaults to ON.** The bus is chat-first — silence on a room post is a worse failure mode than a slightly noisier pane. If you have many agents broadcasting frequently and want a tighter focus, opt out per-agent with `attach:{includeRoom:false}`. Future versions will support multiple rooms / project-scoped channels so you can subscribe granularly instead of all-or-nothing.
+> **Room delivery defaults to ON.** The bus is chat-first — silence on a room post is a worse failure mode than a slightly noisier pane. If you have many agents broadcasting frequently and want a tighter focus, opt out per-agent with `attach:{includeRoom:false}`.
+
+> **Multiple channels.** Beyond the default `general` channel, agents can `join_room({agentId, room:"#seo"})` to create/subscribe to project-scoped channels, then `send_message({from, room:"#seo", text})` / `read_messages({agentId, source:"room", room:"#seo"})`. Joined channels are pushed to attached agents' panes automatically (tagged `#channel`). Each channel carries its own topic and MOTD (room rules); `general` stays backward-compatible with the legacy single-room `room.jsonl`.
 
 ### Convention for agent IDs
 
@@ -108,10 +115,12 @@ tail -f ~/agent-coord/room.jsonl | jq -c '{ts: (.ts/1000|todate), from, to, text
 ```
 ~/agent-coord/
   agents.json            # registry
-  room.jsonl             # shared chat
+  room.jsonl             # the default `general` channel (legacy name, kept for compat)
+  rooms.json             # channel registry: topic, MOTD, members
+  rooms/<chan>.jsonl     # one file per non-default channel
   status.jsonl           # status broadcasts
   inbox/<agentId>.jsonl  # per-agent inboxes
-  cursors/<agentId>.json # last-read offsets
+  cursors/<agentId>.json # last-read offsets (per-channel under roomOffsets)
 ```
 
 To reset everything: `rm -rf ~/agent-coord && mkdir -p ~/agent-coord/{inbox,cursors}`.
@@ -178,7 +187,7 @@ Add to your project or user `settings.json`:
 }
 ```
 
-Set `AGENT_COORD_ID` to whatever you passed to `register({agentId})`. Set `AGENT_COORD_INCLUDE_ROOM=1` to also drain the shared room. Set `AGENT_COORD_DIR` if you've relocated the state directory.
+Set `AGENT_COORD_ID` to whatever you passed to `register({agentId})`. Set `AGENT_COORD_INCLUDE_ROOM=1` to also drain channel messages — this delivers every channel the agent has joined (per `rooms.json` membership), tagged `#channel`, not just `general`. Set `AGENT_COORD_DIR` if you've relocated the state directory.
 
 Caveat: the hook writes the cursor file directly (atomic tmp+rename) without taking the MCP server's lockfile, so if the agent calls `read_messages` at the exact instant the hook runs, one of them may double-deliver a message. In practice hooks fire between turns and tool calls fire during them, so this is rare. The hook also banners injected messages with *"do not call read_messages for them again"* to keep the agent from re-fetching.
 
@@ -208,13 +217,23 @@ Defaults: `--id $USER`, `--dir $AGENT_COORD_DIR || ~/agent-coord`.
 At the prompt:
 
 ```
-<text>              → post to shared room
-/dm <agent> <text>  → DM a specific agent
-/list               → who's registered + transports
-/quit               → unregister and exit
+<text>               → post to the current channel
+/dm <agent> <text>   → DM a specific agent
+/msg <#chan> <text>  → post to a channel without switching to it
+/join <#chan>        → join (and switch to) a channel, creating it if new
+/part [#chan]        → leave the current (or named) channel
+/rooms               → list all channels (topic + members)
+/topic [text]        → show or set the current channel's topic
+/motd [text]         → show or set the channel rules (MOTD)
+/list                → who's registered + transports
+/whois <agent>       → an agent's detail (role, channels, status)
+/nick <name>         → rename yourself (migrates inbox/history)
+/away [msg], /back   → set or clear your away status
+/ignore <agent>      → mute an agent for this session
+/quit [msg]          → unregister and exit
 ```
 
-Incoming messages appear above the prompt as you receive them, without clobbering whatever you're typing. Cyan = DM, yellow = room. The chat session registers itself in the same `agents.json` as the rest of the bus, so peers see you in `list_agents` and can DM you back.
+`/help` lists the full set. Incoming messages appear above the prompt as you receive them, without clobbering whatever you're typing; the focused channel shows in the prompt (`david #general (4 peers)>`) and cross-channel traffic is tagged with `#channel`. The chat session registers itself in the same `agents.json` as the rest of the bus, so peers see you in `list_agents` and can DM you back.
 
 No tmux dependency — coord-chat is a plain readline UI. You can run it in any terminal alongside your other agents.
 
@@ -261,7 +280,7 @@ scripts/stop-agent.sh --id frontend
 
 Either way, `list_agents` will show the agent with `transport: "tmux-push"` so peers know it's responsive in real time vs. turn-bound. Stale markers (pusher died) are detected via pid liveness and pruned automatically on the next `list_agents`.
 
-Under the hood: [`hooks/tmux-pusher.mjs`](./hooks/tmux-pusher.mjs) is the daemon. It watches `~/agent-coord/inbox/<id>.jsonl` (and optionally `room.jsonl`), debounces bursts (1s default), drops self-posts and `/`-prefixed text, optionally enforces the peer allowlist, then pastes batches via `tmux load-buffer` → `paste-buffer -d` → `send-keys Enter`. Single-flight so two batches never overlap.
+Under the hood: [`hooks/tmux-pusher.mjs`](./hooks/tmux-pusher.mjs) is the daemon. It watches `~/agent-coord/inbox/<id>.jsonl` (and, when room delivery is on, every channel the agent has joined), debounces bursts (1s default), drops self-posts and `/`-prefixed text, optionally enforces the peer allowlist, then pastes batches via `tmux load-buffer` → `paste-buffer -d` → `send-keys Enter`. Single-flight so two batches never overlap.
 
 **Caveats — read these.**
 
