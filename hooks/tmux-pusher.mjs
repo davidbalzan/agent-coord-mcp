@@ -225,11 +225,23 @@ function injectViaTmux(batch) {
       if (paste.status !== 0) {
         return reject(new Error(`tmux paste-buffer: ${(paste.stderr ?? "").toString().trim()}`));
       }
-      const enter = spawnSync("tmux", ["send-keys", "-t", TMUX_TARGET, "Enter"]);
-      if (enter.status !== 0) {
-        return reject(new Error(`tmux send-keys: ${(enter.stderr ?? "").toString().trim()}`));
-      }
-      resolve();
+      // Multi-line paste + Enter is racy: long buffers can still be flushing
+      // to the target app's input when Enter arrives, and many TUIs (Claude
+      // Code in particular) treat that first Enter as "still drafting,
+      // add newline" rather than "submit." Wait briefly so paste settles,
+      // then send Enter. Some apps additionally need a second Enter to
+      // exit paste-mode + submit; sending two Enters with a small gap is
+      // safe (worst case: harmless empty submit ignored by the app).
+      setTimeout(() => {
+        const e1 = spawnSync("tmux", ["send-keys", "-t", TMUX_TARGET, "Enter"]);
+        if (e1.status !== 0) {
+          return reject(new Error(`tmux send-keys: ${(e1.stderr ?? "").toString().trim()}`));
+        }
+        setTimeout(() => {
+          spawnSync("tmux", ["send-keys", "-t", TMUX_TARGET, "Enter"]);
+          resolve();
+        }, 50);
+      }, 100);
     });
     load.stdin.end(payload);
   });
