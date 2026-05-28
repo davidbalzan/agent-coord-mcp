@@ -77,14 +77,31 @@ IRC `PRIVMSG` lines are flat text — our messages carry `id`, `ts`, `from`, `to
 1. **IRCv3 `message-tags`** — attach `@id=…;ts=…;coord-from=…` tags to outbound PRIVMSGs. Modern clients see the tags; older clients see only the text body. Lossless for IRCv3-aware peers.
 2. **History-via-extension** — implement a custom `CHATHISTORY` (IRCv3-compatible) that pulls from JSONL when an agent connects, so they get the same "last N messages on join" UX `coord-chat` does today.
 
-### Open questions to resolve before building
+### Resolved decisions
 
-1. **Bin shape.** Separate `coord-irc-server` process, or fold into the MCP server behind a flag? Separate process is cleaner for isolation; combined is simpler to deploy.
-2. **State authority on conflict.** Local agent does `set_room_topic`; remote IRC user does `TOPIC` at the same instant. Both write `rooms/<name>.json`. Use the existing lockfile, last-write-wins is fine.
-3. **History replay on `JOIN`.** Always send last N (like `coord-chat` does), or only when client requests via `CHATHISTORY`? Defaulting to last 10 matches the existing UX.
-4. **Server name + version reporting.** `agent-coord IRCd 0.x.0` in `001 RPL_WELCOME` and `004 RPL_MYINFO`? Cosmetic but matters for client compat.
-5. **Are we comfortable being a network service at all?** Right now the threat model is "anything reading `~/agent-coord/` can read messages." Adding a TCP listener changes that to "anything with the password can read and write." Worth making sure the README leads with that loudly.
-6. **Implementation strategy.** Write it from scratch (~500–800 LoC for the verb set above), or wrap an existing minimal Node IRC daemon library? Most of the npm options are unmaintained — likely from-scratch is the path.
+1. **Packaging — separate repo, separate npm package.** Name: `agent-coord-irc`. Anyone not needing the network face installs `agent-coord-mcp` alone and stays simple. The IRC module is a bolt-on: install it, point it at the same `AGENT_COORD_DIR`, run it. No coupling at build/dist time. Peer-depends on `agent-coord-mcp >=0.4` for the JSONL schema contract.
+2. **Conflict resolution — optimistic concurrency.** Topic, MOTD, channel membership, and other small JSON mutations carry a `version` counter (or mtime). Writers do read-check-write under the existing lockfile; on stale version the LAST writer fails with a server NOTICE like `:agent-coord NOTICE #seo :topic changed by alice — reload and retry`. No silent overwrites.
+3. **History replay — IRCv3 `CHATHISTORY` only.** No auto-replay on `JOIN`. Clients that want history call `CHATHISTORY LATEST #room * 10` (or `BEFORE`/`AFTER` variants). Modern clients support it natively; older clients see an empty channel until new messages arrive, which is standard IRC behavior. Reduces our verb surface and matches standards instead of inventing a custom replay.
+4. **Server name + version reporting.**
+   - Server name: `agent-coord` (the daemon *is* the bus, not a separate identity).
+   - `001 RPL_WELCOME` → `Welcome to the agent-coord bus, <nick>!`
+   - `002 RPL_YOURHOST` → `Your host is <hostname>, running agent-coord-irc <version>`
+   - `003 RPL_CREATED` → server start timestamp
+   - `004 RPL_MYINFO` → `<hostname> agent-coord-irc/<version> <user_modes> <chan_modes>`
+   Version pulled from the IRC module's own `package.json`.
+5. **Network exposure — separate module, independent hardening.** Because the IRC server lives in its own repo, its security surface (TLS, auth, rate limiting, ban lists) can evolve and be audited independently of the MCP core. Default bind: `127.0.0.1`. Anything else requires an explicit `--bind` flag plus a printed warning. README leads with the threat-model change.
+6. **Implementation — from scratch.** Verb set: `PRIVMSG`, `JOIN`, `PART`, `NICK`, `TOPIC`, `NAMES`, `LIST`, `MOTD`, `WHO`, `WHOIS`, `PING`, `PASS`, `QUIT`, `CAP LS`, `CAP REQ`, `CAP END`, `CHATHISTORY`. Estimated 600–900 LoC. npm IRC daemon options are mostly unmaintained and would fight us on the JSONL-backed state model.
+
+### Build plan
+
+Use the bus itself to coordinate the build — meta but on-brand:
+
+- A dedicated **`#irc-build`** channel on this bus.
+- A new Claude Code agent (`irc-dev` or similar) spun up specifically for the new repo, registers with that channel, and is directed via DM/room by this maintainer (coord-dev).
+- The new repo (`agent-coord-irc`) starts as a Node + TypeScript project with the same dist/files convention as `agent-coord-mcp`.
+- First milestone: localhost-only server accepting `weechat /connect localhost 6667`, JOINing `#general`, and seeing room.jsonl history via `CHATHISTORY`.
+- Second milestone: agent-side IRC client wrapper so a non-MCP agent can join via standard `irc-framework`.
+- Third milestone: TLS + SASL `PLAIN` for LAN/internet exposure.
 
 ### Success criteria
 
