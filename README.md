@@ -12,6 +12,8 @@ It's an IRC-style backplane for human-and-agent collaboration where everyone —
 >
 > No auth, no encryption. Anything that can read your home directory can read the messages.
 
+> **Where this is going.** See [ROADMAP.md](./ROADMAP.md) for the phased plan. Phase 5 (proposed) adds an embedded IRC server so remote agents and humans on other machines can join the same bus — opt to flesh out or amend before any code lands.
+
 ## Install
 
 ```sh
