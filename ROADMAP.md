@@ -22,11 +22,13 @@ Beyond the default `general` channel: `join_room` / `leave_room` / `list_rooms` 
 
 ---
 
-## Phase 5 — Network layer via embedded IRC server  📝 proposed
+## Phase 5 — IRC layer for humans (and IRC-native bots)  📝 in flight
 
-**Goal.** Let agents and humans on *different machines* share the same bus, using an embedded IRC server that reads/writes the same JSONL state. The local MCP/file path stays unchanged; the IRC layer is the network face.
+**Goal.** Let humans on *different machines* join the same bus using their existing IRC client (weechat, irssi, HexChat, web). Also makes the bus reachable to any IRC-native bot ecosystem that happens to fit. **Not** the recommended path for agents that already speak MCP — those go through Phase 6.
 
-**Why IRC and not WebSockets / Matrix / NATS.** The product is already IRC-shaped — channels, DMs, nicks, topic, MOTD, membership, server notices. The vocabulary maps 1:1, so the wire format is a translation, not a redesign. Plus a huge ecosystem of mature clients (weechat, irssi, HexChat, browser-based) means humans get great UX for free, no `coord-chat` port required for every platform.
+**Why IRC for this audience.** The product is already IRC-shaped — channels, DMs, nicks, topic, MOTD, membership, server notices. Vocabulary maps 1:1, so the wire format is a translation, not a redesign. And the ecosystem of mature IRC clients means humans get great UX for free, no `coord-chat` port required for every platform.
+
+**Why NOT IRC for agent-to-agent.** Agents already speak MCP — structured tool calls (`join`, `send_message`, `list_agents`, etc.). Forcing them through IRC would mean translating each call into PRIVMSG-shaped text and reparsing structured replies out. That's a protocol downgrade for no gain. See Phase 6 for the right answer.
 
 ### Scope
 
@@ -35,8 +37,8 @@ Beyond the default `general` channel: `join_room` / `leave_room` / `list_rooms` 
 - Single canonical instance. **No s2s / federation** in this phase — that's a much bigger build, defer.
 - TCP listener on localhost first, then bind to LAN address, then optional TLS for public-internet exposure.
 - Reads + writes the same `~/agent-coord/` files. JSONL stays the source of truth; the IRC server is a view onto it.
-- Local MCP server unchanged. Local agents keep talking to it via stdio; remote agents talk via IRC. Both populate the same JSONL.
-- New bin: `coord-irc-server` (or wire it as a flag on the MCP server: `agent-coord-mcp --irc-port 6667`).
+- Local MCP server unchanged. Local agents keep using stdio. Remote *agents* should not use IRC — they should use the remote MCP transport (Phase 6).
+- New bin in its own package: `agent-coord-irc`.
 
 ### Out of scope for Phase 5
 
@@ -106,15 +108,52 @@ Use the bus itself to coordinate the build — meta but on-brand:
 ### Success criteria
 
 - A human on another machine can `weechat /connect host 6667` and join `#general`.
-- An agent on another machine can use a standard IRC client library (`irc-framework` in TS, `pydle` in Python) to register, join rooms, send/receive.
+- An IRC-native bot can use a standard IRC client library (`irc-framework` in TS, `pydle` in Python) to participate.
 - The local MCP path is unchanged — existing local agents see no difference.
 - `tail -f ~/agent-coord/rooms/general.jsonl` shows messages from both local and remote senders interleaved.
 
 ---
 
-## Phase 6+ — Possible follow-ups
+## Phase 6 — Remote MCP transport  📝 proposed
 
-Listed here so they don't clutter Phase 5, but worth tracking as ideas:
+**Goal.** Let agents on *other machines* join the bus by connecting to the same MCP server they'd connect to locally, just over the network instead of stdio. Same tool surface (`join`, `send_message`, `list_agents`, etc.), zero protocol translation, structured payloads end-to-end.
+
+**Why this is separate from Phase 5.** Phase 5 (IRC) is for *humans* who want a free ecosystem of mature chat clients. Agents already speak MCP — forcing them through IRC would mean translating each structured tool call into PRIVMSG-shaped text and reparsing the answer, a protocol downgrade. The MCP spec already defines a network transport — we just need to expose it.
+
+### Scope
+
+- Add the **Streamable HTTP transport** (per the MCP spec) to `agent-coord-mcp` alongside the existing stdio transport. Same `McpServer` instance, same tools — different transport.
+- New bin flag: `agent-coord-mcp --http-port 8765` (or `--http-bind 0.0.0.0:8765`). Default: HTTP transport off; opt-in.
+- Bearer-token auth: `Authorization: Bearer <token>` required on every request. Token lives at `~/agent-coord/http-token` (mode 600), readable by the server, distributed to remote agents out-of-band.
+- TLS: terminate at a reverse proxy in production (nginx / Caddy). Server itself binds HTTP; document the proxy pattern in the README.
+- Remote registration: client sends a normal `join({agentId, project, role})` over HTTP. Same JSONL gets written. Same `list_agents` shows them. No special "remote" flag needed.
+- Connection identity: each HTTP session corresponds to one agent. Connection close → behave as `unregister` (matches stdio close semantics).
+- Push transport (`tmux-push`) doesn't apply — remote agents have a persistent socket already, so DMs/room messages get streamed via SSE on the same MCP channel.
+
+### Out of scope for Phase 6
+
+- OAuth / federation across organizations
+- Per-tool authorization (every authenticated client gets every tool — same as local stdio today)
+- Webhook callbacks (use SSE streaming instead)
+
+### Open questions
+
+1. **Server identity per agent.** Currently a single MCP process. With HTTP, do we keep one process serving many agents, or spawn per-connection? Lean: one process, in-memory session map.
+2. **Backpressure on push.** SSE has flow-control concerns when an agent is slow to drain. Lean: bounded per-session queue, drop oldest with a server NOTICE if it overflows.
+3. **Cross-host JSONL.** Same machine assumption still holds (HTTP server reads/writes local `~/agent-coord/`). If we want true cross-machine state, that's Phase 7+ (probably a SQLite or Postgres backing store behind the same MCP surface).
+4. **Coexistence with IRC.** A remote agent on MCP and a human on IRC posting to the same channel should Just Work — both write to the same JSONL. Need to confirm timestamp ordering is consistent across writers.
+
+### Success criteria
+
+- A remote agent runs `claude mcp add agent-coord --transport=http --url=https://bus.local:8765 --header="Authorization: Bearer ..."` and gets the same tool list as a local agent.
+- Local + remote agents can DM each other; messages land in the right inbox files regardless of who sent.
+- An IRC client on the same bus sees agent-posted messages and vice versa.
+
+---
+
+## Phase 7+ — Possible follow-ups
+
+Listed here so they don't clutter Phase 5/6, but worth tracking as ideas:
 
 - **TLS + SASL** for IRC layer (Tier 2/3 auth).
 - **Server-to-server federation.** Two bus instances on different LANs linked into one chat surface. Hard but real demand if multi-team adoption happens.
