@@ -34,6 +34,7 @@ import {
   roomFile,
   setRoomMeta,
   transportFile,
+  TRANSPORT_DIR,
   updateJson,
   type RoomRegistry,
 } from "./store.js";
@@ -136,6 +137,7 @@ export async function registerTool(args: { agentId: string; project?: string; ro
       role: args.role ?? existing?.role,
       registeredAt: existing?.registeredAt ?? now,
       lastHeartbeat: now,
+      capabilities: existing?.capabilities,
     };
     return current;
   });
@@ -159,7 +161,20 @@ export async function unregisterTool(args: { agentId: string }) {
     }
     return current;
   });
-  return { ok: true, removed: existed, detach };
+
+  // Drop the agent from every channel's membership so it doesn't linger as a
+  // ghost in list_rooms / joinedRooms() after it's gone from the registry.
+  const leftRooms: string[] = [];
+  await updateJson<RoomRegistry>(ROOMS_FILE, {}, (current) => {
+    for (const [chan, e] of Object.entries(current)) {
+      if (e.members?.includes(args.agentId)) {
+        e.members = e.members.filter((m) => m !== args.agentId);
+        leftRooms.push(chan);
+      }
+    }
+    return current;
+  });
+  return { ok: true, removed: existed, detach, leftRooms };
 }
 
 // ---------- heartbeat ----------
@@ -227,7 +242,7 @@ export async function listAgentsTool() {
 async function loadLiveTransports(): Promise<Map<string, TransportMarker>> {
   const out = new Map<string, TransportMarker>();
   for (const fname of await listTransportFiles()) {
-    const file = path.join(path.dirname(transportFile("x")), fname);
+    const file = path.join(TRANSPORT_DIR, fname);
     const marker = await readJson<TransportMarker | null>(file, null);
     if (!marker) {
       await deleteFile(file);
@@ -280,7 +295,14 @@ export async function sendMessageTool(args: {
     };
     const target = inboxFile(args.to);
     await appendJsonl(target, msg);
-    return { ok: true, id: msg.id, target, room: undefined };
+    // Offline delivery is intentional (the inbox is created on demand), but a
+    // typo'd recipient shouldn't vanish silently — surface a warning when the
+    // target isn't a known agent so the caller can catch the mistake.
+    const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
+    const warning = reg[args.to]
+      ? undefined
+      : `recipient '${args.to}' is not a registered agent — message stored in their inbox but no one may be listening`;
+    return { ok: true, id: msg.id, target, room: undefined, warning };
   }
 
   const chan = normalizeRoom(args.room);
@@ -350,6 +372,7 @@ export async function readMessagesTool(args: {
       : limited;
 
   return {
+    ok: true,
     messages: visible,
     totalNew,
     returned: visible.length,
@@ -487,6 +510,11 @@ export async function pruneTool(args: {
       const entries = await readJsonl<Message>(path.join(INBOX_DIR, fname));
       inboxRemoved += entries.filter((e) => e.ts <= cutoff).length;
     }
+    const rooms = await getRooms();
+    const orphanMembers = new Set<string>();
+    for (const e of Object.values(rooms)) {
+      for (const m of e.members ?? []) if (!knownAgents.has(m)) orphanMembers.add(m);
+    }
     return {
       dryRun: true,
       cutoff,
@@ -496,6 +524,7 @@ export async function pruneTool(args: {
         statusEntries: status.filter((e) => e.ts <= cutoff).length,
         inboxMessages: inboxRemoved,
         orphanInboxes: orphans,
+        orphanMembers: [...orphanMembers],
       },
     };
   }
@@ -569,6 +598,24 @@ export async function pruneTool(args: {
     if (touched) cursorsAdjusted.push(id);
   }
 
+  // Compact channel memberships: drop any member no longer in the registry so
+  // list_rooms / joinedRooms() stop surfacing ghosts (mirrors orphan-inbox
+  // cleanup). Empty non-default channels are left in place — their history may
+  // still matter and `general` must always persist.
+  const orphanMembers = new Set<string>();
+  await updateJson<RoomRegistry>(ROOMS_FILE, {}, (current) => {
+    for (const e of Object.values(current)) {
+      const before = e.members?.length ?? 0;
+      if (before === 0) continue;
+      e.members = (e.members ?? []).filter((m) => {
+        const keep = knownAgents.has(m);
+        if (!keep) orphanMembers.add(m);
+        return keep;
+      });
+    }
+    return current;
+  });
+
   return {
     dryRun: false,
     cutoff,
@@ -578,6 +625,7 @@ export async function pruneTool(args: {
       statusEntries: statusResult.removed,
       inboxMessages: inboxRemoved,
       orphanInboxes: deletedOrphans,
+      orphanMembers: [...orphanMembers],
     },
     cursorsAdjusted,
   };
@@ -641,15 +689,18 @@ export async function attachAgentTool(args: {
   await fsp.mkdir(path.dirname(log), { recursive: true });
   await fsp.mkdir(path.dirname(pidFile(args.agentId, "pusher")), { recursive: true });
   await fsp.mkdir(path.dirname(transportFile(args.agentId)), { recursive: true });
-  const out = openSync(log, "a");
-  const err = openSync(log, "a");
+  const logFd = openSync(log, "a");
   // Default: deliver room broadcasts too. The bus is chat-first — silence on
   // a room post is a worse failure mode than a slightly noisier pane. Callers
   // who want DM-only can pass includeRoom:false explicitly.
   const includeRoom = args.includeRoom !== false;
-  const child = spawn("node", [pusher], {
+  // Use the exact node binary running this server, not bare "node" — the MCP
+  // server is often launched via an absolute path (nvm/Homebrew/bundled
+  // runtime) that isn't on the spawned child's PATH, which would silently fail
+  // the pusher launch ("attached but nothing arrives").
+  const child = spawn(process.execPath, [pusher], {
     detached: true,
-    stdio: ["ignore", out, err],
+    stdio: ["ignore", logFd, logFd],
     env: {
       ...process.env,
       AGENT_COORD_ID: args.agentId,
@@ -952,6 +1003,18 @@ export async function renameAgentTool(args: { agentId: string; newAgentId: strin
 
   const joined = await memberRooms(oldId);
 
+  // A running pusher has the OLD agentId (and its file paths) baked into its
+  // env, so after we migrate the inbox/cursor below it would keep tailing the
+  // now-empty old inbox while new DMs land in the new one — silently breaking
+  // delivery and orphaning the moved marker. Take it down first; the caller
+  // must re-attach under the new id (join/attach_agent) to restore push.
+  const liveTransport = await readJson<TransportMarker | null>(transportFile(oldId), null);
+  let detachedTransport = false;
+  if (liveTransport && isPidAlive(liveTransport.pid)) {
+    await detachAgentTool({ agentId: oldId });
+    detachedTransport = true;
+  }
+
   // Registry: move the entry under the new key.
   await updateJson<AgentRegistry>(AGENTS_FILE, {}, (current) => {
     if (current[oldId]) {
@@ -969,7 +1032,8 @@ export async function renameAgentTool(args: { agentId: string; newAgentId: strin
     return current;
   });
 
-  // Per-agent files: inbox, cursor, transport marker.
+  // Per-agent files: inbox, cursor. (The transport marker was already removed
+  // above if a pusher was live; nothing to move otherwise.)
   await moveFile(inboxFile(oldId), inboxFile(newId));
   await moveFile(cursorFile(oldId), cursorFile(newId));
   await moveFile(transportFile(oldId), transportFile(newId));
@@ -979,7 +1043,16 @@ export async function renameAgentTool(args: { agentId: string; newAgentId: strin
     await appendJsonl(roomFile(chan), sysMsg(newId, chan, `is now known as ${newId} (was ${oldId})`));
   }
 
-  return { ok: true, from: oldId, to: newId, rooms: joined };
+  return {
+    ok: true,
+    from: oldId,
+    to: newId,
+    rooms: joined,
+    detachedTransport,
+    ...(detachedTransport
+      ? { warning: `the live tmux-push transport was detached during rename — re-attach as '${newId}' (e.g. join/attach_agent) to restore real-time delivery` }
+      : {}),
+  };
 }
 
 // ---------- helpers ----------

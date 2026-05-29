@@ -171,7 +171,7 @@ async function main() {
 
   server.tool(
     "rename_agent",
-    "Rename an agent (NICK): migrates its registry entry, inbox, cursor, transport marker, and channel memberships to the new id, then broadcasts a rename notice to its channels. Note: a running attached pusher keeps its old id until restarted.",
+    "Rename an agent (NICK): migrates its registry entry, inbox, cursor, and channel memberships to the new id, then broadcasts a rename notice to its channels. If a live tmux-push transport is attached it is detached first (the pusher is bound to the old id) — re-attach as the new id (join/attach_agent) to restore real-time delivery; the response sets detachedTransport + a warning when this happens.",
     renameAgentSchema,
     async (args) => jsonResult(await renameAgentTool(args))
   );

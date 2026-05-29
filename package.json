@@ -11,7 +11,9 @@
     "build": "tsc",
     "prepare": "tsc",
     "start": "node dist/server.js",
-    "dev": "tsx src/server.ts"
+    "dev": "tsx src/server.ts",
+    "pretest": "tsc",
+    "test": "node --test \"test/*.test.mjs\""
   },
   "files": [
     "dist",
@@ -44,6 +46,9 @@
     "tmux"
   ],
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "proper-lockfile": "^4.1.2",

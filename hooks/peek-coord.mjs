@@ -82,36 +82,38 @@ if (MODE === "stop") {
 
 // ---------- helpers ----------
 
-function drain(file, cursor, key) {
+// Parse a JSONL file into entries, dropping blank/malformed lines. Offsets
+// index into THIS parsed array — identical to the MCP server (readJsonl) and
+// the pusher, so the shared cursor means the same position for all three. (The
+// older "slice raw lines, then parse" approach counted malformed lines toward
+// the offset and could desync the cursor against the MCP server.)
+function readJsonlParsed(file) {
   if (!existsSync(file)) return [];
-  const raw = readFileSync(file, "utf8");
-  const lines = raw.split("\n").filter((l) => l.trim());
-  const start = cursor[key] ?? 0;
-  const slice = lines.slice(start);
-  const parsed = [];
-  for (const line of slice) {
-    try { parsed.push(JSON.parse(line)); } catch { /* skip */ }
+  const out = [];
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try { out.push(JSON.parse(line)); } catch { /* skip malformed */ }
   }
+  return out;
+}
+
+function drain(file, cursor, key) {
+  const all = readJsonlParsed(file);
+  const start = cursor[key] ?? 0;
+  const slice = all.slice(start);
   if (slice.length > 0) cursor[key] = start + slice.length;
-  return parsed;
+  return slice;
 }
 
 // Drain a channel against its per-channel offset, reading from the file the
 // channel maps to (general → room.jsonl, others → rooms/<chan>.jsonl).
 function drainRoom(chan, cursor) {
   const c = normalizeRoom(chan);
-  const file = roomFile(c);
-  if (!existsSync(file)) return [];
-  const raw = readFileSync(file, "utf8");
-  const lines = raw.split("\n").filter((l) => l.trim());
+  const all = readJsonlParsed(roomFile(c));
   const start = getRoomOffset(cursor, c);
-  const slice = lines.slice(start);
-  const parsed = [];
-  for (const line of slice) {
-    try { parsed.push(JSON.parse(line)); } catch { /* skip */ }
-  }
+  const slice = all.slice(start);
   if (slice.length > 0) setRoomOffset(cursor, c, start + slice.length);
-  return parsed;
+  return slice;
 }
 
 function fmt(source, chan, m) {

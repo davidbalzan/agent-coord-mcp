@@ -331,8 +331,20 @@ lastLineWasSep = true;
 try { watch(INBOX_FILE, () => void drainAndPrint()); } catch {}
 for (const chan of joinedRooms()) watchRoom(chan);
 try { watch(AGENTS_FILE, () => refreshPrompt()); } catch {}
-setInterval(() => void drainAndPrint(), 1000);
-setInterval(refreshPrompt, 5000);
+const drainTimer = setInterval(() => void drainAndPrint(), 1000);
+const promptTimer = setInterval(refreshPrompt, 5000);
+
+// Single teardown path: stop the poll timers and release the terminal so we
+// exit cleanly no matter which route we leave by (/quit, SIGINT, EOF).
+let toreDown = false;
+function shutdown() {
+  if (toreDown) return;
+  toreDown = true;
+  clearInterval(drainTimer);
+  clearInterval(promptTimer);
+  teardownFooter();
+  try { rl.close(); } catch {}
+}
 
 rl.prompt();
 
@@ -356,7 +368,7 @@ async function handleLine(line) {
       const msg = text.replace(/^\/(quit|exit)\s*/, "").trim();
       for (const chan of joinedRooms()) await sendSystem(chan, msg ? `has quit (${msg})` : "has quit");
       await unregister();
-      teardownFooter();
+      shutdown();
       process.stdout.write(A.dim("bye.\n"));
       process.exit(0);
     } else if (text === "/help" || text === "/?") {
@@ -448,14 +460,14 @@ async function handleLine(line) {
 
 process.on("SIGINT", async () => {
   try { await unregister(); } catch {}
-  teardownFooter();
+  shutdown();
   process.stdout.write("\n" + A.dim("bye.\n"));
   process.exit(0);
 });
 
 process.on("exit", () => {
   // Final safety net — restore terminal state if we exit via any path.
-  teardownFooter();
+  shutdown();
 });
 
 // ---------- helpers ----------

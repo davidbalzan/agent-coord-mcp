@@ -151,6 +151,44 @@ Use the bus itself to coordinate the build — meta but on-brand:
 
 ---
 
+## Maintenance — `doctor` health tool  📝 proposed
+
+**Goal.** A single read-mostly diagnostic that inspects the whole `~/agent-coord/` state and reports drift, leaks, and corruption — the "why isn't my DM landing / why is this agent still showing online" questions, answered in one call instead of by hand-tailing JSONL. Complements `status` (one agent) and `list_agents` (registry only) with a *bus-wide* view.
+
+**Why now.** The state is spread across `agents.json`, `rooms.json`, `transports/`, `inbox/`, `cursors/`, and the channel JSONL files, mutated by the MCP server, the hooks, the pushers, and `coord-chat` — all without a single owner. Several known drift modes already exist (orphan memberships from 24h eviction, stale transport markers, cursor offsets past EOF, malformed JSONL lines). `doctor` makes them visible and, opt-in, fixable.
+
+### Scope
+
+A `doctor({ fix?: boolean })` MCP tool (and a `coord-chat /doctor` command + `coord-chat` flag) that runs a fixed set of checks and returns a structured report. `fix:false` (default) is purely diagnostic; `fix:true` applies the safe, reversible repairs and lists what it changed.
+
+**Checks (each → `{ check, level: ok|warn|error, detail, fixable }`):**
+
+1. **Orphan transport markers** — `transports/*.json` whose `pid` is dead (already pruned lazily by `list_agents`; `doctor` reports them eagerly). *Fix: delete the marker.*
+2. **Orphan room memberships** — ids in `rooms.json` `members[]` not present in `agents.json` (left by the 24h eviction path, which doesn't strip memberships). *Fix: drop them (same compaction `prune` now does).*
+3. **Orphan inboxes / cursors** — `inbox/*.jsonl` and `cursors/*.json` for ids no longer registered. *Fix: delete (gated, mirrors `prune --removeOrphanInboxes`).*
+4. **Cursor past EOF** — any cursor offset (`inboxOffset`, `roomOffset`, `roomOffsets[chan]`, `statusOffset`) greater than the current parsed line count of its file → that source returns `[]` forever. *Fix: clamp to the file length.*
+5. **Malformed JSONL** — count unparseable lines per file (these silently desync offset math between the MCP server and the hooks). *Fix: `fix:true` rewrites the file dropping bad lines, after a `.bak` copy.*
+6. **Stale agents** — registered but `lastHeartbeat` older than `STALE_MS`/`EVICT_MS`, with no live transport. *Report only* (eviction stays a `list_agents` side effect; `doctor` just surfaces it).
+7. **Oversized files** — channel/inbox/status JSONL above a size threshold (default 5 MB) → suggests a `prune`. *Report only.*
+8. **Lock health** — leftover `*.lock` dirs older than `stale` (5 s) from a crashed writer. *Fix: best-effort release.*
+9. **Channel/registry consistency** — `general` always present; every `rooms/<chan>.jsonl` has a matching registry entry and vice-versa.
+10. **Environment sanity** — resolved `ROOT`, whether it's on a network/synced FS (lockfile caveat), `process.execPath` the pushers will inherit, and whether `tmux` is on PATH.
+
+### Design notes
+
+- **Read-only by default; every fix reversible or backed up.** `fix:true` never deletes message history without a `.bak` (check 5); membership/marker/cursor repairs are idempotent and safe to re-run.
+- **Reuse, don't duplicate.** Checks 2/3 share the compaction logic `prune` already grew; check 4 reuses the cursor-clamp math from `prune`'s offset-shift; PID liveness reuses `isPidAlive`. `doctor` is mostly orchestration over existing primitives.
+- **Output doubles as a smoke test.** A clean `doctor` report is the cheapest end-to-end assertion that the bus is internally consistent — useful in CI against a seeded state dir.
+- **No new files on disk.** It inspects existing state; the only writes happen under `fix:true`.
+
+### Success criteria
+
+- `doctor()` on a healthy bus returns all-`ok` and touches nothing.
+- After killing a pusher with `kill -9` (leaving a marker) and evicting an agent that owned a membership, `doctor()` reports both as `warn`/`fixable`, and `doctor({fix:true})` clears them, with a clean follow-up run.
+- A hand-corrupted cursor (offset past EOF) is detected and clamped, restoring delivery.
+
+---
+
 ## Phase 7+ — Possible follow-ups
 
 Listed here so they don't clutter Phase 5/6, but worth tracking as ideas:
