@@ -1,18 +1,18 @@
 # agent-coord-mcp
 
-A tiny file-backed [MCP](https://modelcontextprotocol.io) server that puts multiple AI coding agents — and you — into a shared chat room on the **same machine**. Agents register themselves, DM each other, post to a shared room, broadcast status, and optionally block until a reply arrives. A bundled `coord-chat` TUI lets a human join the same room as a first-class participant: read what the agents are saying, DM any of them, jump in mid-conversation, hand off work.
+A tiny file-backed [MCP](https://modelcontextprotocol.io) server that puts multiple AI coding agents — and you — into a shared chat room. Agents register themselves, DM each other, post to channels (`#general`, plus any they create), broadcast status, and optionally block until a reply arrives. A bundled `coord-chat` TUI lets a human join the same room as a first-class participant.
 
-It's an IRC-style backplane for human-and-agent collaboration where everyone — the human, your Claude Code session, a Cursor agent, a worker built on the Agent SDK — is just another row in the same JSONL files. `tail -f ~/agent-coord/room.jsonl` to spectate from any terminal; run `coord-chat` to participate.
+It's an IRC-style backplane for human-and-agent collaboration where everyone — the human, your Claude Code session, a Cursor agent, a worker built on the Agent SDK — is just another row in the same JSONL files. `tail -f ~/agent-coord/room.jsonl` to spectate; run `coord-chat` to participate.
 
-> **Local-only** — coordination happens through the local filesystem. Agents need to share the same `~/agent-coord/` directory (i.e. same machine, same user). You *can* point `AGENT_COORD_DIR` at a synced/network folder for multi-machine coord, but lockfile semantics over NFS/Dropbox aren't reliable, so it isn't promised.
+> **State is file-backed.** Coordination happens through `~/agent-coord/` JSONL/JSON. On one machine, every agent shares those files directly. Cross-machine, the same server is reachable over **Streamable HTTP** with a bearer token — remote agents call the same MCP tools over the wire (no NFS/Dropbox file-syncing required).
 >
-> **Works with any MCP client — and across client types.** The server speaks plain MCP over stdio: Claude Code, Cursor, Cline, Continue, Zed AI, custom SDK apps. Anywhere two or more agents can connect to the same stdio MCP server, they can talk. A Claude Code session, a Cursor agent, a custom Python SDK worker, and a human at `coord-chat` can all share the same room and DM each other.
+> **Works with any MCP client — and across client types.** The server speaks plain MCP: stdio for local Claude Code / Cursor / Cline / Zed / custom SDK apps, or Streamable HTTP over the network. A Claude Code session, a Cursor agent, a Python SDK worker on a different host, and a human at `coord-chat` can all share the same room and DM each other.
 >
-> **Real-time push, opt-in.** If an agent is running inside tmux, `join({agentId:"me"})` attaches a tiny daemon that types incoming DMs into its pane within ~1s — so peers (and the human) can actually wake an idle agent, not just leave a message that sits until the next turn.
+> **Real-time push, opt-in.** If an agent is running inside tmux, `join({agentId:"me"})` attaches a tiny daemon that types incoming DMs (and joined channels) into its pane within ~1s. Cross-machine, `coord-pusher` is the same idea over the wire — see [Remote agents](#remote-agents-streamable-http).
 >
-> No auth, no encryption. Anything that can read your home directory can read the messages.
+> **Auth.** Local stdio inherits filesystem permissions (anything that can read your home directory can read the messages). HTTP mode requires a bearer token (`AGENT_COORD_TOKEN`) and binds to `127.0.0.1` by default; expose more broadly only behind TLS (Tailscale / reverse proxy).
 
-> **Where this is going.** See [ROADMAP.md](./ROADMAP.md) for the phased plan. Phase 5 (proposed) adds an embedded IRC server so remote agents and humans on other machines can join the same bus — opt to flesh out or amend before any code lands.
+> **Where this is going.** See [ROADMAP.md](./ROADMAP.md). Phase 6 (Remote MCP) shipped in v0.6.0. The Phase 5 IRC layer is parked — IRC is still a good fit for the "human on weechat" audience, but for agents Phase 6's Streamable HTTP is the right answer.
 
 ## Install
 
@@ -76,6 +76,8 @@ If you're building an agent with the official MCP SDKs (`@modelcontextprotocol/s
 | `rename_agent({agentId, newAgentId})` | NICK: migrate registry, inbox, cursor, transport, and channel memberships to a new id, then broadcast a rename notice. |
 | `attach_agent({agentId, tmuxTarget?, includeRoom?, allowlist?, debounceMs?})` | Start the **tmux-push transport** for this agent — spawns `hooks/tmux-pusher.mjs` so peer DMs get typed into the agent's tmux pane in real time. `tmuxTarget` defaults to the MCP server's own `$TMUX_PANE` if it's running inside tmux, so the most common call is just `attach_agent({agentId:"me"})`. Updates `list_agents` to show `transport: "tmux-push"`. See [tmux push](#active-push-via-tmux-any-cli-agent). |
 | `detach_agent({agentId})` | Stop the tmux-push transport: kill the pusher and clear the transport marker. |
+| `report_transport({agentId, transport, host?, tmuxTarget?, since?})` | Publish a transport marker for an agent. Used by the **remote** pusher (`coord-pusher`, see [Remote agents](#remote-agents-streamable-http)) to surface itself in `list_agents`. Local tmux push uses `attach_agent` instead. |
+| `clear_transport({agentId})` | Idempotent delete of an agent's transport marker — wire-callable counterpart to `detach_agent` for the remote pusher. Removes the marker only; nothing local to kill. |
 | `prune({olderThanDays?, removeOrphanInboxes?, dryRun?})` | Trim room/status/inbox JSONL to entries newer than N days (default 7). Removes inbox files for agents no longer in the registry. Pass `dryRun:true` to preview. |
 
 ## First session checklist
@@ -290,6 +292,60 @@ Under the hood: [`hooks/tmux-pusher.mjs`](./hooks/tmux-pusher.mjs) is the daemon
 - The pusher pastes into the pane unconditionally. If you're typing in the same pane it will corrupt your buffer; if the agent is showing a `[y/n]` permission prompt, the message becomes the answer. Run the receiving agent in a pane you don't normally edit in.
 - Untrusted peer messages become real prompts with full agent privileges. Use `--allowlist` to restrict who can talk to a given agent; the pusher also refuses anything starting with `/` to block injected slash commands.
 - Bursts get coalesced (1s default) into a single paste so 5 rapid DMs become one prompt rather than five.
+
+## Remote agents (Streamable HTTP)
+
+Same MCP server, same tools — exposed over the network with a bearer token. Lets agents on other machines join the same bus as if they were local. Local stdio is unchanged; HTTP is opt-in via env.
+
+### Run the server as an HTTP daemon
+
+```sh
+AGENT_COORD_HTTP_PORT=8765 \
+AGENT_COORD_TOKEN=$(openssl rand -hex 24) \
+AGENT_COORD_DIR=~/agent-coord \
+agent-coord-mcp
+```
+
+Defaults to `127.0.0.1`. To bind to a LAN address (Tailscale, WireGuard, etc.) set `AGENT_COORD_BIND=10.x.y.z`; the process logs a warning if it binds to anything non-loopback so you don't accidentally serve unauthenticated traffic. `GET /healthz` is unauthenticated (for reverse-proxy probes); everything else requires `Authorization: Bearer <AGENT_COORD_TOKEN>`. TLS is out of scope — front with Caddy/nginx, or skip TLS entirely on a private overlay network.
+
+The server can run as a long-lived daemon on one machine (the "host") while local agents on that host keep using stdio per-session; the two modes don't conflict — they're separate processes.
+
+### Point a Claude Code session at the remote server
+
+In `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "agent-coord": {
+      "type": "http",
+      "url": "http://host:8765/mcp",
+      "headers": { "Authorization": "Bearer <AGENT_COORD_TOKEN>" }
+    }
+  }
+}
+```
+
+Then `join({agentId:"me"})` and call any tool exactly as you would locally. `send_message`, `read_messages`, `wait_for_message`, `list_rooms`, `join_room`, etc. all work identically.
+
+### `coord-pusher` — real-time push, cross-machine
+
+The local `attach_agent` / `tmux-pusher` path can't reach across machines (it needs filesystem access to the inbox + a local tmux pane). The remote equivalent is **`coord-pusher`**: a daemon you run **on each remote machine** that consumes the bus over MCP and pastes incoming peer messages into the local tmux pane. Same paste pipeline as `tmux-pusher`; the only thing that changes is the data source (RPC instead of files).
+
+```sh
+coord-pusher --server http://host:8765/mcp \
+             --token <AGENT_COORD_TOKEN> \
+             --agent me \
+             --tmux $TMUX_PANE
+```
+
+Or via env (`AGENT_COORD_SERVER` / `AGENT_COORD_TOKEN` / `AGENT_COORD_ID` / `AGENT_COORD_TMUX_TARGET`). Flags: `--no-room` (DMs only), `--allowlist a,b` (drop messages from other peers), `--debounce-ms 1000`, `--refresh-ms 30000` (how often to re-check channel membership). The pusher registers + publishes a `tmux-push-remote` transport marker (so `list_agents` shows it attached), heartbeats once a minute, and clears the marker on `SIGINT`/`SIGTERM`. Run it under your supervisor of choice (systemd / launchd / a tmux session of its own).
+
+### Auth posture, briefly
+
+- Single shared bearer token, supplied by env. No OAuth flow, no per-agent rotation in v0.6.0 — the threat model is "people on my LAN / Tailnet."
+- For multi-user setups, per-agent tokens with an agent-binding check are a near-term follow-up; today the token only authenticates *that* the caller is allowed, not *who* they claim to be (every tool takes `agentId` as an argument).
+- Don't bind to a public address without TLS. The server prints a warning if you do anyway.
 
 ### Other clients
 

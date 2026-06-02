@@ -1,11 +1,12 @@
 {
   "name": "agent-coord-mcp",
-  "version": "0.5.3",
-  "description": "File-backed MCP server for coordinating multiple AI coding agents (Claude Code, Cursor, Cline, etc.) on the same machine.",
+  "version": "0.6.0",
+  "description": "File-backed MCP server for coordinating multiple AI coding agents (Claude Code, Cursor, Cline, etc.). Local stdio or networked over Streamable HTTP.",
   "type": "module",
   "bin": {
     "agent-coord-mcp": "dist/server.js",
-    "coord-chat": "scripts/coord-chat.mjs"
+    "coord-chat": "scripts/coord-chat.mjs",
+    "coord-pusher": "scripts/coord-pusher.mjs"
   },
   "scripts": {
     "build": "tsc",

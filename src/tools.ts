@@ -54,6 +54,9 @@ type TransportMarker = {
   pid: number;
   tmuxTarget?: string;
   since: number;
+  // Remote pushers run on a different machine; the local pid is meaningless,
+  // so we tag the host and use heartbeat-based liveness instead of pidAlive.
+  host?: string;
 };
 
 type AgentRegistry = Record<string, AgentEntry>;
@@ -241,6 +244,10 @@ export async function listAgentsTool() {
 
 async function loadLiveTransports(): Promise<Map<string, TransportMarker>> {
   const out = new Map<string, TransportMarker>();
+  // For remote markers we can't pid-check the foreign process — instead we trust
+  // the registry's lastHeartbeat, which the remote pusher refreshes every minute.
+  const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
+  const now = Date.now();
   for (const fname of await listTransportFiles()) {
     const file = path.join(TRANSPORT_DIR, fname);
     const marker = await readJson<TransportMarker | null>(file, null);
@@ -248,7 +255,15 @@ async function loadLiveTransports(): Promise<Map<string, TransportMarker>> {
       await deleteFile(file);
       continue;
     }
-    if (!isPidAlive(marker.pid)) {
+    const isRemote = marker.transport === "tmux-push-remote";
+    if (isRemote) {
+      const entry = reg[marker.agentId];
+      const fresh = !!entry && now - entry.lastHeartbeat < STALE_MS;
+      if (!fresh) {
+        await deleteFile(file);
+        continue;
+      }
+    } else if (!isPidAlive(marker.pid)) {
       await deleteFile(file);
       continue;
     }
@@ -1053,6 +1068,51 @@ export async function renameAgentTool(args: { agentId: string; newAgentId: strin
       ? { warning: `the live tmux-push transport was detached during rename — re-attach as '${newId}' (e.g. join/attach_agent) to restore real-time delivery` }
       : {}),
   };
+}
+
+// ---------- transport markers (for remote pushers) ----------
+
+export const reportTransportSchema = {
+  agentId: z.string().min(1),
+  transport: z.string().min(1),
+  tmuxTarget: z.string().optional(),
+  host: z.string().optional(),
+  since: z.number().optional(),
+};
+
+// Called by an external push daemon (typically scripts/coord-pusher.mjs on a
+// remote machine) to publish a transport marker so list_agents reflects the
+// attachment. The local tmux-push path writes the marker directly inside
+// attach_agent; this is the wire-callable equivalent for remote pushers.
+export async function reportTransportTool(args: {
+  agentId: string;
+  transport: string;
+  tmuxTarget?: string;
+  host?: string;
+  since?: number;
+}) {
+  const marker: TransportMarker = {
+    agentId: args.agentId,
+    transport: args.transport,
+    pid: 0, // not meaningful for remote; liveness comes from heartbeat
+    tmuxTarget: args.tmuxTarget,
+    host: args.host,
+    since: args.since ?? Date.now(),
+  };
+  await updateJson<TransportMarker>(transportFile(args.agentId), marker, () => marker);
+  return { ok: true, marker };
+}
+
+export const clearTransportSchema = {
+  agentId: z.string().min(1),
+};
+
+// Idempotent remote-counterpart to detach_agent: just deletes the marker. Used
+// by the remote pusher on graceful shutdown so list_agents stops showing it
+// attached. (Does NOT try to kill any process — there's nothing local to kill.)
+export async function clearTransportTool(args: { agentId: string }) {
+  const removed = await deleteFile(transportFile(args.agentId));
+  return { ok: true, removed };
 }
 
 // ---------- helpers ----------

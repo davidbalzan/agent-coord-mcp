@@ -1,10 +1,15 @@
 #!/usr/bin/env node
+import { randomUUID } from "node:crypto";
+import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ensureDirs } from "./store.js";
 import {
   attachAgentSchema,
   attachAgentTool,
+  clearTransportSchema,
+  clearTransportTool,
   detachAgentSchema,
   detachAgentTool,
   heartbeatSchema,
@@ -29,6 +34,8 @@ import {
   registerTool,
   renameAgentSchema,
   renameAgentTool,
+  reportTransportSchema,
+  reportTransportTool,
   sendMessageSchema,
   sendMessageTool,
   setRoomMotdSchema,
@@ -49,9 +56,10 @@ function jsonResult(data: unknown) {
   };
 }
 
-async function main() {
-  ensureDirs();
-
+// Build a fully-configured McpServer with every tool registered. Returns a
+// fresh instance each call — in HTTP mode we need one server per session so
+// transports don't share Protocol state.
+function buildServer(): McpServer {
   const server = new McpServer({
     name: "agent-coord",
     version: "0.1.0",
@@ -190,8 +198,125 @@ async function main() {
     async (args) => jsonResult(await detachAgentTool(args))
   );
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  server.tool(
+    "report_transport",
+    "Publish a transport marker for an agent (used by the remote tmux pusher, scripts/coord-pusher.mjs, to surface itself in list_agents). Set transport='tmux-push-remote' and optionally host/tmuxTarget. Liveness for remote markers is heartbeat-based — keep calling heartbeat or this marker gets GC'd after staleness.",
+    reportTransportSchema,
+    async (args) => jsonResult(await reportTransportTool(args))
+  );
+
+  server.tool(
+    "clear_transport",
+    "Idempotent delete of an agent's transport marker. The wire-callable counterpart to detach_agent for remote pushers: it only removes the marker — there's no local process to kill.",
+    clearTransportSchema,
+    async (args) => jsonResult(await clearTransportTool(args))
+  );
+
+  return server;
+}
+
+async function main() {
+  ensureDirs();
+  // Transport selector. AGENT_COORD_HTTP_PORT set → run as a long-lived HTTP
+  // daemon (Streamable HTTP transport + bearer-token auth). Otherwise the
+  // historical stdio behavior (per-client subprocess spawned by Claude Code).
+  const httpPort = process.env.AGENT_COORD_HTTP_PORT;
+  if (httpPort) {
+    await startHttp(parseInt(httpPort, 10));
+  } else {
+    const server = buildServer();
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+  }
+}
+
+async function startHttp(port: number): Promise<void> {
+  const token = process.env.AGENT_COORD_TOKEN;
+  if (!token) {
+    console.error(
+      "[agent-coord-mcp] AGENT_COORD_TOKEN is required when running in HTTP mode. Refusing to start an unauthenticated network listener.",
+    );
+    process.exit(1);
+  }
+  const bind = process.env.AGENT_COORD_BIND ?? "127.0.0.1";
+  const expected = `Bearer ${token}`;
+
+  // One transport+server pair per client session. The SDK exposes session
+  // affinity via the `mcp-session-id` header: a new request without it is
+  // an init (create new pair); follow-ups carry the id (look up the pair).
+  // We cannot share one stateful transport across clients (it errors with
+  // "Server already initialized"), and stateless mode rejects reuse.
+  const sessions = new Map<string, StreamableHTTPServerTransport>();
+
+  async function makeSessionTransport(): Promise<StreamableHTTPServerTransport> {
+    // `let` + explicit type lets the SDK callbacks close over the binding
+    // before it's assigned — they only fire after construction completes.
+    let transport: StreamableHTTPServerTransport;
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (id: string) => { sessions.set(id, transport); },
+    });
+    transport.onclose = () => {
+      if (transport.sessionId) sessions.delete(transport.sessionId);
+    };
+    const server = buildServer();
+    await server.connect(transport);
+    return transport;
+  }
+
+  const http = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    try {
+      // Unauthenticated liveness probe so reverse proxies / orchestrators can
+      // health-check without needing a credential.
+      const url = req.url ?? "/";
+      if (req.method === "GET" && (url === "/healthz" || url === "/health")) {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("ok\n");
+        return;
+      }
+
+      // Bearer-token gate. Constant-time compare isn't worthwhile here — the
+      // attacker model for the LAN/personal case is "someone on the same
+      // network" who can already observe traffic; TLS termination is the
+      // answer to that, not auth-side timing tricks.
+      if (req.headers.authorization !== expected) {
+        res.writeHead(401, { "Content-Type": "text/plain", "WWW-Authenticate": "Bearer" });
+        res.end("unauthorized\n");
+        return;
+      }
+
+      // Session routing. Existing session id → reuse its transport; new client
+      // (no id, POST init) → mint a fresh transport+server pair; anything else
+      // is a protocol error.
+      const sid = req.headers["mcp-session-id"];
+      let transport = typeof sid === "string" ? sessions.get(sid) : undefined;
+      if (!transport) {
+        if (req.method !== "POST") {
+          res.writeHead(400, { "Content-Type": "text/plain" });
+          res.end("missing or unknown mcp-session-id\n");
+          return;
+        }
+        transport = await makeSessionTransport();
+      }
+      await transport.handleRequest(req, res);
+    } catch (err) {
+      console.error("[agent-coord-mcp] http request failed:", err);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("internal error\n");
+      }
+    }
+  });
+
+  http.listen(port, bind, () => {
+    console.error(`[agent-coord-mcp] http listening on ${bind}:${port} (token required)`);
+    if (bind !== "127.0.0.1" && bind !== "localhost") {
+      console.error(
+        `[agent-coord-mcp] WARNING: bound to ${bind} without TLS. Front with a TLS reverse proxy ` +
+          `(or restrict to a private network e.g. Tailscale/WireGuard) before exposing publicly.`,
+      );
+    }
+  });
 }
 
 main().catch((err) => {

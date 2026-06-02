@@ -22,7 +22,11 @@ Beyond the default `general` channel: `join_room` / `leave_room` / `list_rooms` 
 
 ---
 
-## Phase 5 — IRC layer for humans (and IRC-native bots)  📝 in flight
+## Phase 5 — IRC layer for humans (and IRC-native bots)  🅿️ parked
+
+> **Status: parked, not deleted.** Started, then superseded for the *agent* audience by Phase 6 (Remote MCP) — agents speak MCP natively, so translating their structured tool calls through IRC PRIVMSGs was a protocol downgrade for no gain. IRC still has merit for the *human-on-weechat* audience (existing mature clients, no `coord-chat` port required) and can resume as a separate add-on package later if that audience materialises. The scope below stands as the design of record if/when it's picked back up.
+
+
 
 **Goal.** Let humans on *different machines* join the same bus using their existing IRC client (weechat, irssi, HexChat, web). Also makes the bus reachable to any IRC-native bot ecosystem that happens to fit. **Not** the recommended path for agents that already speak MCP — those go through Phase 6.
 
@@ -114,40 +118,30 @@ Use the bus itself to coordinate the build — meta but on-brand:
 
 ---
 
-## Phase 6 — Remote MCP transport  📝 proposed
+## Phase 6 — Remote MCP transport  ✅ shipped (v0.6.0)
 
-**Goal.** Let agents on *other machines* join the bus by connecting to the same MCP server they'd connect to locally, just over the network instead of stdio. Same tool surface (`join`, `send_message`, `list_agents`, etc.), zero protocol translation, structured payloads end-to-end.
+Agents on *other machines* join the bus by connecting to the same MCP server they'd connect to locally — over Streamable HTTP instead of stdio. Same tool surface (`join`, `send_message`, `list_rooms`, `join_room`, etc.), zero protocol translation, structured payloads end-to-end. Local stdio is unchanged; HTTP is opt-in via `AGENT_COORD_HTTP_PORT`.
 
-**Why this is separate from Phase 5.** Phase 5 (IRC) is for *humans* who want a free ecosystem of mature chat clients. Agents already speak MCP — forcing them through IRC would mean translating each structured tool call into PRIVMSG-shaped text and reparsing the answer, a protocol downgrade. The MCP spec already defines a network transport — we just need to expose it.
+### Delivered
 
-### Scope
+- **Streamable HTTP transport** alongside stdio. Env-driven: `AGENT_COORD_HTTP_PORT` set → run as a long-lived HTTP daemon; unset → stdio per-client (legacy behavior). Same `McpServer` registrations, per-session transport bookkeeping internal to the SDK.
+- **Bearer-token auth** via `AGENT_COORD_TOKEN`. `GET /healthz` is unauthenticated for reverse-proxy probes; everything else 401s without `Authorization: Bearer <token>`.
+- **Bind defaults to `127.0.0.1`**; explicit `AGENT_COORD_BIND` override required to expose on a LAN address, with a startup warning so it's not accidental. TLS is delegated to a reverse proxy (nginx / Caddy) or a private overlay (Tailscale / WireGuard).
+- **`coord-pusher`** — new bin: the remote counterpart to `hooks/tmux-pusher.mjs`. Runs on the remote machine, consumes the bus over MCP (`wait_for_message` long-poll per subscribed source), pastes incoming peer messages into the local tmux pane. Same paste pipeline as the local pusher; same filtering (self-echo, allowlist, slash-prefix); same debounce. Channel membership re-checked periodically via `list_rooms` so newly-`join_room`ed channels start tailing within ~30s.
+- **`report_transport` / `clear_transport` MCP tools** — wire-callable counterparts to `attach_agent` / `detach_agent` for the remote pusher to publish its marker (`transport: "tmux-push-remote"`) so `list_agents` surfaces it. Liveness for remote markers is heartbeat-based (the pusher heartbeats every minute), not pid-based.
 
-- Add the **Streamable HTTP transport** (per the MCP spec) to `agent-coord-mcp` alongside the existing stdio transport. Same `McpServer` instance, same tools — different transport.
-- New bin flag: `agent-coord-mcp --http-port 8765` (or `--http-bind 0.0.0.0:8765`). Default: HTTP transport off; opt-in.
-- Bearer-token auth: `Authorization: Bearer <token>` required on every request. Token lives at `~/agent-coord/http-token` (mode 600), readable by the server, distributed to remote agents out-of-band.
-- TLS: terminate at a reverse proxy in production (nginx / Caddy). Server itself binds HTTP; document the proxy pattern in the README.
-- Remote registration: client sends a normal `join({agentId, project, role})` over HTTP. Same JSONL gets written. Same `list_agents` shows them. No special "remote" flag needed.
-- Connection identity: each HTTP session corresponds to one agent. Connection close → behave as `unregister` (matches stdio close semantics).
-- Push transport (`tmux-push`) doesn't apply — remote agents have a persistent socket already, so DMs/room messages get streamed via SSE on the same MCP channel.
+### Out of scope (deferred to v0.7+)
 
-### Out of scope for Phase 6
+- TLS termination in the server itself
+- OAuth 2.1 flows / per-agent token rotation
+- Per-tool authorization
+- True multi-machine *state* (the server still reads/writes one filesystem; remote agents reach it via RPC, but the canonical state lives on the host)
 
-- OAuth / federation across organizations
-- Per-tool authorization (every authenticated client gets every tool — same as local stdio today)
-- Webhook callbacks (use SSE streaming instead)
+### Verified
 
-### Open questions
-
-1. **Server identity per agent.** Currently a single MCP process. With HTTP, do we keep one process serving many agents, or spawn per-connection? Lean: one process, in-memory session map.
-2. **Backpressure on push.** SSE has flow-control concerns when an agent is slow to drain. Lean: bounded per-session queue, drop oldest with a server NOTICE if it overflows.
-3. **Cross-host JSONL.** Same machine assumption still holds (HTTP server reads/writes local `~/agent-coord/`). If we want true cross-machine state, that's Phase 7+ (probably a SQLite or Postgres backing store behind the same MCP surface).
-4. **Coexistence with IRC.** A remote agent on MCP and a human on IRC posting to the same channel should Just Work — both write to the same JSONL. Need to confirm timestamp ordering is consistent across writers.
-
-### Success criteria
-
-- A remote agent runs `claude mcp add agent-coord --transport=http --url=https://bus.local:8765 --header="Authorization: Bearer ..."` and gets the same tool list as a local agent.
-- Local + remote agents can DM each other; messages land in the right inbox files regardless of who sent.
-- An IRC client on the same bus sees agent-posted messages and vice versa.
+- Loopback two-process test: HTTP server + `coord-pusher` on the same box delivers both DMs and channel posts to the configured tmux pane within ~1s of arrival.
+- `SIGTERM` on the pusher cleanly clears the transport marker via `clear_transport`.
+- Stdio mode unchanged; existing local agents see identical behavior.
 
 ---
 
