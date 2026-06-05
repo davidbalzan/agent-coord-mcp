@@ -32,6 +32,7 @@ import {
   removeMember,
   rewriteJsonl,
   roomFile,
+  rotateAgentToken,
   setRoomMeta,
   transportFile,
   TRANSPORT_DIR,
@@ -1052,6 +1053,11 @@ export async function renameAgentTool(args: { agentId: string; newAgentId: strin
   await moveFile(inboxFile(oldId), inboxFile(newId));
   await moveFile(cursorFile(oldId), cursorFile(newId));
   await moveFile(transportFile(oldId), transportFile(newId));
+
+  // Identity-binding token rotation: if tokens.json exists and had the old
+  // id, move its token to the new id atomically. Lets the same bearer keep
+  // authenticating after rename — no-op if binding isn't configured.
+  await rotateAgentToken(oldId, newId);
 
   // Broadcast a NICK notice to every channel the agent was in.
   for (const chan of joined) {

@@ -10,7 +10,7 @@ It's an IRC-style backplane for human-and-agent collaboration where everyone —
 >
 > **Real-time push, opt-in.** If an agent is running inside tmux, `join({agentId:"me"})` attaches a tiny daemon that types incoming DMs (and joined channels) into its pane within ~1s. Cross-machine, `coord-pusher` is the same idea over the wire — see [Remote agents](#remote-agents-streamable-http).
 >
-> **Auth.** Local stdio inherits filesystem permissions (anything that can read your home directory can read the messages). HTTP mode requires a bearer token (`AGENT_COORD_TOKEN`) and binds to `127.0.0.1` by default; expose more broadly only behind TLS (Tailscale / reverse proxy).
+> **Auth.** Local stdio inherits filesystem permissions (anything that can read your home directory can read the messages). HTTP mode requires a bearer token and binds to `127.0.0.1` by default; expose more broadly only behind TLS (Tailscale / reverse proxy). v0.7.0 adds per-agent token binding via `~/agent-coord/tokens.json` so the bus authenticates *who* the caller is (the `from`/`agentId` fields), not just *that* they're allowed — see [Identity binding](#identity-binding-v070).
 
 > **Where this is going.** See [ROADMAP.md](./ROADMAP.md). Phase 6 (Remote MCP) shipped in v0.6.0. The Phase 5 IRC layer is parked — IRC is still a good fit for the "human on weechat" audience, but for agents Phase 6's Streamable HTTP is the right answer.
 
@@ -341,10 +341,30 @@ coord-pusher --server http://host:8765/mcp \
 
 Or via env (`AGENT_COORD_SERVER` / `AGENT_COORD_TOKEN` / `AGENT_COORD_ID` / `AGENT_COORD_TMUX_TARGET`). Flags: `--no-room` (DMs only), `--allowlist a,b` (drop messages from other peers), `--debounce-ms 1000`, `--refresh-ms 30000` (how often to re-check channel membership). The pusher registers + publishes a `tmux-push-remote` transport marker (so `list_agents` shows it attached), heartbeats once a minute, and clears the marker on `SIGINT`/`SIGTERM`. Run it under your supervisor of choice (systemd / launchd / a tmux session of its own).
 
+### Identity binding (v0.7.0)
+
+By default the bearer authenticates the *channel* — any session can post under any `from`/`agentId`. v0.7.0 adds **per-agent tokens that bind a session to an identity**, so a tool call that claims to be someone else is rejected:
+
+```
+identity bound to 'alice'; rejected attempt to act as 'bob'
+```
+
+To enable, drop a `~/agent-coord/tokens.json` (mode 600) mapping agentId → bearer:
+
+```json
+{ "alice": "tk_$(openssl rand -hex 24)",
+  "bob":   "tk_$(openssl rand -hex 24)" }
+```
+
+Each remote client uses its agent's token in the `Authorization: Bearer …` header. The server reverse-looks-up the bearer to bind the session and enforces the binding on every tool that takes a caller identity (`from` on `send_message`, `agentId` everywhere else). Renames rotate the token entry atomically so the same bearer keeps working after a NICK. `kill -HUP <pid>` reloads the file without a restart.
+
+**For local stdio agents**, set `AGENT_COORD_BOUND_AGENT=<your-id>` in the MCP launch env (the `env` block in `~/.claude.json`) to bind the spawned subprocess to that identity. Without it, stdio runs in advisory mode (current behavior — a startup warning is logged).
+
+Backward-compat: if `tokens.json` is absent, the legacy single shared `AGENT_COORD_TOKEN` still works as channel-only auth (a startup warning fires, identity is advisory). The server refuses to start in HTTP mode with no auth configured at all. Malformed `tokens.json` is fatal.
+
 ### Auth posture, briefly
 
-- Single shared bearer token, supplied by env. No OAuth flow, no per-agent rotation in v0.6.0 — the threat model is "people on my LAN / Tailnet."
-- For multi-user setups, per-agent tokens with an agent-binding check are a near-term follow-up; today the token only authenticates *that* the caller is allowed, not *who* they claim to be (every tool takes `agentId` as an argument).
+- Threat model: misbehaving / buggy / compromised same-LAN cooperator can no longer assert another agent's identity. Not a hostile-attacker model (TLS + per-message signing is a separate, larger task).
 - Don't bind to a public address without TLS. The server prints a warning if you do anyway.
 
 ### Other clients

@@ -145,6 +145,24 @@ Agents on *other machines* join the bus by connecting to the same MCP server the
 
 ---
 
+## v0.7.0 — Bound caller identity  ✅ shipped
+
+The HTTP bearer (v0.6.0) authenticated the *channel*, not the *agent* — any session could post under any `from`/`agentId`. Root cause of the PR #45 chair-identity spoof. v0.7.0 binds each session to a single agent id and rejects any tool call that claims a different one.
+
+### Delivered
+
+- **Per-agent token map** at `~/agent-coord/tokens.json` (mode 600): `{ agentId: bearer }`. Server reverse-looks-up incoming bearers → bound agent.
+- **`AGENT_COORD_BOUND_AGENT` env** for stdio: each subprocess is bound to one identity (set in the `env` block of `~/.claude.json`).
+- **Enforcement** across all 17 tools that take `from`/`agentId`: mismatch returns `identity bound to 'X'; rejected attempt to act as 'Y'`. Tools with no caller identity (`list_agents`, `list_rooms`, `prune`) are unaffected.
+- **Backward-compatible rollout**: no `tokens.json` and no `AGENT_COORD_BOUND_AGENT` → advisory mode with a startup warning (legacy behavior preserved). The legacy shared `AGENT_COORD_TOKEN` still works for HTTP channel-auth when `tokens.json` is absent.
+- **`rename_agent` rotates the token entry atomically** under the existing lockfile, so the bearer keeps authenticating after a NICK.
+- **`SIGHUP` reloads** `tokens.json` without a server restart; malformed JSON is fatal on initial load (refuse to start in a broken auth state) and retains the previous map on hot-reload.
+
+### Tests
+`test/identity-binding.test.mjs` covers: absent → null, valid map parses, malformed JSON throws, non-string/empty tokens rejected, rename rotation, no-op rotation when binding is unconfigured.
+
+---
+
 ## Maintenance — `doctor` health tool  📝 proposed
 
 **Goal.** A single read-mostly diagnostic that inspects the whole `~/agent-coord/` state and reports drift, leaks, and corruption — the "why isn't my DM landing / why is this agent still showing online" questions, answered in one call instead of by hand-tailing JSONL. Complements `status` (one agent) and `list_agents` (registry only) with a *bus-wide* view.

@@ -1,4 +1,4 @@
-import { promises as fs, existsSync, mkdirSync } from "node:fs";
+import { promises as fs, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import lockfile from "proper-lockfile";
@@ -24,6 +24,14 @@ export const ROOMS_DIR = path.join(ROOT, "rooms");
 export const ROOMS_FILE = path.join(ROOT, "rooms.json");
 export const DEFAULT_ROOM = "general";
 
+// Per-agent token map for identity-bound bus auth (v0.7.0). Shape on disk:
+//   { "alice": "tk_<random-secret>", "bob": "tk_<another-secret>" }
+// HTTP transport reverse-looks-up the bearer to bind the session to an
+// agentId, then enforces that bound id against every tool call's
+// from/agentId field. Absent → advisory mode (legacy behaviour, with a
+// startup warning). Should be mode 600; operator-managed.
+export const TOKENS_FILE = path.join(ROOT, "tokens.json");
+
 export function ensureDirs(): void {
   for (const d of [ROOT, INBOX_DIR, CURSOR_DIR, TRANSPORT_DIR, PID_DIR, LOG_DIR, ROOMS_DIR]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
@@ -31,6 +39,53 @@ export function ensureDirs(): void {
   for (const f of [ROOM_FILE, STATUS_FILE]) {
     if (!existsSync(f)) mkdirSync(path.dirname(f), { recursive: true });
   }
+}
+
+// Synchronous, deliberate. The result feeds the server's bearer→agent
+// reverse-lookup map; we want startup to fail loudly on a malformed file
+// rather than silently degrade to advisory mode. Returns null if the file
+// is absent (operator hasn't configured binding yet).
+export function readTokenMapSync(): Map<string, string> | null {
+  if (!existsSync(TOKENS_FILE)) return null;
+  const raw = readFileSync(TOKENS_FILE, "utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(
+      `[agent-coord-mcp] ${TOKENS_FILE} is not valid JSON: ${(e as Error).message}. ` +
+        `Fix or remove the file (the bus refuses to start with a broken token map).`,
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(
+      `[agent-coord-mcp] ${TOKENS_FILE} must be a JSON object mapping agentId → token.`,
+    );
+  }
+  const out = new Map<string, string>();
+  for (const [agentId, token] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof token !== "string" || token.length === 0) {
+      throw new Error(
+        `[agent-coord-mcp] ${TOKENS_FILE}: agent "${agentId}" has a non-string/empty token.`,
+      );
+    }
+    out.set(token, agentId);
+  }
+  return out;
+}
+
+// Atomically rotate the token entry for an agent rename (used by
+// rename_agent so the same bearer continues to authenticate the renamed
+// identity). No-op if the file is absent or the old id isn't in the map.
+export async function rotateAgentToken(oldAgentId: string, newAgentId: string): Promise<void> {
+  if (!existsSync(TOKENS_FILE)) return;
+  await updateJson<Record<string, string>>(TOKENS_FILE, {}, (current) => {
+    if (current[oldAgentId] !== undefined) {
+      current[newAgentId] = current[oldAgentId];
+      delete current[oldAgentId];
+    }
+    return current;
+  });
 }
 
 export type RoomEntry = {
