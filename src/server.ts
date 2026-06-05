@@ -56,36 +56,45 @@ function jsonResult(data: unknown) {
   };
 }
 
-// v0.7.0 identity binding: every tool that takes a caller-identity field
-// (`from` on send_message, `agentId` everywhere else) is wrapped to enforce
-// that the field matches the session's bound agent. Unbound sessions (no
-// tokens.json / no AGENT_COORD_BOUND_AGENT) run in advisory mode — the field
-// is not checked but a single startup warning is logged. Tools with no caller
-// identity (list_agents, list_rooms, prune) pass `field: null` and skip the
-// check entirely.
-function bind(
-  field: "agentId" | "from" | null,
-  handler: (args: Record<string, unknown>) => Promise<unknown>,
-  boundAgent: string | undefined,
-) {
-  return async (args: Record<string, unknown>) => {
-    if (boundAgent && field) {
-      const claimed = args[field];
-      if (typeof claimed === "string" && claimed !== boundAgent) {
-        throw new Error(
-          `identity bound to '${boundAgent}'; rejected attempt to act as '${claimed}'`,
-        );
-      }
-    }
-    return jsonResult(await handler(args));
-  };
-}
-
 // Build a fully-configured McpServer with every tool registered. Returns a
 // fresh instance each call — in HTTP mode we need one server per session so
-// transports don't share Protocol state. `boundAgent` (when set) enforces
-// caller identity on every tool that claims one.
-function buildServer(boundAgent?: string): McpServer {
+// transports don't share Protocol state.
+//
+// Identity binding (v0.7.0 + TOFU in v0.7.1):
+//   - `initialBound` (when set) pre-binds the session — from a bearer token
+//     (HTTP/tokens.json) or AGENT_COORD_BOUND_AGENT env (stdio).
+//   - Otherwise the session starts unbound. The first tool call that carries
+//     an agentId/from field captures that value as the session's binding —
+//     trust-on-first-use. Subsequent calls must match; mid-session identity
+//     switching (the PR #45 spoof shape) is rejected.
+//   - rename_agent updates the binding to the new id on success so the
+//     renamed session keeps working.
+function buildServer(initialBound?: string): McpServer {
+  let bound = initialBound;
+
+  // Gate every tool that takes a caller identity. `field: null` (list_agents,
+  // list_rooms, prune) bypasses the check entirely.
+  function gate(
+    field: "agentId" | "from" | null,
+    handler: (args: Record<string, unknown>) => Promise<unknown>,
+  ) {
+    return async (args: Record<string, unknown>) => {
+      if (field) {
+        const claimed = args[field];
+        if (typeof claimed === "string") {
+          if (bound === undefined) {
+            bound = claimed; // TOFU: first claim wins, then sticky.
+          } else if (bound !== claimed) {
+            throw new Error(
+              `identity bound to '${bound}'; rejected attempt to act as '${claimed}'`,
+            );
+          }
+        }
+      }
+      return jsonResult(await handler(args));
+    };
+  }
+
   const server = new McpServer({
     name: "agent-coord",
     version: "0.1.0",
@@ -95,147 +104,164 @@ function buildServer(boundAgent?: string): McpServer {
     "join",
     "Recommended session-start call. Does register + auto-attach (if running inside tmux) + read inbox in one round-trip. Pass attach=false to skip the transport, attach={...overrides} to customize, or omit it to let the server auto-detect $TMUX_PANE. Returns the registration, attach result, any unread inbox messages, and the default channel's topic + MOTD (room rules) so you see them on connect.",
     joinSchema,
-    bind("agentId", joinTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", joinTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "register",
     "Register this agent in the shared registry. Lower-level than `join` — does not attach a transport or drain the inbox. Prefer `join` unless you need explicit control.",
     registerSchema,
-    bind("agentId", registerTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", registerTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "unregister",
     "Tear down this agent: detach any attached transport (kills the pusher) and remove the registry entry. Clean shutdown counterpart to `join`.",
     unregisterSchema,
-    bind("agentId", unregisterTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", unregisterTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "status",
     "Introspect this agent's coord state: registration, attached transport, inbox depth and unread count, and whether this MCP server is running inside tmux. Useful for debugging 'why isn't my DM landing'.",
     statusSchema,
-    bind("agentId", statusTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", statusTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "heartbeat",
     "Refresh this agent's lastHeartbeat timestamp.",
     heartbeatSchema,
-    bind("agentId", heartbeatTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", heartbeatTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "list_agents",
     "List all known agents and whether they appear online (heartbeat <5min).",
     listAgentsSchema,
-    bind(null, listAgentsTool as () => Promise<unknown>, boundAgent),
+    gate(null, listAgentsTool as () => Promise<unknown>),
   );
 
   server.tool(
     "send_message",
     "Send a message. If 'to' is set, goes to that agent's inbox (DM); otherwise to a channel — pass 'room' (e.g. 'seo' or '#seo') to target a specific channel, or omit it for the default 'general' channel. The 'from' field is enforced against the session's bound identity when binding is configured.",
     sendMessageSchema,
-    bind("from", sendMessageTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("from", sendMessageTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "read_messages",
     "Read new messages from inbox|room|status. For source='room', pass 'room' to read a specific channel (default 'general'). Advances the per-channel cursor unless peek=true.",
     readMessagesSchema,
-    bind("agentId", readMessagesTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", readMessagesTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "post_status",
     "Append a status broadcast to the shared status stream.",
     postStatusSchema,
-    bind("agentId", postStatusTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", postStatusTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "prune",
     "Trim room/status/inbox JSONL to entries newer than `olderThanDays` (default 7). Removes inbox files for agents no longer in the registry unless removeOrphanInboxes=false. Pass dryRun=true to preview.",
     pruneSchema,
-    bind(null, pruneTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate(null, pruneTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "wait_for_message",
     "Block (max 60s) until a new message appears on the given source, then return it. For source='room', pass 'room' to wait on a specific channel (default 'general').",
     waitForMessageSchema,
-    bind("agentId", waitForMessageTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", waitForMessageTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "list_rooms",
     "List all channels with their topic, MOTD (room rules), members, message count, and last activity.",
     listRoomsSchema,
-    bind(null, listRoomsTool as () => Promise<unknown>, boundAgent),
+    gate(null, listRoomsTool as () => Promise<unknown>),
   );
 
   server.tool(
     "join_room",
     "Join a channel (creating it if new). Adds this agent to the channel's membership so the notification hooks push its messages, and returns the channel's topic, MOTD, members, and unread count.",
     joinRoomSchema,
-    bind("agentId", joinRoomTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", joinRoomTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "leave_room",
     "Leave a channel — removes this agent from its membership. Cannot leave the default 'general' channel.",
     leaveRoomSchema,
-    bind("agentId", leaveRoomTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", leaveRoomTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "set_room_topic",
     "Set a channel's topic (a short one-line description). Posts a system notice to the channel.",
     setRoomTopicSchema,
-    bind("agentId", setRoomTopicTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", setRoomTopicTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "set_room_motd",
     "Set a channel's MOTD / room rules (shown to agents on join). Posts a system notice to the channel.",
     setRoomMotdSchema,
-    bind("agentId", setRoomMotdTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", setRoomMotdTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "rename_agent",
     "Rename an agent (NICK): migrates its registry entry, inbox, cursor, and channel memberships to the new id, then broadcasts a rename notice to its channels. When tokens.json identity binding is on, the caller's bearer token is atomically rotated to the new id so the same session keeps authenticating after rename. If a live tmux-push transport is attached it is detached first (the pusher is bound to the old id) — re-attach as the new id (join/attach_agent) to restore real-time delivery; the response sets detachedTransport + a warning when this happens.",
     renameAgentSchema,
-    bind("agentId", renameAgentTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    // Special: after a successful rename we update the session's bound id
+    // too, so the same session can keep operating under the new name without
+    // the next call being rejected as a binding mismatch.
+    async (args: Record<string, unknown>) => {
+      const claimed = args.agentId;
+      if (typeof claimed === "string") {
+        if (bound === undefined) bound = claimed;
+        else if (bound !== claimed) {
+          throw new Error(`identity bound to '${bound}'; rejected attempt to act as '${claimed}'`);
+        }
+      }
+      const result = await renameAgentTool(args as { agentId: string; newAgentId: string });
+      if (result && typeof result === "object" && (result as { ok?: unknown }).ok === true) {
+        const to = (result as { to?: unknown }).to;
+        if (typeof to === "string") bound = to;
+      }
+      return jsonResult(result);
+    },
   );
 
   server.tool(
     "attach_agent",
     "Start the tmux-push transport for an agent: spawns hooks/tmux-pusher.mjs as a background process so peer DMs (and optionally room messages) get typed into the agent's tmux pane in real time. tmuxTarget defaults to the MCP server's own $TMUX_PANE if this server is running inside tmux. allowlist restricts which peer agentIds can push. Updates list_agents to show transport=tmux-push.",
     attachAgentSchema,
-    bind("agentId", attachAgentTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", attachAgentTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "detach_agent",
     "Stop the tmux-push transport for an agent: kills the pusher process and clears the transport marker.",
     detachAgentSchema,
-    bind("agentId", detachAgentTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", detachAgentTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "report_transport",
     "Publish a transport marker for an agent (used by the remote tmux pusher, scripts/coord-pusher.mjs, to surface itself in list_agents). Set transport='tmux-push-remote' and optionally host/tmuxTarget. Liveness for remote markers is heartbeat-based — keep calling heartbeat or this marker gets GC'd after staleness.",
     reportTransportSchema,
-    bind("agentId", reportTransportTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", reportTransportTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "clear_transport",
     "Idempotent delete of an agent's transport marker. The wire-callable counterpart to detach_agent for remote pushers: it only removes the marker — there's no local process to kill.",
     clearTransportSchema,
-    bind("agentId", clearTransportTool as (a: Record<string, unknown>) => Promise<unknown>, boundAgent),
+    gate("agentId", clearTransportTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   return server;
@@ -277,9 +303,10 @@ async function main() {
     const boundAgent = process.env.AGENT_COORD_BOUND_AGENT;
     if (!boundAgent) {
       console.error(
-        "[agent-coord-mcp] WARN: bus identity unbound (stdio). The 'from'/'agentId' " +
-          "fields are NOT authenticated — set AGENT_COORD_BOUND_AGENT=<your-id> in the " +
-          "MCP launch env to enforce. Running in advisory mode.",
+        "[agent-coord-mcp] bus identity unbound (stdio) — falling back to TOFU: the " +
+          "first tool call's agentId/from claim becomes this session's bound identity " +
+          "and subsequent calls cannot switch. For stricter pre-binding, set " +
+          "AGENT_COORD_BOUND_AGENT=<your-id> in the MCP launch env.",
       );
     }
     const server = buildServer(boundAgent);
@@ -307,9 +334,10 @@ async function startHttp(port: number): Promise<void> {
   }
   if (!bound) {
     console.error(
-      "[agent-coord-mcp] WARN: bus identity unbound (HTTP). The shared bearer auths the " +
-        "channel but not the agent — 'from'/'agentId' fields are NOT authenticated. " +
-        "Create ~/agent-coord/tokens.json to enforce per-agent identity.",
+      "[agent-coord-mcp] bus identity unbound (HTTP) — shared bearer auths the channel; " +
+        "per-session identity falls back to TOFU (the first agentId/from claim becomes " +
+        "the session's bound id, can't switch mid-stream). Create ~/agent-coord/tokens.json " +
+        "to pre-bind sessions to identities at connect time.",
     );
   }
   const bindAddr = process.env.AGENT_COORD_BIND ?? "127.0.0.1";
@@ -399,7 +427,7 @@ async function startHttp(port: number): Promise<void> {
   });
 
   http.listen(port, bindAddr, () => {
-    const mode = bound ? `bound (${tokenMap?.size ?? 0} agents)` : "advisory";
+    const mode = bound ? `pre-bound (${tokenMap?.size ?? 0} agents)` : "TOFU";
     console.error(`[agent-coord-mcp] http listening on ${bindAddr}:${port} — identity ${mode}`);
     if (bindAddr !== "127.0.0.1" && bindAddr !== "localhost") {
       console.error(

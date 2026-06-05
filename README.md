@@ -341,15 +341,19 @@ coord-pusher --server http://host:8765/mcp \
 
 Or via env (`AGENT_COORD_SERVER` / `AGENT_COORD_TOKEN` / `AGENT_COORD_ID` / `AGENT_COORD_TMUX_TARGET`). Flags: `--no-room` (DMs only), `--allowlist a,b` (drop messages from other peers), `--debounce-ms 1000`, `--refresh-ms 30000` (how often to re-check channel membership). The pusher registers + publishes a `tmux-push-remote` transport marker (so `list_agents` shows it attached), heartbeats once a minute, and clears the marker on `SIGINT`/`SIGTERM`. Run it under your supervisor of choice (systemd / launchd / a tmux session of its own).
 
-### Identity binding (v0.7.0)
+### Identity binding (v0.7.0 / TOFU in v0.7.1)
 
-By default the bearer authenticates the *channel* — any session can post under any `from`/`agentId`. v0.7.0 adds **per-agent tokens that bind a session to an identity**, so a tool call that claims to be someone else is rejected:
+By default the bearer authenticates the *channel* — any session can post under any `from`/`agentId`. The bus closes the spoof gap in two layers:
+
+**v0.7.1 — Trust-on-first-use (zero config).** Each session is initially unbound. The first tool call that carries an `agentId`/`from` field becomes the session's bound identity; subsequent calls in that session cannot switch to a different name. Mid-session identity switching (the PR #45 spoof shape) is rejected:
 
 ```
 identity bound to 'alice'; rejected attempt to act as 'bob'
 ```
 
-To enable, drop a `~/agent-coord/tokens.json` (mode 600) mapping agentId → bearer:
+TOFU stops mid-session switching. It does *not* stop a fresh session claiming an unbound name — for that, layer one of the stronger configs below.
+
+**v0.7.0 — Pre-binding (when you want sessions identified at connect-time).** Drop a `~/agent-coord/tokens.json` (mode 600) mapping agentId → bearer:
 
 ```json
 { "alice": "tk_$(openssl rand -hex 24)",
@@ -360,7 +364,15 @@ Each remote client uses its agent's token in the `Authorization: Bearer …` hea
 
 **For local stdio agents**, set `AGENT_COORD_BOUND_AGENT=<your-id>` in the MCP launch env (the `env` block in `~/.claude.json`) to bind the spawned subprocess to that identity. Without it, stdio runs in advisory mode (current behavior — a startup warning is logged).
 
-Backward-compat: if `tokens.json` is absent, the legacy single shared `AGENT_COORD_TOKEN` still works as channel-only auth (a startup warning fires, identity is advisory). The server refuses to start in HTTP mode with no auth configured at all. Malformed `tokens.json` is fatal.
+Backward-compat: if `tokens.json` is absent, the legacy single shared `AGENT_COORD_TOKEN` still works as channel-only auth (the session falls back to TOFU). The server refuses to start in HTTP mode with no auth configured at all. Malformed `tokens.json` is fatal.
+
+**Posture summary:**
+
+| Config | Mid-session switch | Fresh-session impersonation |
+|---|---|---|
+| None (default after v0.7.1) | ❌ blocked (TOFU) | ⚠️ possible (no pre-binding) |
+| `AGENT_COORD_BOUND_AGENT` env | ❌ blocked (pre-bound) | ❌ blocked (env is process-local) |
+| `tokens.json` | ❌ blocked (pre-bound) | ❌ blocked (bearer ↔ id) |
 
 ### Auth posture, briefly
 

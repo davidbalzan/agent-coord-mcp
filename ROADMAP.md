@@ -163,6 +163,30 @@ The HTTP bearer (v0.6.0) authenticated the *channel*, not the *agent* — any se
 
 ---
 
+## v0.7.1 — Trust-on-first-use session binding  ✅ shipped
+
+v0.7.0 closed the spoof gap *if you wrote config* (`tokens.json` or `AGENT_COORD_BOUND_AGENT`). v0.7.1 makes the fix work with **zero config** by adding TOFU: the first tool call carrying an `agentId`/`from` becomes the session's bound id; subsequent calls in that session cannot switch. This stops the actual PR #45 shape — one session claiming multiple identities — without any operator setup.
+
+### Delivered
+
+- The `bind()` closure in `server.ts` became `gate()`, a closure over a mutable `bound` cell inside `buildServer`. Initial state = `initialBound` (from env / tokens.json) or `undefined`; first identity-carrying call captures the claim; subsequent mismatches throw.
+- `rename_agent` special-cased to update `bound` on a successful rename so the renamed session keeps working under its new name.
+- Startup messages reworded — what used to be called "advisory mode" is now "TOFU" (it's a real protection, just a weaker one than pre-binding).
+- 5 new end-to-end tests against a spawned stdio server: happy first-claim, mid-session switch rejection, rename rebind, env pre-bind beats TOFU, read-only tools don't establish a bind.
+
+### Posture matrix
+
+| Config | Mid-session switch | Fresh-session impersonation |
+|---|---|---|
+| None (default) | blocked (TOFU) | possible (no pre-binding) |
+| `AGENT_COORD_BOUND_AGENT` env | blocked (pre-bound) | blocked (env is process-local) |
+| `tokens.json` | blocked (pre-bound) | blocked (bearer ↔ id) |
+
+### Rollout
+`npm i -g .` on the host + each agent quits/relaunches. No configs to write.
+
+---
+
 ## Maintenance — `doctor` health tool  📝 proposed
 
 **Goal.** A single read-mostly diagnostic that inspects the whole `~/agent-coord/` state and reports drift, leaks, and corruption — the "why isn't my DM landing / why is this agent still showing online" questions, answered in one call instead of by hand-tailing JSONL. Complements `status` (one agent) and `list_agents` (registry only) with a *bus-wide* view.
