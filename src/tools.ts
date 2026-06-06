@@ -248,32 +248,29 @@ export async function listAgentsTool() {
 
 async function loadLiveTransports(): Promise<Map<string, TransportMarker>> {
   const out = new Map<string, TransportMarker>();
-  // For remote markers we can't pid-check the foreign process — instead we trust
-  // the registry's lastHeartbeat, which the remote pusher refreshes every minute.
   const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
   const now = Date.now();
   for (const fname of await listTransportFiles()) {
     const file = path.join(TRANSPORT_DIR, fname);
     const marker = await readJson<TransportMarker | null>(file, null);
-    if (!marker) {
-      await deleteFile(file);
-      continue;
-    }
-    const isRemote = marker.transport === "tmux-push-remote";
-    if (isRemote) {
-      const entry = reg[marker.agentId];
-      const fresh = !!entry && now - entry.lastHeartbeat < STALE_MS;
-      if (!fresh) {
-        await deleteFile(file);
-        continue;
-      }
-    } else if (!isPidAlive(marker.pid)) {
+    if (!marker || !isMarkerLive(marker, reg, now)) {
       await deleteFile(file);
       continue;
     }
     out.set(marker.agentId, marker);
   }
   return out;
+}
+
+// Liveness for a transport marker. Local markers carry a real pid we can probe;
+// remote markers (tmux-push-remote, pid 0 on a foreign host) can't be — so we
+// trust the registry heartbeat the remote pusher refreshes (within STALE_MS).
+function isMarkerLive(marker: TransportMarker, reg: AgentRegistry, now: number): boolean {
+  if (marker.transport === "tmux-push-remote") {
+    const entry = reg[marker.agentId];
+    return !!entry && now - entry.lastHeartbeat < STALE_MS;
+  }
+  return isPidAlive(marker.pid);
 }
 
 function isPidAlive(pid: number): boolean {
@@ -1202,13 +1199,13 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
   const rooms = await getRooms();
   const channels = Object.keys(rooms);
 
-  // 1. Orphan transport markers (dead pid).
+  // 1. Orphan transport markers (dead local pid, or stale remote heartbeat).
   {
     const dead: string[] = [];
     for (const fname of await listTransportFiles()) {
       const file = path.join(TRANSPORT_DIR, fname);
       const marker = await readJson<TransportMarker | null>(file, null);
-      if (!marker || !isPidAlive(marker.pid)) {
+      if (!marker || !isMarkerLive(marker, reg, now)) {
         dead.push(file);
         if (fix) {
           await deleteFile(file);
@@ -1219,7 +1216,7 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
     findings.push({
       check: "orphan-transport-markers",
       level: dead.length ? "warn" : "ok",
-      detail: dead.length ? `${dead.length} transport marker(s) with a dead pid` : "no stale transport markers",
+      detail: dead.length ? `${dead.length} stale transport marker(s) (dead pid or expired remote heartbeat)` : "no stale transport markers",
       fixable: true,
       items: dead.length ? dead.map((f) => path.basename(f)) : undefined,
     });
@@ -1375,7 +1372,7 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
     const live = new Set<string>();
     for (const fname of await listTransportFiles()) {
       const marker = await readJson<TransportMarker | null>(path.join(TRANSPORT_DIR, fname), null);
-      if (marker && isPidAlive(marker.pid)) live.add(marker.agentId);
+      if (marker && isMarkerLive(marker, reg, now)) live.add(marker.agentId);
     }
     const stale: string[] = [];
     for (const [id, a] of Object.entries(reg)) {

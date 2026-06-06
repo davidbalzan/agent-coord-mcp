@@ -65,3 +65,32 @@ test("doctor detects seeded corruption, fixes it, and a follow-up run is clean",
   const offenders = stateFindings(after2).filter((f) => f.level !== "ok");
   assert.equal(offenders.length, 0, JSON.stringify(offenders));
 });
+
+test("doctor judges remote markers by heartbeat, not pid", async () => {
+  // A remote pusher publishes a marker with pid 0 (foreign host) and keeps the
+  // registry heartbeat fresh. It must NOT be flagged as a dead-pid orphan.
+  await t.registerTool({ agentId: "remoteagent" }); // fresh heartbeat
+  await store.writeJson(store.transportFile("remoteagent"), {
+    agentId: "remoteagent",
+    transport: "tmux-push-remote",
+    pid: 0,
+    host: "otherbox",
+    since: Date.now(),
+  });
+  const fresh = await t.doctorTool({});
+  assert.equal(
+    fresh.findings.find((f) => f.check === "orphan-transport-markers").level,
+    "ok",
+    "fresh remote marker (pid 0) must not be flagged as a dead pid",
+  );
+
+  // Age the heartbeat past STALE_MS (5 min) → the remote marker is now stale.
+  await store.updateJson(store.AGENTS_FILE, {}, (cur) => {
+    cur.remoteagent.lastHeartbeat = Date.now() - 10 * 60 * 1000;
+    return cur;
+  });
+  const stale = await t.doctorTool({});
+  const f = stale.findings.find((x) => x.check === "orphan-transport-markers");
+  assert.equal(f.level, "warn");
+  assert.ok(f.items.some((i) => i.includes("remoteagent")));
+});
