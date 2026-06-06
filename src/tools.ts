@@ -74,6 +74,10 @@ type Message = {
   text: string;
   // System notices (join/part/topic/nick) — rendered distinctly by clients.
   system?: boolean;
+  // Control commands (`/clear`, `/compact`) addressed at the agent's CLI, not
+  // its operator. The tmux pushers inject these RAW (no banner/prefix) so the
+  // TUI runs them as real slash commands; every other consumer ignores them.
+  control?: boolean;
 };
 
 type StatusEntry = {
@@ -333,6 +337,123 @@ export async function sendMessageTool(args: {
   const target = roomFile(chan);
   await appendJsonl(target, msg);
   return { ok: true, id: msg.id, target, room: chan };
+}
+
+// ---------- send_command (context-management control commands) ----------
+
+// The only slash commands a lead may inject into a sub-agent's CLI. Locked on
+// purpose: these wipe/compact context (cheap, reversible-by-the-agent), nothing
+// that mutates the repo or the bus. Stored WITHOUT the leading slash; the wire
+// text is `/${cmd}`.
+export const CONTROL_COMMANDS = ["clear", "compact"] as const;
+
+// Transports whose pusher can actually TYPE a slash command into a live CLI.
+// A control command is meaningless to a plain MCP poller, so send_command is
+// gated to agents currently attached over one of these.
+const TMUX_TRANSPORTS = new Set(["tmux-push", "tmux-push-remote"]);
+
+// Normalize "clear" / "/clear" / "  /Clear " → "clear"; null if not allowlisted.
+function normalizeControlCommand(raw: string): string | null {
+  const c = raw.trim().replace(/^\/+/, "").toLowerCase();
+  return (CONTROL_COMMANDS as readonly string[]).includes(c) ? c : null;
+}
+
+// Live transports filtered to the tmux-push family (local + remote).
+async function liveTmuxTargets(): Promise<Map<string, TransportMarker>> {
+  const all = await loadLiveTransports();
+  const out = new Map<string, TransportMarker>();
+  for (const [id, m] of all) if (TMUX_TRANSPORTS.has(m.transport)) out.set(id, m);
+  return out;
+}
+
+export const sendCommandSchema = {
+  from: z.string().min(1),
+  to: z.string().optional(),
+  room: z.string().optional(),
+  command: z.string().min(1),
+};
+
+// Inject a context-management slash command into a sub-agent's live tmux
+// session. Writes a control-flagged message the pushers deliver RAW (no banner,
+// no `[DM …]` prefix) so the receiving CLI runs it as a real slash command.
+// Hard-gated to tmux: refuses unless the target(s) have a live tmux-push(-remote)
+// transport, so a command never rots unexecuted in an offline inbox.
+export async function sendCommandTool(args: {
+  from: string;
+  to?: string;
+  room?: string;
+  command: string;
+}) {
+  const cmd = normalizeControlCommand(args.command);
+  if (!cmd) {
+    return {
+      ok: false,
+      error: `unsupported command '${args.command}'. Allowed: ${CONTROL_COMMANDS.map((c) => "/" + c).join(", ")}`,
+    };
+  }
+  if (!args.to && !args.room) {
+    return { ok: false, error: "specify 'to' (a single agent) or 'room' (a channel's tmux-attached members)" };
+  }
+  if (args.to && args.room) {
+    return { ok: false, error: "specify only one of 'to' or 'room'" };
+  }
+
+  const text = `/${cmd}`;
+  const liveTmux = await liveTmuxTargets();
+
+  // DM: target must itself be tmux-attached.
+  if (args.to) {
+    const marker = liveTmux.get(args.to);
+    if (!marker) {
+      return {
+        ok: false,
+        error: `'${args.to}' has no live tmux-push transport — control commands can only be injected into a tmux session. Attach it (join/attach_agent) or target an attached agent.`,
+      };
+    }
+    const msg: Message = {
+      id: randomUUID(),
+      ts: Date.now(),
+      from: args.from,
+      to: args.to,
+      text,
+      control: true,
+    };
+    const target = inboxFile(args.to);
+    await appendJsonl(target, msg);
+    return { ok: true, id: msg.id, command: text, target, delivered: [args.to], transport: marker.transport };
+  }
+
+  // Room: broadcast to every tmux-attached member (never the sender itself).
+  const chan = normalizeRoom(args.room);
+  const rooms = await getRooms();
+  const members = rooms[chan]?.members ?? [];
+  const delivered = members.filter((m) => m !== args.from && liveTmux.has(m));
+  if (delivered.length === 0) {
+    return {
+      ok: false,
+      error: `no tmux-attached members in #${chan} to receive '${text}' (${members.length} member(s) total). Control commands only fire in a live tmux session.`,
+    };
+  }
+  const skipped = members.filter((m) => m !== args.from && !liveTmux.has(m));
+  const msg: Message = {
+    id: randomUUID(),
+    ts: Date.now(),
+    from: args.from,
+    room: chan,
+    text,
+    control: true,
+  };
+  const target = roomFile(chan);
+  await appendJsonl(target, msg);
+  return {
+    ok: true,
+    id: msg.id,
+    command: text,
+    target,
+    room: chan,
+    delivered,
+    skipped: skipped.length ? skipped : undefined,
+  };
 }
 
 // ---------- read_messages ----------

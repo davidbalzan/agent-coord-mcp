@@ -38,6 +38,8 @@ import {
   renameAgentTool,
   reportTransportSchema,
   reportTransportTool,
+  sendCommandSchema,
+  sendCommandTool,
   sendMessageSchema,
   sendMessageTool,
   setRoomMotdSchema,
@@ -149,6 +151,13 @@ function buildServer(initialBound?: string): McpServer {
     "Send a message. If 'to' is set, goes to that agent's inbox (DM); otherwise to a channel — pass 'room' (e.g. 'seo' or '#seo') to target a specific channel, or omit it for the default 'general' channel. The 'from' field is enforced against the session's bound identity when binding is configured.",
     sendMessageSchema,
     gate("from", sendMessageTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "send_command",
+    "Inject a context-management slash command (/clear or /compact) directly into a sub-agent's live tmux session — delivered RAW with no banner or prefix, so the agent's CLI runs it as a real slash command. Target one agent with 'to' or broadcast to a channel's tmux-attached members with 'room' (never the sender). Hard-gated to tmux: returns ok:false if the target has no live tmux-push(-remote) transport. Intended for a lead agent to clear/compact sub-agent context and save tokens. The command allowlist is locked to /clear and /compact; nothing else is accepted. 'from' is enforced against the session's bound identity.",
+    sendCommandSchema,
+    gate("from", sendCommandTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(

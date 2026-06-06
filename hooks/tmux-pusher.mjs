@@ -18,10 +18,14 @@
  *                             (default: accept all)
  *   AGENT_COORD_DEBOUNCE_MS   coalesce window for bursts (default 1000)
  *   AGENT_COORD_POLL_MS       fallback poll interval (default 1000)
+ *   AGENT_COORD_TARGET_GRACE  missed pane probes before self-exit (default 3)
  *
  * Safety:
  *   - drops messages where from === AGENT_COORD_ID (no self-echo)
- *   - drops messages whose text starts with "/" (avoid injected slash commands)
+ *   - drops messages whose text starts with "/" (avoid injected slash commands),
+ *     EXCEPT control-flagged messages carrying an allowlisted command
+ *     (/clear, /compact) sent via the MCP `send_command` tool — those are
+ *     injected RAW (no banner/prefix) so the CLI runs them as slash commands
  *   - if allowlist set, drops messages from peers not in it
  *   - serializes tmux sends so two batches never overlap
  *
@@ -69,6 +73,9 @@ const ALLOWLIST = (process.env.AGENT_COORD_ALLOWLIST || "")
   .filter(Boolean);
 const DEBOUNCE_MS = parseInt(process.env.AGENT_COORD_DEBOUNCE_MS || "1000", 10);
 const POLL_MS = parseInt(process.env.AGENT_COORD_POLL_MS || "1000", 10);
+// Consecutive missed pane probes before we conclude the target is gone and
+// self-exit. A small grace rides out transient tmux-server hiccups.
+const TARGET_GRACE = parseInt(process.env.AGENT_COORD_TARGET_GRACE || "3", 10);
 
 const SAFE_ID = AGENT_ID.replace(/[^a-zA-Z0-9._-]/g, "_");
 const INBOX_FILE = path.join(ROOT, "inbox", `${SAFE_ID}.jsonl`);
@@ -88,6 +95,7 @@ if (probe.status !== 0) {
 let pending = [];
 let debounceTimer = null;
 let sending = false;
+let targetMisses = 0;
 
 function readCursor() {
   if (!existsSync(CURSOR_FILE)) return {};
@@ -119,9 +127,25 @@ function readJsonl(file) {
     .filter(Boolean);
 }
 
+// Allowlisted control commands the bus may type into this CLI. Mirrors
+// CONTROL_COMMANDS in src/tools.ts; kept tiny + literal so a bugged/compromised
+// sender can't smuggle an arbitrary slash command past the guard below.
+const CONTROL_COMMANDS = new Set(["/clear", "/compact"]);
+
+function isControl(m) {
+  return (
+    !!m &&
+    m.control === true &&
+    typeof m.text === "string" &&
+    CONTROL_COMMANDS.has(m.text.trim())
+  );
+}
+
 function shouldInject(m) {
   if (!m || m.from === AGENT_ID) return false;
   if (ALLOWLIST.length > 0 && !ALLOWLIST.includes(m.from)) return false;
+  // Authorized control command — bypass the slash guard, injected raw later.
+  if (isControl(m)) return true;
   if (typeof m.text === "string" && m.text.trimStart().startsWith("/")) return false;
   return true;
 }
@@ -207,9 +231,30 @@ function formatBatch(batch) {
   return lines.join("\n");
 }
 
-function injectViaTmux(batch) {
+// Inject a batch, preserving order. Runs of ordinary peer messages go in as one
+// banner-wrapped paste; each control command (/clear, /compact) is injected on
+// its own as a RAW line so the TUI runs it as a slash command — a banner or
+// `[DM …]` prefix would turn it into plain chat text instead.
+async function injectViaTmux(batch) {
+  let run = [];
+  const flushRun = async () => {
+    if (run.length === 0) return;
+    await pasteAndSubmit(formatBatch(run));
+    run = [];
+  };
+  for (const m of batch) {
+    if (isControl(m)) {
+      await flushRun();
+      await pasteAndSubmit(m.text.trim());
+    } else {
+      run.push(m);
+    }
+  }
+  await flushRun();
+}
+
+function pasteAndSubmit(payload) {
   return new Promise((resolve, reject) => {
-    const payload = formatBatch(batch);
     const load = spawn("tmux", ["load-buffer", "-b", BUFFER_NAME, "-"]);
     load.on("error", reject);
     load.on("exit", (code) => {
@@ -231,7 +276,8 @@ function injectViaTmux(batch) {
       // add newline" rather than "submit." Wait briefly so paste settles,
       // then send Enter. Some apps additionally need a second Enter to
       // exit paste-mode + submit; sending two Enters with a small gap is
-      // safe (worst case: harmless empty submit ignored by the app).
+      // safe (worst case: harmless empty submit ignored by the app). For a
+      // slash command this also dismisses the autocomplete menu and submits.
       setTimeout(() => {
         const e1 = spawnSync("tmux", ["send-keys", "-t", TMUX_TARGET, "Enter"]);
         if (e1.status !== 0) {
@@ -295,10 +341,33 @@ if (INCLUDE_ROOM) {
   for (const chan of joinedRooms()) watchRoom(chan);
 }
 setInterval(checkOnce, POLL_MS);
+// Self-exit when our target pane disappears (agent closed its window or crashed
+// without unregister). Without this the daemon lingers with a live pid, so its
+// transport marker reads as "live" forever and list_agents keeps the ghost
+// agent online. cleanupMarker (also wired to process exit) drops the marker.
+setInterval(checkTargetAlive, POLL_MS);
 
 process.stderr.write(
   `[tmux-pusher] watching inbox for '${AGENT_ID}' -> tmux ${TMUX_TARGET} (room=${INCLUDE_ROOM ? "on" : "off"})\n`,
 );
+
+// Probe the target pane; after TARGET_GRACE consecutive misses, give up and
+// exit cleanly so the marker is removed and the agent stops looking attached.
+function checkTargetAlive() {
+  const p = spawnSync("tmux", ["display-message", "-p", "-t", TMUX_TARGET, "ok"]);
+  if (p.status === 0) {
+    targetMisses = 0;
+    return;
+  }
+  targetMisses++;
+  if (targetMisses >= TARGET_GRACE) {
+    process.stderr.write(
+      `[tmux-pusher] target '${TMUX_TARGET}' gone for ${targetMisses} probe(s) — cleaning up and exiting\n`,
+    );
+    cleanupMarker();
+    process.exit(0);
+  }
+}
 
 function die(msg) {
   process.stderr.write(`[tmux-pusher] ${msg}\n`);

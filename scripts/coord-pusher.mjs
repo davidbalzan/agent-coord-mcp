@@ -11,6 +11,7 @@
  *   coord-pusher --server <url> --token <t> --agent <id> --tmux <pane>
  *                [--no-room] [--allowlist a,b]
  *                [--debounce-ms 1000] [--refresh-ms 30000]
+ *                [--probe-ms 5000] [--target-grace 3]
  *
  * Environment fallbacks (used if a flag is omitted):
  *   AGENT_COORD_SERVER     server URL (e.g. http://host:8765/mcp)
@@ -20,13 +21,18 @@
  *
  * Safety mirrors tmux-pusher:
  *   - drops messages where from === agentId  (no self-echo)
- *   - drops messages whose text starts with "/" (avoid injected slash commands)
+ *   - drops messages whose text starts with "/" (avoid injected slash commands),
+ *     EXCEPT control-flagged /clear and /compact from the `send_command` tool,
+ *     which are injected RAW so the CLI runs them as slash commands
  *   - if allowlist set, drops messages from peers not in it
  *   - single-flight tmux send so two batches never overlap
  *
  * Liveness: heartbeats the server every 60s. The server treats the remote
  * transport marker as live while heartbeats stay fresh; without them, the
- * marker is garbage-collected (see loadLiveTransports in src/tools.ts).
+ * marker is garbage-collected (see loadLiveTransports in src/tools.ts). To
+ * avoid a ghost agent when the pane is closed/crashed, the pusher also probes
+ * its local tmux target and shuts down (clearing the marker) after a few
+ * consecutive misses — tunable via --probe-ms / --target-grace.
  */
 
 import { hostname } from "node:os";
@@ -109,9 +115,22 @@ let pending = [];
 let debounceTimer = null;
 let sending = false;
 
+// Allowlisted control commands (mirrors CONTROL_COMMANDS in src/tools.ts).
+const CONTROL_COMMANDS = new Set(["/clear", "/compact"]);
+
+function isControl(m) {
+  return (
+    !!m &&
+    m.control === true &&
+    typeof m.text === "string" &&
+    CONTROL_COMMANDS.has(m.text.trim())
+  );
+}
+
 function shouldInject(m) {
   if (!m || m.from === AGENT_ID) return false;
   if (ALLOWLIST.length > 0 && !ALLOWLIST.includes(m.from)) return false;
+  if (isControl(m)) return true; // authorized control command — injected raw later
   if (typeof m.text === "string" && m.text.trimStart().startsWith("/")) return false;
   return true;
 }
@@ -150,9 +169,29 @@ function formatBatch(batch) {
   return lines.join("\n");
 }
 
-function injectViaTmux(batch) {
+// Order-preserving inject: ordinary messages batch into one banner paste; each
+// control command (/clear, /compact) goes in on its own as a RAW line so the
+// CLI runs it as a slash command rather than echoing it as chat text.
+async function injectViaTmux(batch) {
+  let run = [];
+  const flushRun = async () => {
+    if (run.length === 0) return;
+    await pasteAndSubmit(formatBatch(run));
+    run = [];
+  };
+  for (const m of batch) {
+    if (isControl(m)) {
+      await flushRun();
+      await pasteAndSubmit(m.text.trim());
+    } else {
+      run.push(m);
+    }
+  }
+  await flushRun();
+}
+
+function pasteAndSubmit(payload) {
   return new Promise((resolve, reject) => {
-    const payload = formatBatch(batch);
     const load = spawn("tmux", ["load-buffer", "-b", BUFFER_NAME, "-"]);
     load.on("error", reject);
     load.on("exit", (code) => {
@@ -246,6 +285,25 @@ async function refreshSubscriptions() {
 await refreshSubscriptions();
 const refreshTimer = setInterval(() => { refreshSubscriptions().catch(() => {}); }, REFRESH_MS);
 
+// ---------- self-exit when the local tmux pane disappears ----------
+
+// If the agent closes its pane or crashes without a clean shutdown, this daemon
+// would otherwise keep heartbeating and the server's transport marker would
+// stay "live" — a ghost agent in list_agents. Probe the pane periodically and,
+// after a small grace (rides out transient tmux hiccups), shut down cleanly
+// (which calls clear_transport, removing the marker).
+const PROBE_MS = parseInt(argv["probe-ms"] ?? "5000", 10);
+const TARGET_GRACE = parseInt(argv["target-grace"] ?? "3", 10);
+let targetMisses = 0;
+const targetTimer = setInterval(() => {
+  const p = spawnSync("tmux", ["display-message", "-p", "-t", TMUX_TARGET, "ok"]);
+  if (p.status === 0) { targetMisses = 0; return; }
+  if (++targetMisses >= TARGET_GRACE) {
+    process.stderr.write(`[coord-pusher] target '${TMUX_TARGET}' gone for ${targetMisses} probe(s)\n`);
+    void shutdown("target-gone");
+  }
+}, PROBE_MS);
+
 // ---------- shutdown ----------
 
 let shuttingDown = false;
@@ -255,6 +313,7 @@ async function shutdown(signal) {
   process.stderr.write(`[coord-pusher] ${signal} → clearing transport marker + closing\n`);
   clearInterval(hbTimer);
   clearInterval(refreshTimer);
+  clearInterval(targetTimer);
   for (const s of loops.values()) s.cancelled = true;
   try { await call("clear_transport", { agentId: AGENT_ID }); } catch {}
   try { await client.close(); } catch {}

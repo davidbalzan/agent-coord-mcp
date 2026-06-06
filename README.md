@@ -12,8 +12,6 @@ It's an IRC-style backplane for human-and-agent collaboration where everyone —
 >
 > **Auth.** Local stdio inherits filesystem permissions (anything that can read your home directory can read the messages). HTTP mode requires a bearer token and binds to `127.0.0.1` by default; expose more broadly only behind TLS (Tailscale / reverse proxy). v0.7.0 adds per-agent token binding via `~/agent-coord/tokens.json` so the bus authenticates *who* the caller is (the `from`/`agentId` fields), not just *that* they're allowed — see [Identity binding](#identity-binding-v070).
 
-> **Where this is going.** See [ROADMAP.md](./ROADMAP.md). Phase 6 (Remote MCP) shipped in v0.6.0. The Phase 5 IRC layer is parked — IRC is still a good fit for the "human on weechat" audience, but for agents Phase 6's Streamable HTTP is the right answer.
-
 ## Install
 
 ```sh
@@ -66,6 +64,7 @@ If you're building an agent with the official MCP SDKs (`@modelcontextprotocol/s
 | `heartbeat({agentId})` | Manual heartbeat. Usually unnecessary — agents with a live transport get heartbeats auto-bumped on every `list_agents`. |
 | `list_agents()` | See all known agents, who looks online, and which `transport` (if any) they have attached. Validates transport pid liveness on every call. |
 | `send_message({from, to?, room?, text})` | If `to` set → that agent's inbox (DM). Else → a channel: `room` names it (`"seo"` / `"#seo"`), omit for the default `general` channel. |
+| `send_command({from, to?, command})` / `send_command({from, room, command})` | Inject a context-management slash command (`/clear` or `/compact`) **directly into a sub-agent's CLI** — delivered raw (no banner/prefix) so the receiving TUI runs it as a real slash command. `to` targets one agent; `room` broadcasts to a channel's tmux-attached members (never the sender). **Gated to tmux:** returns `ok:false` unless the target has a live `tmux-push`(`-remote`) transport. Command allowlist is locked to `/clear` + `/compact`. Lets a lead clear/compact sub-agent context to save tokens. See [clearing sub-agent context](#clearing-sub-agent-context-send_command). |
 | `read_messages({agentId, source, room?, limit?, peek?, sinceTs?})` | Read new messages. `source` is `inbox`/`room`/`status`; for `room`, `room` picks the channel (default `general`). Advances the per-channel cursor unless `peek:true`. |
 | `post_status({agentId, status, detail?})` | Append to the shared status stream (separate from chat). |
 | `wait_for_message({agentId, source, room?, timeoutMs?})` | Block (max 60s) until a new entry appears, then return it. For `room`, `room` picks the channel. |
@@ -283,16 +282,34 @@ tmux attach -t coord-frontend
 scripts/stop-agent.sh --id frontend
 ```
 
-Either way, `list_agents` will show the agent with `transport: "tmux-push"` so peers know it's responsive in real time vs. turn-bound. Stale markers (pusher died) are detected via pid liveness and pruned automatically on the next `list_agents`.
+Either way, `list_agents` will show the agent with `transport: "tmux-push"` so peers know it's responsive in real time vs. turn-bound. Stale markers (pusher died) are detected via pid liveness and pruned automatically on the next `list_agents`. And if the agent's pane closes or it crashes without `unregister`, the pusher notices its target is gone (a few consecutive probe misses), removes its own marker, and exits — so the agent stops looking attached instead of lingering as a ghost.
 
-Under the hood: [`hooks/tmux-pusher.mjs`](./hooks/tmux-pusher.mjs) is the daemon. It watches `~/agent-coord/inbox/<id>.jsonl` (and, when room delivery is on, every channel the agent has joined), debounces bursts (1s default), drops self-posts and `/`-prefixed text, optionally enforces the peer allowlist, then pastes batches via `tmux load-buffer` → `paste-buffer -d` → `send-keys Enter`. Single-flight so two batches never overlap.
+Under the hood: [`hooks/tmux-pusher.mjs`](./hooks/tmux-pusher.mjs) is the daemon. It watches `~/agent-coord/inbox/<id>.jsonl` (and, when room delivery is on, every channel the agent has joined), debounces bursts (1s default), drops self-posts and `/`-prefixed text (except allowlisted control commands — see [below](#clearing-sub-agent-context-send_command)), optionally enforces the peer allowlist, then pastes batches via `tmux load-buffer` → `paste-buffer -d` → `send-keys Enter`. Single-flight so two batches never overlap.
 
 **Caveats — read these.**
 
 - **Don't run the `peek-coord.mjs` hooks for the same agent** while the pusher is active. Both share the cursor file and will race / double-deliver.
 - The pusher pastes into the pane unconditionally. If you're typing in the same pane it will corrupt your buffer; if the agent is showing a `[y/n]` permission prompt, the message becomes the answer. Run the receiving agent in a pane you don't normally edit in.
-- Untrusted peer messages become real prompts with full agent privileges. Use `--allowlist` to restrict who can talk to a given agent; the pusher also refuses anything starting with `/` to block injected slash commands.
+- Untrusted peer messages become real prompts with full agent privileges. Use `--allowlist` to restrict who can talk to a given agent; the pusher also refuses anything starting with `/` to block injected slash commands — the sole exception being the locked `/clear` + `/compact` control commands sent via [`send_command`](#clearing-sub-agent-context-send_command).
 - Bursts get coalesced (1s default) into a single paste so 5 rapid DMs become one prompt rather than five.
+
+### Clearing sub-agent context (`send_command`)
+
+A lead agent can wipe or compact a sub-agent's context to save tokens by injecting a slash command straight into its CLI:
+
+```js
+send_command({ from: "lead", to: "frontend", command: "/clear" })   // one agent
+send_command({ from: "lead", room: "#crew", command: "/compact" })  // every tmux-attached member of #crew
+```
+
+Unlike `send_message`, a control command is delivered **raw** — no `[agent-coord]` banner, no `[DM …]` prefix — so the receiving TUI runs it as a real slash command instead of echoing it as chat. This is the one exception to the pusher's "drop everything starting with `/`" rule, and it's deliberately narrow:
+
+- **Locked allowlist.** Only `/clear` and `/compact` are accepted; anything else returns `ok:false`. These wipe/compact context and nothing more — no command that touches the repo or the bus can ride this path.
+- **Marked, not inferred.** A normal `send_message({text:"/clear"})` is still dropped. The command only flows because `send_command` tags the message `control:true`; a peer can't smuggle one through the chat path.
+- **Gated to tmux.** A slash command means nothing to a turn-bound MCP poller, so `send_command` refuses unless the target has a live `tmux-push`/`tmux-push-remote` transport. The DM form errors if the recipient isn't attached; the room form delivers to attached members and reports any `skipped`.
+- **Never self-clears.** The sender is excluded from a room broadcast, and the pusher's self-post filter means a lead that's also a member won't clear itself.
+
+Works identically over the remote transport (`coord-pusher`).
 
 ## Remote agents (Streamable HTTP)
 

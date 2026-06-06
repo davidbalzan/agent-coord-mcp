@@ -80,6 +80,61 @@ test("room reads filter out the reader's own posts", async () => {
   assert.ok(texts.includes("theirs"));
 });
 
+test("send_command rejects a command outside the locked allowlist", async () => {
+  const r = await t.sendCommandTool({ from: "lead", to: "sub", command: "/rm" });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /unsupported|Allowed/);
+});
+
+test("send_command requires exactly one of 'to' or 'room'", async () => {
+  const none = await t.sendCommandTool({ from: "lead", command: "clear" });
+  assert.equal(none.ok, false);
+  const both = await t.sendCommandTool({ from: "lead", to: "x", room: "#y", command: "clear" });
+  assert.equal(both.ok, false);
+});
+
+test("send_command refuses a target with no live tmux transport (gate to tmux)", async () => {
+  await t.registerTool({ agentId: "subnotmux" });
+  const r = await t.sendCommandTool({ from: "lead", to: "subnotmux", command: "clear" });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /tmux/i);
+});
+
+test("send_command delivers a raw control message to a tmux-attached agent (DM)", async () => {
+  await t.registerTool({ agentId: "subtmux" });
+  // A remote marker is judged live by registry heartbeat (just refreshed by
+  // register), so no real pusher process is needed for this unit test.
+  await t.reportTransportTool({ agentId: "subtmux", transport: "tmux-push-remote", host: "test" });
+
+  const r = await t.sendCommandTool({ from: "lead", to: "subtmux", command: "/compact" });
+  assert.equal(r.ok, true);
+  assert.equal(r.command, "/compact");
+  assert.deepEqual(r.delivered, ["subtmux"]);
+
+  const read = await t.readMessagesTool({ agentId: "subtmux", source: "inbox" });
+  const m = read.messages.find((x) => x.text === "/compact");
+  assert.ok(m, "control message stored in the inbox");
+  assert.equal(m.control, true);
+});
+
+test("send_command broadcasts to a channel's tmux-attached members only", async () => {
+  await t.registerTool({ agentId: "leadX" });
+  await t.registerTool({ agentId: "attached" });
+  await t.registerTool({ agentId: "detached" });
+  await t.reportTransportTool({ agentId: "attached", transport: "tmux-push-remote", host: "test" });
+  await t.joinRoomTool({ agentId: "leadX", room: "#crew" });
+  await t.joinRoomTool({ agentId: "attached", room: "#crew" });
+  await t.joinRoomTool({ agentId: "detached", room: "#crew" });
+
+  const r = await t.sendCommandTool({ from: "leadX", room: "#crew", command: "clear" });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.delivered, ["attached"]);
+  assert.deepEqual(r.skipped, ["detached"]);
+
+  const read = await t.readMessagesTool({ agentId: "attached", source: "room", room: "#crew" });
+  assert.ok(read.messages.some((m) => m.text === "/clear" && m.control === true));
+});
+
 test("prune drops old messages and shifts the reader's cursor to stay aligned", async () => {
   const old = Date.now() - 30 * 24 * 60 * 60 * 1000;
   await store.appendJsonl(store.ROOM_FILE, { id: "old1", ts: old, from: "x", room: "general", text: "ancient" });

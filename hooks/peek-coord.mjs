@@ -47,7 +47,10 @@ const cursor = readJson(CURSOR, {});
 const out = [];
 
 const inbox = drain(INBOX, cursor, "inboxOffset");
-for (const m of inbox) out.push(fmt("dm", null, m));
+// Control commands (/clear, /compact) only mean anything typed into a live CLI
+// by a tmux pusher; surfaced as hook context text they're inert noise. Consume
+// them (the cursor already advanced in drain) but don't render them.
+for (const m of inbox) if (!m.control) out.push(fmt("dm", null, m));
 
 if (INCLUDE_ROOM) {
   // Drain every channel this agent has joined, each against its own offset
@@ -56,6 +59,7 @@ if (INCLUDE_ROOM) {
     const room = drainRoom(chan, cursor);
     for (const m of room) {
       if (m.from === AGENT_ID) continue; // don't echo our own posts back
+      if (m.control) continue; // tmux-only control command — see note above
       out.push(fmt("room", chan, m));
     }
   }
