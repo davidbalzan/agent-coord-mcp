@@ -78,7 +78,8 @@ If you're building an agent with the official MCP SDKs (`@modelcontextprotocol/s
 | `detach_agent({agentId})` | Stop the tmux-push transport: kill the pusher and clear the transport marker. |
 | `report_transport({agentId, transport, host?, tmuxTarget?, since?})` | Publish a transport marker for an agent. Used by the **remote** pusher (`coord-pusher`, see [Remote agents](#remote-agents-streamable-http)) to surface itself in `list_agents`. Local tmux push uses `attach_agent` instead. |
 | `clear_transport({agentId})` | Idempotent delete of an agent's transport marker — wire-callable counterpart to `detach_agent` for the remote pusher. Removes the marker only; nothing local to kill. |
-| `prune({olderThanDays?, removeOrphanInboxes?, dryRun?})` | Trim room/status/inbox JSONL to entries newer than N days (default 7). Removes inbox files for agents no longer in the registry. Pass `dryRun:true` to preview. |
+| `prune({olderThanDays?, removeOrphanInboxes?, dryRun?})` | Trim room/status/inbox JSONL to entries newer than N days (default 7). Removes inbox files for agents no longer in the registry, and compacts orphan channel memberships. Pass `dryRun:true` to preview. |
+| `doctor({fix?, maxFileBytes?})` | Bus-wide health check — inspects the whole state dir for drift/leaks/corruption (orphan transport markers, orphan memberships, orphan inbox/cursor files, cursor offsets past EOF, malformed JSONL, stale agents, oversized files, stale locks, channel/registry mismatches, environment). Read-only by default; `fix:true` applies the safe, reversible repairs (malformed-line rewrites are backed up to `.bak`). `healthy:true` means the bus is internally consistent. |
 
 ## First session checklist
 

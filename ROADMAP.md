@@ -187,9 +187,11 @@ v0.7.0 closed the spoof gap *if you wrote config* (`tokens.json` or `AGENT_COORD
 
 ---
 
-## Maintenance — `doctor` health tool  📝 proposed
+## Maintenance — `doctor` health tool  ✅ shipped
 
 **Goal.** A single read-mostly diagnostic that inspects the whole `~/agent-coord/` state and reports drift, leaks, and corruption — the "why isn't my DM landing / why is this agent still showing online" questions, answered in one call instead of by hand-tailing JSONL. Complements `status` (one agent) and `list_agents` (registry only) with a *bus-wide* view.
+
+Shipped as the `doctor({fix?, maxFileBytes?})` MCP tool: all 10 checks below, read-only by default, with opt-in `fix:true` for the reversible repairs (malformed-line rewrites backed up to `.bak`). A clean run returns `healthy:true` and is wired into the test suite as an end-to-end consistency assertion. Still open: the `coord-chat /doctor` command surface.
 
 **Why now.** The state is spread across `agents.json`, `rooms.json`, `transports/`, `inbox/`, `cursors/`, and the channel JSONL files, mutated by the MCP server, the hooks, the pushers, and `coord-chat` — all without a single owner. Several known drift modes already exist (orphan memberships from 24h eviction, stale transport markers, cursor offsets past EOF, malformed JSONL lines). `doctor` makes them visible and, opt-in, fixable.
 

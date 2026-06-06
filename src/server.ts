@@ -12,6 +12,8 @@ import {
   clearTransportTool,
   detachAgentSchema,
   detachAgentTool,
+  doctorSchema,
+  doctorTool,
   heartbeatSchema,
   heartbeatTool,
   joinRoomSchema,
@@ -262,6 +264,13 @@ function buildServer(initialBound?: string): McpServer {
     "Idempotent delete of an agent's transport marker. The wire-callable counterpart to detach_agent for remote pushers: it only removes the marker — there's no local process to kill.",
     clearTransportSchema,
     gate("agentId", clearTransportTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "doctor",
+    "Bus-wide health check: inspects the whole state dir and reports drift, leaks, and corruption (orphan transport markers / memberships / inboxes, cursor offsets past EOF, malformed JSONL, stale agents, oversized files, stale locks, channel/registry mismatches, environment). Read-only by default; pass fix=true to apply the safe, reversible repairs (malformed-line rewrites are backed up to .bak first). A clean report (healthy=true) means the bus is internally consistent.",
+    doctorSchema,
+    gate(null, doctorTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   return server;

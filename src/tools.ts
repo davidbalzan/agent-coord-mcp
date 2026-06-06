@@ -10,6 +10,9 @@ import {
   CURSOR_DIR,
   DEFAULT_ROOM,
   INBOX_DIR,
+  ROOT,
+  ROOM_FILE,
+  ROOMS_DIR,
   ROOMS_FILE,
   STATUS_FILE,
   addMember,
@@ -1119,6 +1122,379 @@ export const clearTransportSchema = {
 export async function clearTransportTool(args: { agentId: string }) {
   const removed = await deleteFile(transportFile(args.agentId));
   return { ok: true, removed };
+}
+
+// ---------- doctor (bus-wide health check) ----------
+
+type DoctorLevel = "ok" | "warn" | "error";
+type DoctorFinding = {
+  check: string;
+  level: DoctorLevel;
+  detail: string;
+  fixable: boolean;
+  items?: string[];
+};
+
+// Count non-empty lines vs successfully-parsed entries in a JSONL file.
+// Offsets index the PARSED entries (see readJsonl), so `parsed` is the figure
+// cursor math is compared against; `malformed` is the desync risk.
+async function scanJsonl(file: string): Promise<{ lines: number; parsed: number; malformed: number }> {
+  if (!existsSync(file)) return { lines: 0, parsed: 0, malformed: 0 };
+  const raw = await fsp.readFile(file, "utf8");
+  let lines = 0;
+  let parsed = 0;
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    lines++;
+    try {
+      JSON.parse(line);
+      parsed++;
+    } catch {
+      // malformed
+    }
+  }
+  return { lines, parsed, malformed: lines - parsed };
+}
+
+// Find leftover proper-lockfile lock dirs (`<file>.lock`) across the state
+// dirs. Anything older than the threshold is almost certainly orphaned by a
+// crashed writer (withLock's stale window is 5s).
+async function scanStaleLocks(olderThanMs: number, now: number): Promise<{ path: string; ageMs: number }[]> {
+  const out: { path: string; ageMs: number }[] = [];
+  const dirs = [ROOT, INBOX_DIR, CURSOR_DIR, ROOMS_DIR, TRANSPORT_DIR];
+  for (const dir of dirs) {
+    if (!existsSync(dir)) continue;
+    let names: string[];
+    try {
+      names = await fsp.readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (!name.endsWith(".lock")) continue;
+      const p = path.join(dir, name);
+      try {
+        const st = await fsp.stat(p);
+        const ageMs = now - st.mtimeMs;
+        if (ageMs > olderThanMs) out.push({ path: p, ageMs });
+      } catch {
+        // vanished mid-scan
+      }
+    }
+  }
+  return out;
+}
+
+export const doctorSchema = {
+  fix: z.boolean().optional(),
+  maxFileBytes: z.number().int().positive().optional(),
+};
+
+export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number }) {
+  const fix = args.fix ?? false;
+  const maxBytes = args.maxFileBytes ?? 5 * 1024 * 1024;
+  const now = Date.now();
+  const findings: DoctorFinding[] = [];
+  const fixed: string[] = [];
+
+  const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
+  const known = new Set(Object.keys(reg));
+  const rooms = await getRooms();
+  const channels = Object.keys(rooms);
+
+  // 1. Orphan transport markers (dead pid).
+  {
+    const dead: string[] = [];
+    for (const fname of await listTransportFiles()) {
+      const file = path.join(TRANSPORT_DIR, fname);
+      const marker = await readJson<TransportMarker | null>(file, null);
+      if (!marker || !isPidAlive(marker.pid)) {
+        dead.push(file);
+        if (fix) {
+          await deleteFile(file);
+          fixed.push(`deleted stale transport marker ${fname}`);
+        }
+      }
+    }
+    findings.push({
+      check: "orphan-transport-markers",
+      level: dead.length ? "warn" : "ok",
+      detail: dead.length ? `${dead.length} transport marker(s) with a dead pid` : "no stale transport markers",
+      fixable: true,
+      items: dead.length ? dead.map((f) => path.basename(f)) : undefined,
+    });
+  }
+
+  // 2. Orphan room memberships (member not in the registry).
+  {
+    const orphans = new Set<string>();
+    for (const e of Object.values(rooms)) {
+      for (const m of e.members ?? []) if (!known.has(m)) orphans.add(m);
+    }
+    if (fix && orphans.size) {
+      await updateJson<RoomRegistry>(ROOMS_FILE, {}, (cur) => {
+        for (const e of Object.values(cur)) {
+          if (e.members?.length) e.members = e.members.filter((m) => known.has(m));
+        }
+        return cur;
+      });
+      fixed.push(`dropped ${orphans.size} orphan membership(s): ${[...orphans].join(", ")}`);
+    }
+    findings.push({
+      check: "orphan-room-memberships",
+      level: orphans.size ? "warn" : "ok",
+      detail: orphans.size ? `${orphans.size} channel member(s) not in the registry` : "all channel members are registered",
+      fixable: true,
+      items: orphans.size ? [...orphans] : undefined,
+    });
+  }
+
+  // 3. Orphan inbox / cursor files (owner not registered).
+  {
+    const orphanInbox: string[] = [];
+    for (const fname of await listInboxFiles()) {
+      const id = fname.replace(/\.jsonl$/, "");
+      if (!known.has(id)) {
+        orphanInbox.push(id);
+        if (fix) {
+          await deleteFile(path.join(INBOX_DIR, fname));
+          fixed.push(`deleted orphan inbox ${fname}`);
+        }
+      }
+    }
+    const orphanCursor: string[] = [];
+    for (const fname of await listCursorFiles()) {
+      const id = fname.replace(/\.json$/, "");
+      if (!known.has(id)) {
+        orphanCursor.push(id);
+        if (fix) {
+          await deleteFile(path.join(CURSOR_DIR, fname));
+          fixed.push(`deleted orphan cursor ${fname}`);
+        }
+      }
+    }
+    const total = orphanInbox.length + orphanCursor.length;
+    findings.push({
+      check: "orphan-inboxes-cursors",
+      level: total ? "warn" : "ok",
+      detail: total
+        ? `${orphanInbox.length} inbox + ${orphanCursor.length} cursor file(s) for unregistered ids`
+        : "no orphan inbox/cursor files",
+      fixable: true,
+      items: total ? [...new Set([...orphanInbox, ...orphanCursor])] : undefined,
+    });
+  }
+
+  // Precompute parsed line counts for cursor + malformed checks.
+  const counts = new Map<string, { lines: number; parsed: number; malformed: number }>();
+  const countFor = async (file: string) => {
+    if (!counts.has(file)) counts.set(file, await scanJsonl(file));
+    return counts.get(file)!;
+  };
+
+  // 4. Cursor offsets past end-of-file (would return [] forever).
+  {
+    const broken: string[] = [];
+    for (const fname of await listCursorFiles()) {
+      const id = fname.replace(/\.json$/, "");
+      const cursorPath = path.join(CURSOR_DIR, fname);
+      const cursor = await readJson<Cursor>(cursorPath, {});
+      const overflow: string[] = [];
+      const inboxMax = (await countFor(inboxFile(id))).parsed;
+      if ((cursor.inboxOffset ?? 0) > inboxMax) overflow.push(`inboxOffset ${cursor.inboxOffset}>${inboxMax}`);
+      const roomMax = (await countFor(ROOM_FILE)).parsed;
+      if ((cursor.roomOffset ?? 0) > roomMax) overflow.push(`roomOffset ${cursor.roomOffset}>${roomMax}`);
+      const statusMax = (await countFor(STATUS_FILE)).parsed;
+      if ((cursor.statusOffset ?? 0) > statusMax) overflow.push(`statusOffset ${cursor.statusOffset}>${statusMax}`);
+      for (const [chan, off] of Object.entries(cursor.roomOffsets ?? {})) {
+        const max = (await countFor(roomFile(chan))).parsed;
+        if (off > max) overflow.push(`roomOffsets[${chan}] ${off}>${max}`);
+      }
+      if (overflow.length) {
+        broken.push(`${id}: ${overflow.join(", ")}`);
+        if (fix) {
+          await updateJson<Cursor>(cursorPath, {}, (c) => {
+            if ((c.inboxOffset ?? 0) > inboxMax) c.inboxOffset = inboxMax;
+            if ((c.roomOffset ?? 0) > roomMax) c.roomOffset = roomMax;
+            if ((c.statusOffset ?? 0) > statusMax) c.statusOffset = statusMax;
+            if (c.roomOffsets) {
+              for (const chan of Object.keys(c.roomOffsets)) {
+                const max = counts.get(roomFile(chan))?.parsed ?? 0;
+                if (c.roomOffsets[chan] > max) c.roomOffsets[chan] = max;
+              }
+            }
+            return c;
+          });
+          fixed.push(`clamped cursor offsets for ${id}`);
+        }
+      }
+    }
+    findings.push({
+      check: "cursor-past-eof",
+      level: broken.length ? "error" : "ok",
+      detail: broken.length ? `${broken.length} cursor(s) with an offset past EOF — delivery stalled` : "all cursor offsets are within bounds",
+      fixable: true,
+      items: broken.length ? broken : undefined,
+    });
+  }
+
+  // 5. Malformed JSONL lines (silently desync offset math between server + hooks).
+  {
+    const jsonlFiles = [
+      ROOM_FILE,
+      STATUS_FILE,
+      ...channels.filter((c) => c !== DEFAULT_ROOM).map((c) => roomFile(c)),
+      ...(await listInboxFiles()).map((f) => path.join(INBOX_DIR, f)),
+    ];
+    const bad: string[] = [];
+    for (const file of jsonlFiles) {
+      const c = await countFor(file);
+      if (c.malformed > 0) {
+        bad.push(`${path.basename(file)} (${c.malformed})`);
+        if (fix) {
+          await fsp.copyFile(file, file + ".bak");
+          await rewriteJsonl(file, () => true); // drops unparseable lines
+          fixed.push(`rewrote ${path.basename(file)} dropping ${c.malformed} malformed line(s) (backup: ${path.basename(file)}.bak)`);
+        }
+      }
+    }
+    findings.push({
+      check: "malformed-jsonl",
+      level: bad.length ? "warn" : "ok",
+      detail: bad.length ? `${bad.length} file(s) contain unparseable lines` : "no malformed JSONL lines",
+      fixable: true,
+      items: bad.length ? bad : undefined,
+    });
+  }
+
+  // 6. Stale agents (registered, no live transport, heartbeat past EVICT_MS). Report only.
+  {
+    // Compute liveness WITHOUT deleting dead markers — loadLiveTransports
+    // prunes as a side effect, which would make this read-only check mutate
+    // state (and pre-empt the orphan-marker fix in check 1).
+    const live = new Set<string>();
+    for (const fname of await listTransportFiles()) {
+      const marker = await readJson<TransportMarker | null>(path.join(TRANSPORT_DIR, fname), null);
+      if (marker && isPidAlive(marker.pid)) live.add(marker.agentId);
+    }
+    const stale: string[] = [];
+    for (const [id, a] of Object.entries(reg)) {
+      if (live.has(id)) continue;
+      if (now - a.lastHeartbeat > EVICT_MS) stale.push(`${id} (${Math.floor((now - a.lastHeartbeat) / 3600000)}h)`);
+    }
+    findings.push({
+      check: "stale-agents",
+      level: stale.length ? "warn" : "ok",
+      detail: stale.length ? `${stale.length} agent(s) past the eviction window — next list_agents will drop them` : "no stale agents",
+      fixable: false,
+      items: stale.length ? stale : undefined,
+    });
+  }
+
+  // 7. Oversized JSONL files. Report only (suggest prune).
+  {
+    const big: string[] = [];
+    const candidates = [
+      ROOM_FILE,
+      STATUS_FILE,
+      ...channels.filter((c) => c !== DEFAULT_ROOM).map((c) => roomFile(c)),
+      ...(await listInboxFiles()).map((f) => path.join(INBOX_DIR, f)),
+    ];
+    for (const file of candidates) {
+      const sz = await fileSize(file);
+      if (sz > maxBytes) big.push(`${path.basename(file)} (${(sz / 1024 / 1024).toFixed(1)}MB)`);
+    }
+    findings.push({
+      check: "oversized-files",
+      level: big.length ? "warn" : "ok",
+      detail: big.length ? `${big.length} file(s) over ${(maxBytes / 1024 / 1024).toFixed(0)}MB — consider prune` : "no oversized files",
+      fixable: false,
+      items: big.length ? big : undefined,
+    });
+  }
+
+  // 8. Stale lock dirs from crashed writers.
+  {
+    const locks = await scanStaleLocks(60_000, now);
+    for (const l of locks) {
+      if (fix) {
+        try {
+          await fsp.rm(l.path, { recursive: true, force: true });
+          fixed.push(`removed stale lock ${path.basename(l.path)}`);
+        } catch {
+          // ignore
+        }
+      }
+    }
+    findings.push({
+      check: "stale-locks",
+      level: locks.length ? "warn" : "ok",
+      detail: locks.length ? `${locks.length} lock dir(s) older than 60s — likely from a crashed writer` : "no stale locks",
+      fixable: true,
+      items: locks.length ? locks.map((l) => `${path.basename(l.path)} (${Math.floor(l.ageMs / 1000)}s)`) : undefined,
+    });
+  }
+
+  // 9. Channel/registry consistency: rooms/<chan>.jsonl files without a registry entry.
+  {
+    const orphanFiles: string[] = [];
+    if (existsSync(ROOMS_DIR)) {
+      let names: string[] = [];
+      try {
+        names = await fsp.readdir(ROOMS_DIR);
+      } catch {
+        // ignore
+      }
+      for (const name of names) {
+        if (!name.endsWith(".jsonl")) continue;
+        const chan = name.replace(/\.jsonl$/, "");
+        if (!rooms[chan]) {
+          orphanFiles.push(name);
+          if (fix) {
+            await ensureRoom(chan, "doctor");
+            fixed.push(`registered channel '${chan}' (had a JSONL file but no registry entry)`);
+          }
+        }
+      }
+    }
+    findings.push({
+      check: "channel-registry-consistency",
+      level: orphanFiles.length ? "warn" : "ok",
+      detail: orphanFiles.length ? `${orphanFiles.length} channel file(s) with no registry entry` : "channel files and registry agree",
+      fixable: true,
+      items: orphanFiles.length ? orphanFiles : undefined,
+    });
+  }
+
+  // 10. Environment sanity. Report only.
+  {
+    const tmuxProbe = spawnSync("tmux", ["-V"]);
+    const tmuxOk = tmuxProbe.status === 0;
+    findings.push({
+      check: "environment",
+      level: tmuxOk ? "ok" : "warn",
+      detail: tmuxOk
+        ? `root=${ROOT}; node=${process.execPath}; tmux=${(tmuxProbe.stdout ?? "").toString().trim() || "present"}`
+        : `root=${ROOT}; node=${process.execPath}; tmux NOT on PATH — the tmux-push transport will not work`,
+      fixable: false,
+      items: [`root=${ROOT}`, `execPath=${process.execPath}`, `inTmux=${!!process.env.TMUX_PANE}`],
+    });
+  }
+
+  const summary = {
+    ok: findings.filter((f) => f.level === "ok").length,
+    warn: findings.filter((f) => f.level === "warn").length,
+    error: findings.filter((f) => f.level === "error").length,
+  };
+  return {
+    ok: true,
+    healthy: summary.warn === 0 && summary.error === 0,
+    fixApplied: fix,
+    root: ROOT,
+    findings,
+    fixed: fix ? fixed : undefined,
+    summary,
+  };
 }
 
 // ---------- helpers ----------
