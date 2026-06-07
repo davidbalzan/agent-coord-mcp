@@ -94,12 +94,22 @@ async function call(name, args) {
 // Register (idempotent), then publish the transport marker so list_agents
 // shows us attached. Marker liveness is heartbeat-based server-side.
 await call("register", { agentId: AGENT_ID });
+// Stamp the mtime of THIS process's loaded script so doctor() can spot a
+// stale remote pusher after a remote-side upgrade (see v0.8.2 stale-pusher
+// check — same hazard as the local tmux-pusher).
+let scriptMtime;
+try {
+  const { statSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  scriptMtime = statSync(fileURLToPath(import.meta.url)).mtimeMs;
+} catch { /* non-fatal */ }
 await call("report_transport", {
   agentId: AGENT_ID,
   transport: "tmux-push-remote",
   host: hostname(),
   tmuxTarget: TMUX_TARGET,
   since: Date.now(),
+  ...(scriptMtime !== undefined ? { scriptMtime } : {}),
 });
 process.stderr.write(
   `[coord-pusher] attached agent='${AGENT_ID}' tmux=${TMUX_TARGET} server=${SERVER} (room=${INCLUDE_ROOM ? "on" : "off"})\n`,

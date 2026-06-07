@@ -61,6 +61,12 @@ type TransportMarker = {
   // Remote pushers run on a different machine; the local pid is meaningless,
   // so we tag the host and use heartbeat-based liveness instead of pidAlive.
   host?: string;
+  // mtime of the pusher script the daemon loaded into memory at spawn time
+  // (epoch ms). When the on-disk script is upgraded but the daemon isn't
+  // restarted, doctor() compares this to the current mtime to flag a stale
+  // pusher — the class of bug that silently dropped /clear /compact in v0.8.1.
+  // Absent on markers written by older versions (treated as "unknown, skip").
+  scriptMtime?: number;
 };
 
 type AgentRegistry = Record<string, AgentEntry>;
@@ -855,12 +861,18 @@ export async function attachAgentTool(args: {
 
   // Write pid file (for scripts) and transport marker (for list_agents).
   await fsp.writeFile(pidFile(args.agentId, "pusher"), String(pid), "utf8");
+  // Stamp the script's mtime so doctor() can flag a stale daemon if it
+  // outlives a later upgrade of the on-disk script (see v0.8.1 → v0.8.2 bug
+  // report: control commands silently dropped by pre-v0.8 in-memory code).
+  let scriptMtime: number | undefined;
+  try { scriptMtime = (await fsp.stat(pusher)).mtimeMs; } catch { /* non-fatal */ }
   const marker: TransportMarker = {
     agentId: args.agentId,
     transport: "tmux-push",
     pid,
     tmuxTarget: target,
     since: Date.now(),
+    scriptMtime,
   };
   // Use updateJson so it lockfile-protects and creates the file atomically.
   await updateJson<TransportMarker>(transportFile(args.agentId), marker, () => marker);
@@ -1205,6 +1217,11 @@ export const reportTransportSchema = {
   tmuxTarget: z.string().optional(),
   host: z.string().optional(),
   since: z.number().optional(),
+  // mtime of the script the remote daemon loaded into memory at spawn time
+  // (epoch ms). Lets doctor() flag the remote pusher as stale if its on-disk
+  // counterpart has been upgraded since. The remote pusher passes
+  // `(await fsp.stat(__filename)).mtimeMs`; absent → doctor skips the check.
+  scriptMtime: z.number().optional(),
 };
 
 // Called by an external push daemon (typically scripts/coord-pusher.mjs on a
@@ -1217,6 +1234,7 @@ export async function reportTransportTool(args: {
   tmuxTarget?: string;
   host?: string;
   since?: number;
+  scriptMtime?: number;
 }) {
   const marker: TransportMarker = {
     agentId: args.agentId,
@@ -1225,6 +1243,7 @@ export async function reportTransportTool(args: {
     tmuxTarget: args.tmuxTarget,
     host: args.host,
     since: args.since ?? Date.now(),
+    scriptMtime: args.scriptMtime,
   };
   await updateJson<TransportMarker>(transportFile(args.agentId), marker, () => marker);
   return { ok: true, marker };
@@ -1340,6 +1359,43 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
       detail: dead.length ? `${dead.length} stale transport marker(s) (dead pid or expired remote heartbeat)` : "no stale transport markers",
       fixable: true,
       items: dead.length ? dead.map((f) => path.basename(f)) : undefined,
+    });
+  }
+
+  // 1b. Stale pusher daemons — a long-running pusher loaded its script into
+  //     memory at spawn time, so when the on-disk script is later upgraded
+  //     (npm i -g a new version), the still-running pid is on the OLD code.
+  //     Pre-v0.8.2 pushers had no `control:true` awareness and silently
+  //     dropped /clear /compact at the slash-guard — ack:true with no
+  //     keystrokes ever reaching the pane. Comparing the marker's stamped
+  //     scriptMtime against the on-disk script's current mtime catches it.
+  //     Local tmux-push only — for tmux-push-remote the script lives on a
+  //     different host so we can't stat it from here.
+  {
+    let localPusherMtime: number | undefined;
+    try { localPusherMtime = (await fsp.stat(resolvePusherPath())).mtimeMs; } catch { /* not packaged? skip */ }
+    const stale: string[] = [];
+    for (const fname of await listTransportFiles()) {
+      const file = path.join(TRANSPORT_DIR, fname);
+      const marker = await readJson<TransportMarker | null>(file, null);
+      if (!marker || !isMarkerLive(marker, reg, now)) continue;
+      if (marker.transport !== "tmux-push") continue; // remote = can't verify
+      if (marker.scriptMtime === undefined) continue; // pre-v0.8.2 marker, no info
+      if (localPusherMtime === undefined) continue;
+      if (marker.scriptMtime < localPusherMtime - 1) { // -1ms slack for fs mtime rounding
+        const loaded = new Date(marker.scriptMtime).toISOString();
+        const ondisk = new Date(localPusherMtime).toISOString();
+        stale.push(`${marker.agentId} (pid ${marker.pid}, loaded ${loaded}, on-disk now ${ondisk})`);
+      }
+    }
+    findings.push({
+      check: "stale-pusher-script",
+      level: stale.length ? "warn" : "ok",
+      detail: stale.length
+        ? `${stale.length} attached pusher(s) running pre-upgrade code — control commands (/clear, /compact) may be silently dropped. Run detach_agent + attach_agent for each, or have the agent relaunch.`
+        : "all attached pushers are running the current on-disk script",
+      fixable: false,
+      items: stale.length ? stale : undefined,
     });
   }
 

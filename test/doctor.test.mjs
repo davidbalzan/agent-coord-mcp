@@ -94,3 +94,82 @@ test("doctor judges remote markers by heartbeat, not pid", async () => {
   assert.equal(f.level, "warn");
   assert.ok(f.items.some((i) => i.includes("remoteagent")));
 });
+
+test("doctor flags a stale local pusher (loaded mtime < on-disk mtime)", async () => {
+  // Live marker for a registered agent. transport:"tmux-push" with our own pid
+  // (so isPidAlive passes), and a scriptMtime well in the past. The doctor's
+  // check stats hooks/tmux-pusher.mjs which is current → the past mtime is
+  // strictly less → warn.
+  await t.registerTool({ agentId: "staleagent" });
+  await store.updateJson(
+    store.transportFile("staleagent"),
+    {},
+    () => ({
+      agentId: "staleagent",
+      transport: "tmux-push",
+      pid: process.pid,
+      tmuxTarget: "%0",
+      since: Date.now(),
+      scriptMtime: 1, // epoch=Jan 1 1970 → definitely older than any built script
+    }),
+  );
+
+  const r = await t.doctorTool({});
+  const f = r.findings.find((x) => x.check === "stale-pusher-script");
+  assert.ok(f, "stale-pusher-script finding present");
+  assert.equal(f.level, "warn");
+  assert.ok(f.items.some((i) => i.includes("staleagent")));
+  assert.ok(f.detail.includes("control commands"));
+});
+
+test("doctor doesn't warn when the marker has no scriptMtime (pre-v0.8.2 marker)", async () => {
+  await t.registerTool({ agentId: "legacy" });
+  await store.updateJson(
+    store.transportFile("legacy"),
+    {},
+    () => ({
+      agentId: "legacy",
+      transport: "tmux-push",
+      pid: process.pid,
+      tmuxTarget: "%0",
+      since: Date.now(),
+      // scriptMtime intentionally omitted — pre-v0.8.2 shape.
+    }),
+  );
+
+  // Take the staleagent marker from the previous test out of the way so it
+  // doesn't make this assertion ambiguous.
+  await store.deleteFile(store.transportFile("staleagent"));
+
+  const r = await t.doctorTool({});
+  const f = r.findings.find((x) => x.check === "stale-pusher-script");
+  assert.ok(f);
+  assert.equal(f.level, "ok", `pre-v0.8.2 marker should be skipped, got: ${JSON.stringify(f)}`);
+});
+
+test("doctor doesn't try to verify remote (tmux-push-remote) markers", async () => {
+  await t.registerTool({ agentId: "remote-stale" });
+  await store.updateJson(
+    store.AGENTS_FILE,
+    {},
+    (cur) => { cur["remote-stale"].lastHeartbeat = Date.now(); return cur; },
+  );
+  await store.updateJson(
+    store.transportFile("remote-stale"),
+    {},
+    () => ({
+      agentId: "remote-stale",
+      transport: "tmux-push-remote",
+      pid: 0,
+      tmuxTarget: "%0",
+      since: Date.now(),
+      scriptMtime: 1, // ancient, but remote → must not be checked here
+      host: "other-host",
+    }),
+  );
+
+  const r = await t.doctorTool({});
+  const f = r.findings.find((x) => x.check === "stale-pusher-script");
+  // Even with an ancient remote scriptMtime, the check is local-only.
+  assert.equal(f.level, "ok", `remote markers should be skipped, got: ${JSON.stringify(f)}`);
+});

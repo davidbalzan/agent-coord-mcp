@@ -187,6 +187,24 @@ v0.7.0 closed the spoof gap *if you wrote config* (`tokens.json` or `AGENT_COORD
 
 ---
 
+## v0.8.2 — Stale pusher detection  ✅ shipped
+
+v0.8.1 added `send_command` (`/clear`, `/compact`) for context resets. Field report from new-chief on Jun 7 surfaced a class-of-bug: pushers spawned *before* an upgrade keep running their old in-memory code, so a pre-v0.8 pusher silently drops `control:true` messages at its slash-guard while the v0.8 server happily writes them and the cursor advances. Symptom: `send_command` returns `ok:true` but no keystrokes reach the pane. Exactly the kind of thing `doctor` should catch.
+
+### Delivered
+
+- **`scriptMtime` field on `TransportMarker`** — `attach_agent` stats the spawned pusher's script at spawn time and stamps the mtime onto the marker; the remote `coord-pusher` stats its own script and ships the value via `report_transport`.
+- **`doctor()` "stale-pusher-script" check** — for every live local `tmux-push` marker, compares the stamped `scriptMtime` against the current on-disk script's mtime; warns when the loaded code predates the upgrade with the concrete remediation (`detach_agent` + `attach_agent`, or have the agent relaunch). Backward-compat: pre-v0.8.2 markers with no `scriptMtime` are skipped, not false-positived. Remote `tmux-push-remote` markers are also skipped — the script lives on another host, can't be stat'd from here.
+- **3 new tests** (`test/doctor.test.mjs`): stale local marker triggers warn with the right items, pre-v0.8.2 marker (no scriptMtime) stays OK, remote marker stays OK regardless of its scriptMtime.
+
+### Rollout
+`npm i -g .` + each agent's owner runs `detach_agent` + `attach_agent` on themselves (or relaunches). After rollout `doctor()` is the source of truth — if it reports `stale-pusher-script: ok` you're known-clean.
+
+### Not done in this slice (deferred)
+- Auto-respawn on `attach_agent` when an existing live marker is detected and its scriptMtime is older than the on-disk script. Heavier handed; per new-chief's note any such behavior must be *loud*, not silent. Visibility-via-doctor is sufficient for now.
+
+---
+
 ## Maintenance — `doctor` health tool  ✅ shipped
 
 **Goal.** A single read-mostly diagnostic that inspects the whole `~/agent-coord/` state and reports drift, leaks, and corruption — the "why isn't my DM landing / why is this agent still showing online" questions, answered in one call instead of by hand-tailing JSONL. Complements `status` (one agent) and `list_agents` (registry only) with a *bus-wide* view.
