@@ -64,7 +64,7 @@ If you're building an agent with the official MCP SDKs (`@modelcontextprotocol/s
 | `heartbeat({agentId})` | Manual heartbeat. Usually unnecessary — agents with a live transport get heartbeats auto-bumped on every `list_agents`. |
 | `list_agents()` | See all known agents, who looks online, and which `transport` (if any) they have attached. Validates transport pid liveness on every call. |
 | `send_message({from, to?, room?, text})` | If `to` set → that agent's inbox (DM). Else → a channel: `room` names it (`"seo"` / `"#seo"`), omit for the default `general` channel. |
-| `send_command({from, to?, command})` / `send_command({from, room, command})` | Inject a context-management slash command (`/clear` or `/compact`) **directly into a sub-agent's CLI** — delivered raw (no banner/prefix) so the receiving TUI runs it as a real slash command. `to` targets one agent; `room` broadcasts to a channel's tmux-attached members (never the sender). **Gated to tmux:** returns `ok:false` unless the target has a live `tmux-push`(`-remote`) transport. Command allowlist is locked to `/clear` + `/compact`. Lets a lead clear/compact sub-agent context to save tokens. See [clearing sub-agent context](#clearing-sub-agent-context-send_command). |
+| `send_command({from, to?, command, reminderMs?, reminderText?})` / `send_command({from, room, command, ...})` | Inject a context-management slash command (`/clear` or `/compact`) **directly into a sub-agent's CLI** — delivered raw (no banner/prefix) so the receiving TUI runs it as a real slash command. `to` targets one agent; `room` broadcasts to a channel's tmux-attached members (never the sender). **Gated to tmux:** returns `ok:false` unless the target has a live `tmux-push`(`-remote`) transport. Command allowlist is locked to `/clear` + `/compact`. After `/clear`, a follow-up identity-reminder DM is auto-scheduled (`reminderMs:0` to opt out, `reminderText` to override) so the freshly-cleared worker re-anchors on its agentId and bus attach state. See [clearing sub-agent context](#clearing-sub-agent-context-send_command). |
 | `read_messages({agentId, source, room?, limit?, peek?, sinceTs?})` | Read new messages. `source` is `inbox`/`room`/`status`; for `room`, `room` picks the channel (default `general`). Advances the per-channel cursor unless `peek:true`. |
 | `post_status({agentId, status, detail?})` | Append to the shared status stream (separate from chat). |
 | `wait_for_message({agentId, source, room?, timeoutMs?})` | Block (max 60s) until a new entry appears, then return it. For `room`, `room` picks the channel. |
@@ -308,6 +308,14 @@ Unlike `send_message`, a control command is delivered **raw** — no `[agent-coo
 - **Marked, not inferred.** A normal `send_message({text:"/clear"})` is still dropped. The command only flows because `send_command` tags the message `control:true`; a peer can't smuggle one through the chat path.
 - **Gated to tmux.** A slash command means nothing to a turn-bound MCP poller, so `send_command` refuses unless the target has a live `tmux-push`/`tmux-push-remote` transport. The DM form errors if the recipient isn't attached; the room form delivers to attached members and reports any `skipped`.
 - **Never self-clears.** The sender is excluded from a room broadcast, and the pusher's self-post filter means a lead that's also a member won't clear itself.
+
+**Post-`/clear` identity reminder.** `/clear` wipes the receiver's conversation context — including its understanding of which agent it is and that it's on the bus. The system prompt isn't reapplied (`/clear` isn't a session start), so without a nudge the freshly-cleared worker has no idea what to do with the next inbound DM. `send_command({command:"/clear", …})` therefore schedules a reminder DM ~3s after delivery, telling the recipient its `agentId` and pointing it at `status()` / `list_rooms()` to re-orient. Tunables:
+
+- `reminderMs:0` → opt out for this call.
+- `reminderMs:5000` → push the delay (max 60s).
+- `reminderText:"…"` → override the default body (e.g. seed the worker with its new task in the same DM).
+
+The reminder is per-recipient on `room:` broadcasts (each gets their own DM with their own agentId). `/compact` doesn't schedule a reminder — it preserves a summary the agent should be able to read.
 
 Works identically over the remote transport (`coord-pusher`).
 

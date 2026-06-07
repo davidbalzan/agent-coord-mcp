@@ -377,7 +377,52 @@ export const sendCommandSchema = {
   to: z.string().optional(),
   room: z.string().optional(),
   command: z.string().min(1),
+  // Default 3000ms. After /clear, schedules an identity-reminder DM to each
+  // recipient so a freshly-wiped worker re-anchors on its agentId and bus
+  // attach state. Set 0 to opt out. Ignored for non-/clear commands.
+  reminderMs: z.number().int().min(0).max(60_000).optional(),
+  // Override the auto-generated reminder body if you want something specific.
+  reminderText: z.string().optional(),
 };
+
+function defaultReminderText(agentId: string): string {
+  return (
+    `[agent-coord] context reset by /clear. ` +
+    `Your bus identity is '${agentId}'. You remain registered and attached — call ` +
+    `status({agentId:"${agentId}"}) to re-orient (role, transport, unread) and ` +
+    `list_rooms() for the channels you're in. Any DM or channel post you receive ` +
+    `next is your new task context.`
+  );
+}
+
+function scheduleReminders(
+  from: string,
+  recipients: string[],
+  delayMs: number,
+  override: string | undefined,
+): void {
+  const t = setTimeout(async () => {
+    for (const r of recipients) {
+      try {
+        const reminder: Message = {
+          id: randomUUID(),
+          ts: Date.now(),
+          from,
+          to: r,
+          text: override ?? defaultReminderText(r),
+        };
+        await appendJsonl(inboxFile(r), reminder);
+      } catch (e) {
+        process.stderr.write(
+          `[send_command] post-/clear reminder to '${r}' failed: ${(e as Error)?.message ?? e}\n`,
+        );
+      }
+    }
+  }, delayMs);
+  // Don't keep the event loop alive solely for the reminder — the MCP server's
+  // transport already holds it open as long as it's connected.
+  if (typeof t.unref === "function") t.unref();
+}
 
 // Inject a context-management slash command into a sub-agent's live tmux
 // session. Writes a control-flagged message the pushers deliver RAW (no banner,
@@ -389,6 +434,8 @@ export async function sendCommandTool(args: {
   to?: string;
   room?: string;
   command: string;
+  reminderMs?: number;
+  reminderText?: string;
 }) {
   const cmd = normalizeControlCommand(args.command);
   if (!cmd) {
@@ -426,7 +473,20 @@ export async function sendCommandTool(args: {
     };
     const target = inboxFile(args.to);
     await appendJsonl(target, msg);
-    return { ok: true, id: msg.id, command: text, target, delivered: [args.to], transport: marker.transport };
+    // After /clear the receiver forgets its identity and that it's bus-attached
+    // (the system prompt isn't re-applied because /clear isn't a session
+    // start). Schedule a follow-up DM as a re-anchor; opt out with reminderMs:0.
+    const reminderMs = cmd === "clear" ? args.reminderMs ?? 3000 : 0;
+    if (reminderMs > 0) scheduleReminders(args.from, [args.to], reminderMs, args.reminderText);
+    return {
+      ok: true,
+      id: msg.id,
+      command: text,
+      target,
+      delivered: [args.to],
+      transport: marker.transport,
+      ...(reminderMs > 0 ? { reminderScheduled: { delayMs: reminderMs, recipients: [args.to] } } : {}),
+    };
   }
 
   // Room: broadcast to every tmux-attached member (never the sender itself).
@@ -451,6 +511,10 @@ export async function sendCommandTool(args: {
   };
   const target = roomFile(chan);
   await appendJsonl(target, msg);
+  // Same post-/clear re-anchor as the DM path — one reminder per delivered
+  // member, in their own inbox, with their own agentId in the body.
+  const reminderMs = cmd === "clear" ? args.reminderMs ?? 3000 : 0;
+  if (reminderMs > 0) scheduleReminders(args.from, delivered, reminderMs, args.reminderText);
   return {
     ok: true,
     id: msg.id,
@@ -459,6 +523,7 @@ export async function sendCommandTool(args: {
     room: chan,
     delivered,
     skipped: skipped.length ? skipped : undefined,
+    ...(reminderMs > 0 ? { reminderScheduled: { delayMs: reminderMs, recipients: delivered } } : {}),
   };
 }
 

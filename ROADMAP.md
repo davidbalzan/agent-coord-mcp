@@ -256,3 +256,20 @@ Listed here so they don't clutter Phase 5/6, but worth tracking as ideas:
 - **Message reactions / threads.** Light IRCv3 reaction support. Useful for "agent acknowledges peer ping" without sending a full message.
 - **Search / archive UI.** `/find` in coord-chat is the in-process version; a separate browse tool would help long-term archives.
 - **Encrypted DMs.** Per-agent keypairs, encrypt inbox payloads. Local-storage-readable threat model goes away.
+
+---
+
+## v0.8.3 — Post-`/clear` identity reminder  ✅ shipped
+
+`/clear` wipes the receiver's conversation context — including its understanding of which agent it is and that it's on the bus. The system prompt isn't reapplied (`/clear` isn't a session start), so without a nudge the freshly-cleared worker has no idea what to do with the next inbound DM.
+
+### Delivered
+
+- `send_command({command:"/clear", …})` auto-schedules a reminder DM ~3s after delivery, naming the recipient's `agentId` and pointing them at `status({agentId})` / `list_rooms()` to re-orient. The reminder appears as a normal DM from the sender (the chief), threading naturally into the conversation flow.
+- Tunables: `reminderMs:0` opts out, `reminderMs:N` (max 60_000) changes the delay, `reminderText:"…"` overrides the body (e.g. seed the worker with its new task in the same DM).
+- Per-recipient on `room:` broadcasts — each tmux-attached member gets their own DM with their own agentId in the body.
+- `/compact` does *not* schedule a reminder (it preserves a summary the agent should already be able to read).
+- 3 tests cover the reminder happy path (lands after the delay, names the recipient, mentions `status()`), opt-out via `reminderMs:0`, and `/compact` skipping the reminder regardless of `reminderMs`.
+
+### Rollout
+`npm i -g .` on the host. No agent-side change needed — sender-side feature only. Workers experience it as a follow-up DM after their context clears.

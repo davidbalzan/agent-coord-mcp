@@ -135,6 +135,73 @@ test("send_command broadcasts to a channel's tmux-attached members only", async 
   assert.ok(read.messages.some((m) => m.text === "/clear" && m.control === true));
 });
 
+test("send_command /clear schedules an identity reminder DM after the configured delay", async () => {
+  await t.registerTool({ agentId: "rem-lead" });
+  await t.registerTool({ agentId: "rem-worker" });
+  await t.reportTransportTool({ agentId: "rem-worker", transport: "tmux-push-remote", host: "test" });
+
+  const r = await t.sendCommandTool({
+    from: "rem-lead",
+    to: "rem-worker",
+    command: "/clear",
+    reminderMs: 60, // short enough to keep the test snappy
+  });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.reminderScheduled, { delayMs: 60, recipients: ["rem-worker"] });
+
+  // Immediately after the call, only the /clear control message is in the inbox.
+  const before = await t.readMessagesTool({ agentId: "rem-worker", source: "inbox", peek: true });
+  assert.equal(before.messages.filter((m) => m.text === "/clear").length, 1);
+  assert.equal(before.messages.some((m) => m.text?.includes("context reset by /clear")), false);
+
+  // Wait past the reminder delay; the reminder DM should now be present.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const after = await t.readMessagesTool({ agentId: "rem-worker", source: "inbox", peek: true });
+  const reminder = after.messages.find((m) => m.text?.includes("context reset by /clear"));
+  assert.ok(reminder, "post-/clear reminder DM lands in the recipient's inbox");
+  assert.equal(reminder.from, "rem-lead");
+  assert.ok(reminder.text.includes("rem-worker"), "reminder names the recipient's agentId");
+  assert.ok(reminder.text.includes("status("), "reminder points the agent at status()");
+});
+
+test("send_command /clear with reminderMs:0 opts out of the reminder", async () => {
+  await t.registerTool({ agentId: "noremind-lead" });
+  await t.registerTool({ agentId: "noremind-worker" });
+  await t.reportTransportTool({ agentId: "noremind-worker", transport: "tmux-push-remote", host: "test" });
+
+  const r = await t.sendCommandTool({
+    from: "noremind-lead",
+    to: "noremind-worker",
+    command: "/clear",
+    reminderMs: 0,
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.reminderScheduled, undefined);
+
+  // Even after waiting, no reminder should appear.
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const after = await t.readMessagesTool({ agentId: "noremind-worker", source: "inbox", peek: true });
+  assert.equal(after.messages.some((m) => m.text?.includes("context reset by /clear")), false);
+});
+
+test("send_command /compact does NOT schedule a reminder (only /clear does)", async () => {
+  await t.registerTool({ agentId: "compact-lead" });
+  await t.registerTool({ agentId: "compact-worker" });
+  await t.reportTransportTool({ agentId: "compact-worker", transport: "tmux-push-remote", host: "test" });
+
+  const r = await t.sendCommandTool({
+    from: "compact-lead",
+    to: "compact-worker",
+    command: "/compact",
+    reminderMs: 50, // even with a value set, /compact skips the reminder
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.reminderScheduled, undefined);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const after = await t.readMessagesTool({ agentId: "compact-worker", source: "inbox", peek: true });
+  assert.equal(after.messages.some((m) => m.text?.includes("context reset by /clear")), false);
+});
+
 test("prune drops old messages and shifts the reader's cursor to stay aligned", async () => {
   const old = Date.now() - 30 * 24 * 60 * 60 * 1000;
   await store.appendJsonl(store.ROOM_FILE, { id: "old1", ts: old, from: "x", room: "general", text: "ancient" });
