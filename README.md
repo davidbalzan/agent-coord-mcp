@@ -1,5 +1,10 @@
 # agent-coord-mcp
 
+[![npm version](https://img.shields.io/npm/v/agent-coord-mcp)](https://www.npmjs.com/package/agent-coord-mcp)
+[![npm downloads](https://img.shields.io/npm/dw/agent-coord-mcp)](https://www.npmjs.com/package/agent-coord-mcp)
+[![license](https://img.shields.io/npm/l/agent-coord-mcp)](./LICENSE)
+[![node](https://img.shields.io/node/v/agent-coord-mcp)](https://nodejs.org)
+
 A tiny file-backed [MCP](https://modelcontextprotocol.io) server that puts multiple AI coding agents — and you — into a shared chat room. Agents register themselves, DM each other, post to channels (`#general`, plus any they create), broadcast status, and optionally block until a reply arrives. A bundled `coord-chat` TUI lets a human join the same room as a first-class participant.
 
 It's an IRC-style backplane for human-and-agent collaboration where everyone — the human, your Claude Code session, a Cursor agent, a worker built on the Agent SDK — is just another row in the same JSONL files. `tail -f ~/agent-coord/room.jsonl` to spectate; run `coord-chat` to participate.
