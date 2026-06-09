@@ -194,6 +194,22 @@ export async function unregisterTool(args: { agentId: string }) {
   return { ok: true, removed: existed, detach, leftRooms };
 }
 
+// ---------- quit ----------
+// Clean shutdown: unregister (detach transport + leave rooms + remove registry
+// entry) then exit the MCP process. Only the bound identity can call this —
+// prevents one agent from killing another agent's session.
+
+export const quitSchema = { agentId: z.string().min(1) };
+
+export async function quitTool(args: { agentId: string }): Promise<never> {
+  await unregisterTool(args);
+  // Give stdio a moment to flush the JSON response before exiting
+  setTimeout(() => process.exit(0), 150);
+  // Return a result so the MCP framework sends the response before the
+  // setTimeout fires — the caller will see this before the process dies.
+  return { ok: true, message: `'${args.agentId}' unregistered — MCP process exiting` } as never;
+}
+
 // ---------- heartbeat ----------
 
 export const heartbeatSchema = { agentId: z.string().min(1) };
@@ -1734,6 +1750,75 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
     fixed: fix ? fixed : undefined,
     summary,
   };
+}
+
+// ---------- delete_room ----------
+
+export const deleteRoomSchema = {
+  agentId: z.string().min(1),
+  room: z.string().min(1),
+  // When true, kick remaining members instead of refusing.
+  force: z.boolean().optional(),
+};
+
+export async function deleteRoomTool(args: { agentId: string; room: string; force?: boolean }) {
+  const chan = normalizeRoom(args.room);
+  if (chan === DEFAULT_ROOM) return { ok: false, error: "cannot delete the default channel" };
+
+  const rooms = await getRooms();
+  const entry = rooms[chan];
+  if (!entry) return { ok: false, error: `room '${chan}' does not exist` };
+
+  const members = entry.members ?? [];
+  if (members.length > 0 && !args.force) {
+    return {
+      ok: false,
+      error: `room '${chan}' still has ${members.length} member(s): ${members.join(", ")}. Pass force=true to delete anyway.`,
+      members,
+    };
+  }
+
+  // Remove from rooms registry.
+  await updateJson<RoomRegistry>(ROOMS_FILE, {}, (current) => {
+    delete current[chan];
+    return current;
+  });
+
+  // Delete the backing JSONL file.
+  const file = roomFile(chan);
+  const fileDeleted = await deleteFile(file);
+
+  // Drop the channel offset from every agent's cursor so no offset points into
+  // a now-deleted file.
+  const cursorsAdjusted: string[] = [];
+  for (const fname of await listCursorFiles()) {
+    const id = fname.replace(/\.json$/, "");
+    const cursorPath = path.join(CURSOR_DIR, fname);
+    let touched = false;
+    await updateJson<Cursor>(cursorPath, {}, (current) => {
+      if (current.roomOffsets?.[chan] !== undefined) {
+        delete current.roomOffsets[chan];
+        touched = true;
+      }
+      return current;
+    });
+    if (touched) cursorsAdjusted.push(id);
+  }
+
+  await appendJsonl(ROOM_FILE, sysMsg(args.agentId, DEFAULT_ROOM, `deleted channel #${chan}`));
+  return { ok: true, room: chan, fileDeleted, members, cursorsAdjusted };
+}
+
+// ---------- force_unregister ----------
+
+export const forceUnregisterSchema = {
+  targetAgentId: z.string().min(1),
+};
+
+// Admin eviction — same logic as unregister but bypasses the identity gate
+// so the caller does not need to be the target agent.
+export async function forceUnregisterTool(args: { targetAgentId: string }) {
+  return unregisterTool({ agentId: args.targetAgentId });
 }
 
 // ---------- helpers ----------

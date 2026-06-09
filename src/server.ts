@@ -10,10 +10,14 @@ import {
   attachAgentTool,
   clearTransportSchema,
   clearTransportTool,
+  deleteRoomSchema,
+  deleteRoomTool,
   detachAgentSchema,
   detachAgentTool,
   doctorSchema,
   doctorTool,
+  forceUnregisterSchema,
+  forceUnregisterTool,
   heartbeatSchema,
   heartbeatTool,
   joinRoomSchema,
@@ -50,6 +54,8 @@ import {
   statusTool,
   unregisterSchema,
   unregisterTool,
+  quitSchema,
+  quitTool,
   waitForMessageSchema,
   waitForMessageTool,
 } from "./tools.js";
@@ -123,6 +129,13 @@ function buildServer(initialBound?: string): McpServer {
     "Tear down this agent: detach any attached transport (kills the pusher) and remove the registry entry. Clean shutdown counterpart to `join`.",
     unregisterSchema,
     gate("agentId", unregisterTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "quit",
+    "Clean shutdown: unregister this agent (detach transport, leave rooms, remove registry entry) then exit the MCP process. Only callable by the session's bound identity. Use this to cleanly hand off before a restart with a new name.",
+    quitSchema,
+    gate("agentId", quitTool as unknown as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
@@ -282,6 +295,20 @@ function buildServer(initialBound?: string): McpServer {
     gate(null, doctorTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
+  server.tool(
+    "delete_room",
+    "Permanently delete a channel: removes it from the registry, deletes its JSONL file, and clears all agent cursor offsets for that channel. Refuses if agents are still joined unless force=true. Cannot delete the default 'general' channel. Posts a system notice to #general on success.",
+    deleteRoomSchema,
+    gate("agentId", deleteRoomTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "force_unregister",
+    "Admin eviction: unregisters any agent by targetAgentId regardless of the caller's identity. Detaches the agent's transport, removes it from all channel memberships, and drops its registry entry. Use after a reboot to clean up stale agents that can no longer unregister themselves.",
+    forceUnregisterSchema,
+    gate(null, forceUnregisterTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
   return server;
 }
 
@@ -321,10 +348,12 @@ async function main() {
     const boundAgent = process.env.AGENT_COORD_BOUND_AGENT;
     if (!boundAgent) {
       console.error(
-        "[agent-coord-mcp] bus identity unbound (stdio) — falling back to TOFU: the " +
-          "first tool call's agentId/from claim becomes this session's bound identity " +
-          "and subsequent calls cannot switch. For stricter pre-binding, set " +
-          "AGENT_COORD_BOUND_AGENT=<your-id> in the MCP launch env.",
+        "[agent-coord-mcp] WARNING: AGENT_COORD_BOUND_AGENT is not set.\n" +
+          "  The session identity will be locked to whatever agentId is used in the first\n" +
+          "  tool call (TOFU). This cannot be changed mid-session.\n" +
+          "  To fix: add AGENT_COORD_BOUND_AGENT=<your-agent-id> to the MCP server env\n" +
+          "  in your Claude Code MCP config, then restart. Use the `quit` tool to cleanly\n" +
+          "  unregister before restarting so the new name starts fresh.",
       );
     }
     const server = buildServer(boundAgent);
