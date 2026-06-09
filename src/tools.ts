@@ -1158,6 +1158,7 @@ export async function joinRoomTool(args: { agentId: string; room: string }) {
   const chan = normalizeRoom(args.room);
   await ensureRoom(chan, args.agentId);
   await addMember(chan, args.agentId);
+  await appendJsonl(roomFile(chan), sysMsg(args.agentId, chan, `${args.agentId} has joined`));
   const reg = await getRooms();
   const e = reg[chan];
   const all = await readJsonl<Message>(roomFile(chan));

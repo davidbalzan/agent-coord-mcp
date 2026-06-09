@@ -224,7 +224,7 @@ function buildServer(initialBound?: string): McpServer {
 
   server.tool(
     "join_room",
-    "Join a channel (creating it if new). Adds this agent to the channel's membership so the notification hooks push its messages, and returns the channel's topic, MOTD, members, and unread count.",
+    "Join a channel (creating it if new). Adds this agent to the channel's membership so the notification hooks push its messages. Posts a system join notice to the channel. Returns the channel's topic, MOTD, member list, and unread message count — but not the messages themselves. Call read_messages to fetch history if needed.",
     joinRoomSchema,
     gate("agentId", joinRoomTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
