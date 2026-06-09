@@ -112,9 +112,23 @@ function buildServer(initialBound?: string): McpServer {
 
   server.tool(
     "join",
-    "Recommended session-start call. Does register + auto-attach (if running inside tmux) + read inbox in one round-trip. Pass attach=false to skip the transport, attach={...overrides} to customize, or omit it to let the server auto-detect $TMUX_PANE. Returns the registration, attach result, any unread inbox messages, and the default channel's topic + MOTD (room rules) so you see them on connect.",
+    "Recommended session-start call. Does register + auto-attach (if running inside tmux) + read inbox in one round-trip. Pass attach=false to skip the transport, attach={...overrides} to customize, or omit it to let the server auto-detect $TMUX_PANE. Returns the registration, attach result, any unread inbox messages, and the default channel's topic + MOTD (room rules) so you see them on connect. Calling join binds this MCP process's identity to agentId for the lifetime of the session — no env var or config needed. Each Claude Code session runs its own stdio process so bindings are naturally isolated.",
     joinSchema,
-    gate("agentId", joinTool as (a: Record<string, unknown>) => Promise<unknown>),
+    // join explicitly sets the session binding when unset, so each agent can
+    // declare its identity via join rather than relying on env vars.
+    async (args: Record<string, unknown>) => {
+      const claimed = args["agentId"];
+      if (typeof claimed === "string") {
+        if (bound === undefined) {
+          bound = claimed;
+        } else if (bound !== claimed) {
+          throw new Error(
+            `identity bound to '${bound}'; rejected attempt to act as '${claimed}'`,
+          );
+        }
+      }
+      return jsonResult(await (joinTool as (a: Record<string, unknown>) => Promise<unknown>)(args));
+    },
   );
 
   server.tool(
