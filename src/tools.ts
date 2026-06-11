@@ -568,20 +568,25 @@ export async function readMessagesTool(args: {
   let limited: (Message | StatusEntry)[] = [];
   let totalNew = 0;
 
+  // Room reads default to 50 messages to prevent agents flooding themselves
+  // with full channel history on join. Inbox and status drain fully by default
+  // since they are targeted/bounded by nature.
+  const effectiveLimit = args.limit ?? (args.source === "room" ? 50 : undefined);
+
   if (args.peek) {
     const cursor = await readJson<Cursor>(cursorFile(args.agentId), {});
     const startOffset = getOffset(cursor, args.source, args.room);
     let entries = all.slice(startOffset);
     if (args.sinceTs !== undefined) entries = entries.filter((e) => e.ts > args.sinceTs!);
     totalNew = entries.length;
-    limited = args.limit ? entries.slice(0, args.limit) : entries;
+    limited = effectiveLimit ? entries.slice(0, effectiveLimit) : entries;
   } else {
     await updateJson<Cursor>(cursorFile(args.agentId), {}, (current) => {
       const startOffset = getOffset(current, args.source, args.room);
       let entries = all.slice(startOffset);
       if (args.sinceTs !== undefined) entries = entries.filter((e) => e.ts > args.sinceTs!);
       totalNew = entries.length;
-      limited = args.limit ? entries.slice(0, args.limit) : entries;
+      limited = effectiveLimit ? entries.slice(0, effectiveLimit) : entries;
       if (limited.length > 0) setOffset(current, args.source, args.room, startOffset + limited.length);
       return current;
     });

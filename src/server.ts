@@ -189,7 +189,7 @@ function buildServer(initialBound?: string): McpServer {
 
   server.tool(
     "read_messages",
-    "Read new messages from inbox|room|status. For source='room', pass 'room' to read a specific channel (default 'general'). Advances the per-channel cursor unless peek=true.",
+    "Read new messages from inbox|room|status. For source='room', pass 'room' to read a specific channel (default 'general'). Room reads default to 50 messages per call — pass limit to override (max 500). Inbox and status drain fully by default. Advances the per-channel cursor unless peek=true.",
     readMessagesSchema,
     gate("agentId", readMessagesTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
