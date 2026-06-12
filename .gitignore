@@ -5,3 +5,6 @@ dist/
 
 # Local Grok / agent-coord identity marker (not shared)
 .grok-coord.json
+
+# Coordinator live board (local only — never published; the backlog IS tracked)
+LIVE_STATE_*.md
