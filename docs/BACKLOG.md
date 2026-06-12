@@ -6,7 +6,9 @@
 > Priorities: P1 > P2 > P3.
 >
 > Initial population: compiled 2026-06-12 by agent-mcp-coordinator from ROADMAP gaps, code scan, and
-> issues surfaced in the v0.8.0/0.8.1 work. Items are coordinator-proposed for David's triage.
+> issues surfaced in the v0.8.0/0.8.1 work; reconciled against HEAD v0.8.9 (main raced ahead during
+> compilation — `force_unregister` and a `quit` tool shipped meanwhile and were dropped from here).
+> Items are coordinator-proposed for David's triage.
 
 ## Queue
 
@@ -19,12 +21,6 @@
   — it has been flagged "intentional" in this environment, but reads as a defect; confirm before fixing.
 
 ### P2 — protocol/tooling gaps
-- [P2] **Implement `force_unregister` MCP tool.** The coordinator handoff protocol (coordinator skill,
-  *Coordinator Handoffs* / *Delivery And Restart Hygiene*) tells an incoming coordinator to evict an
-  unreachable predecessor with `force_unregister` — but no such tool exists (`unregister`/`detach_agent`
-  only act on self / bound identity). Done-def: a tool that, given a target agentId, removes its registry
-  entry + transport marker + (optionally) drains its inbox, identity-gated so only a deliberate operator
-  call can evict another agent; tests; README + skill cross-ref.
 - [P2] **`coord-chat /doctor` command surface.** The `doctor` MCP tool shipped (v0.7.2) but the ROADMAP
   doctor section lists "still open: the coord-chat /doctor command." Done-def: `/doctor [--fix]` command
   in `coord-chat.mjs` rendering the structured report, plus a CLI flag; matches the MCP tool's output.
@@ -32,8 +28,9 @@
 ### P3 — hardening / features
 - [P3] **`doctor` reaper for wedged pushers (pid-alive, pane-dead).** v0.8.0 made pushers self-exit on a
   dead pane, but a pusher that's alive yet whose pane is gone (didn't self-exit) is still reported "live"
-  by `list_agents` and not caught by `doctor`. Add a check: probe each local `tmux-push` marker's
-  `tmuxTarget`; under `fix:true`, SIGTERM the pusher + clear the marker. Host-local only.
+  by `list_agents` and not caught by `doctor`. Distinct from the v0.8.2 `stale-pusher-script` check (which
+  flags a pusher running *pre-upgrade code*, not a dead *pane*). Add a check: probe each local `tmux-push`
+  marker's `tmuxTarget`; under `fix:true`, SIGTERM the pusher + clear the marker. Host-local only.
 - [P3] **Pusher safety: pane outlived the agent as a bare shell.** If a pane survives after the agent CLI
   exits, peer messages paste into the shell. Self-exit doesn't catch this (pane is alive). Detect via
   `pane_current_command` (or similar) and refuse to inject / self-exit. RISK-tagged — typing into a live
