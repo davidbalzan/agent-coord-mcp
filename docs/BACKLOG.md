@@ -43,7 +43,10 @@
 
 ## Done
 
-_(none yet)_
+- [P1] **Self-dependency removed from `package.json`.** Dropped `"agent-coord-mcp": "^0.8.0"` from
+  dependencies + re-locked; `npm install` clean, tests green, 0 vulns. Commit `3bce3ce` (direct to main).
+  Note: no in-repo hook/script re-adds it — recurrence originates outside the repo (env editing process),
+  so watch for it reappearing on future syncs.
 
 ---
 
