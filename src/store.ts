@@ -1,4 +1,5 @@
 import { promises as fs, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import lockfile from "proper-lockfile";
@@ -15,6 +16,25 @@ export const CURSOR_DIR = path.join(ROOT, "cursors");
 export const TRANSPORT_DIR = path.join(ROOT, "transports");
 export const PID_DIR = path.join(ROOT, "pids");
 export const LOG_DIR = path.join(ROOT, "logs");
+// Out-of-band delivery receipts (v0.9.0). A pusher stamps `receipts/<id>.jsonl`
+// after it actually types a message into the receiving pane — proof of
+// delivery the *sender* can poll for, WITHOUT the receipt ever entering any
+// agent's context window (it lives in a file, not an inbox/room). This is what
+// lets send_command return a truthful `delivered:true` instead of merely
+// `written-to-jsonl:true`, at zero added agent token cost.
+export const RECEIPTS_DIR = path.join(ROOT, "receipts");
+
+// Reversible-history cache (CCR pattern, v0.9.x). When read_messages would
+// flood an agent with a large channel backlog, the overflow (everything older
+// than the recent window) is stashed here as one entry and replaced inline by
+// a compact digest carrying a `hash`. The agent expands it on demand via
+// retrieve_room_history(hash). Entries are content+scope addressed, TTL'd, and
+// scoped to the (room, agent) they were produced for so a hash can't be
+// replayed to read a channel the caller never read itself. This is a cache of
+// data ALREADY present in rooms/<chan>.jsonl — not a new source of truth — so
+// losing it (TTL/eviction) only costs the agent a re-read at a higher limit.
+export const HISTORY_DIR = path.join(ROOT, "history");
+export const HISTORY_TTL_MS = 30 * 60_000; // session-scale; mirrors headroom DEFAULT_CCR_TTL_SECONDS
 
 // Channels. The default channel `general` keeps using the legacy single-room
 // file (room.jsonl) + the flat `roomOffset` cursor key, so existing agents and
@@ -33,7 +53,7 @@ export const DEFAULT_ROOM = "general";
 export const TOKENS_FILE = path.join(ROOT, "tokens.json");
 
 export function ensureDirs(): void {
-  for (const d of [ROOT, INBOX_DIR, CURSOR_DIR, TRANSPORT_DIR, PID_DIR, LOG_DIR, ROOMS_DIR]) {
+  for (const d of [ROOT, INBOX_DIR, CURSOR_DIR, TRANSPORT_DIR, PID_DIR, LOG_DIR, ROOMS_DIR, RECEIPTS_DIR, HISTORY_DIR]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
   }
   for (const f of [ROOM_FILE, STATUS_FILE]) {
@@ -274,6 +294,18 @@ export function cursorFile(agentId: string): string {
   return path.join(CURSOR_DIR, `${sanitize(agentId)}.json`);
 }
 
+// Per-agent delivery-receipt log. The agent's own pusher appends here after it
+// types a message into the pane; senders poll it to confirm delivery.
+export function receiptFile(agentId: string): string {
+  return path.join(RECEIPTS_DIR, `${sanitize(agentId)}.jsonl`);
+}
+
+export async function listReceiptFiles(): Promise<string[]> {
+  if (!existsSync(RECEIPTS_DIR)) return [];
+  const names = await fs.readdir(RECEIPTS_DIR);
+  return names.filter((n) => n.endsWith(".jsonl")).map((n) => path.join(RECEIPTS_DIR, n));
+}
+
 function sanitize(id: string): string {
   return id.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
@@ -329,4 +361,97 @@ export async function fileSize(file: string): Promise<number> {
   if (!existsSync(file)) return 0;
   const st = await fs.stat(file);
   return st.size;
+}
+
+// ---------- reversible history cache (CCR) ----------
+
+export type HistoryEntry<T = unknown> = {
+  hash: string;
+  room: string;
+  forAgent: string; // scope key — only this agent may retrieve (see HISTORY_DIR note)
+  createdTs: number;
+  messages: T[];
+};
+
+function historyFile(hash: string): string {
+  return path.join(HISTORY_DIR, `${sanitize(hash)}.json`);
+}
+
+// Content+scope address: same backlog read by two agents (or twice by one)
+// yields distinct entries, and the hash can't be guessed for a (room, agent)
+// pair the caller never read. 12 hex chars ≈ 48 bits — collision-safe at this
+// volume, short enough to sit inline in the digest marker.
+function historyHash(room: string, forAgent: string, messages: { ts: number }[]): string {
+  const first = messages[0]?.ts ?? 0;
+  const last = messages[messages.length - 1]?.ts ?? 0;
+  const sig = `${room} ${forAgent} ${first} ${last} ${messages.length}`;
+  return createHash("sha1").update(sig).digest("hex").slice(0, 12);
+}
+
+// Best-effort sweep of expired entries. Cheap (one readdir + stat per file) and
+// only the data is a disposable cache, so we swallow all errors.
+export async function pruneHistory(now = Date.now()): Promise<void> {
+  if (!existsSync(HISTORY_DIR)) return;
+  let names: string[];
+  try {
+    names = await fs.readdir(HISTORY_DIR);
+  } catch {
+    return;
+  }
+  await Promise.all(
+    names
+      .filter((n) => n.endsWith(".json"))
+      .map(async (n) => {
+        const f = path.join(HISTORY_DIR, n);
+        try {
+          const e = await readJsonNoLock<HistoryEntry | null>(f, null);
+          if (!e || now - e.createdTs > HISTORY_TTL_MS) await fs.unlink(f).catch(() => {});
+        } catch {
+          /* leave it; next sweep retries */
+        }
+      }),
+  );
+}
+
+// Stash a backlog slice and return its hash. Caller embeds the hash in the
+// digest marker it returns to the agent.
+export async function stashHistory<T extends { ts: number }>(
+  room: string,
+  forAgent: string,
+  messages: T[],
+): Promise<string> {
+  const hash = historyHash(room, forAgent, messages);
+  const entry: HistoryEntry<T> = { hash, room, forAgent, createdTs: Date.now(), messages };
+  await writeJson(historyFile(hash), entry);
+  void pruneHistory();
+  return hash;
+}
+
+export type RetrieveHistoryResult<T = unknown> =
+  | { ok: true; room: string; total: number; messages: T[] }
+  | { ok: false; reason: "not_found" | "expired" | "forbidden" };
+
+// Expand a stashed backlog. Enforces the (forAgent) scope and TTL. `query`, if
+// given, returns only entries whose serialized form contains the substring
+// (case-insensitive) — the lossless analogue of headroom's BM25 search-within.
+export async function retrieveHistory<T = unknown>(
+  hash: string,
+  forAgent: string,
+  query?: string,
+): Promise<RetrieveHistoryResult<T>> {
+  const f = historyFile(hash);
+  const entry = await readJson<HistoryEntry<T> | null>(f, null);
+  if (!entry) return { ok: false, reason: "not_found" };
+  if (Date.now() - entry.createdTs > HISTORY_TTL_MS) {
+    await deleteFile(f).catch(() => {});
+    return { ok: false, reason: "expired" };
+  }
+  if (entry.forAgent !== forAgent) return { ok: false, reason: "forbidden" };
+
+  let messages = entry.messages;
+  if (query && query.trim()) {
+    const q = query.toLowerCase();
+    messages = messages.filter((m) => JSON.stringify(m).toLowerCase().includes(q));
+  }
+  return { ok: true, room: entry.room, total: entry.messages.length, messages };
 }

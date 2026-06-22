@@ -36,6 +36,8 @@ import {
   pruneTool,
   readMessagesSchema,
   readMessagesTool,
+  retrieveRoomHistorySchema,
+  retrieveRoomHistoryTool,
   registerSchema,
   registerTool,
   renameAgentSchema,
@@ -182,16 +184,23 @@ function buildServer(initialBound?: string): McpServer {
 
   server.tool(
     "send_command",
-    "Inject a context-management slash command (/clear or /compact) directly into a sub-agent's live tmux session — delivered RAW with no banner or prefix, so the agent's CLI runs it as a real slash command. Target one agent with 'to' or broadcast to a channel's tmux-attached members with 'room' (never the sender). Hard-gated to tmux: returns ok:false if the target has no live tmux-push(-remote) transport. Intended for a lead agent to clear/compact sub-agent context and save tokens. The command allowlist is locked to /clear and /compact; nothing else is accepted. 'from' is enforced against the session's bound identity.",
+    "Inject a context-management slash command (/clear or /compact) directly into a sub-agent's live tmux session — delivered RAW with no banner or prefix, so the agent's CLI runs it as a real slash command. Target one agent with 'to' or broadcast to a channel's tmux-attached members with 'room' (never the sender). Hard-gated to tmux: returns ok:false if the target has no live tmux-push(-remote) transport. By default BLOCKS until the receiving pusher confirms it actually typed the command into the pane (out-of-band delivery receipt, no added agent context) and returns delivery:'confirmed' with deliveredAt, or delivery:'pending'+warning if no receipt arrived within deliveryTimeoutMs (default 8000) — a stale/wedged pusher. Pass waitForDelivery:false for fire-and-forget. Intended for a lead agent to clear/compact sub-agent context and save tokens. The command allowlist is locked to /clear and /compact; nothing else is accepted. 'from' is enforced against the session's bound identity.",
     sendCommandSchema,
     gate("from", sendCommandTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
     "read_messages",
-    "Read new messages from inbox|room|status. For source='room', pass 'room' to read a specific channel (default 'general'). Room reads default to 50 messages per call — pass limit to override (max 500). Inbox and status drain fully by default. Advances the per-channel cursor unless peek=true.",
+    "Read new messages from inbox|room|status. For source='room', pass 'room' to read a specific channel (default 'general'). Room reads return the most recent 50 messages per call — pass limit to override (max 500). When a channel backlog exceeds the window, the older overflow is replaced by a compact `history` digest carrying a retrieval hash; call retrieve_room_history(hash) to expand it. Inbox and status drain fully by default. Advances the per-channel cursor unless peek=true.",
     readMessagesSchema,
     gate("agentId", readMessagesTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "retrieve_room_history",
+    "Expand a compressed channel-history digest returned by read_messages. Pass the `hash` from the `history` field; optionally pass `query` to return only matching messages (case-insensitive substring). Entries are scoped to the agent that produced them and expire after 30 minutes — if expired, re-read the channel with a higher limit instead.",
+    retrieveRoomHistorySchema,
+    gate("agentId", retrieveRoomHistoryTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(

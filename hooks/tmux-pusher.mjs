@@ -47,6 +47,7 @@ import {
   existsSync,
   readFileSync,
   writeFileSync,
+  appendFileSync,
   renameSync,
   mkdirSync,
   unlinkSync,
@@ -81,10 +82,15 @@ const SAFE_ID = AGENT_ID.replace(/[^a-zA-Z0-9._-]/g, "_");
 const INBOX_FILE = path.join(ROOT, "inbox", `${SAFE_ID}.jsonl`);
 const CURSOR_FILE = path.join(ROOT, "cursors", `${SAFE_ID}.json`);
 const TRANSPORT_FILE = path.join(ROOT, "transports", `${SAFE_ID}.json`);
+// Out-of-band delivery receipts: stamped AFTER a message is typed into the
+// pane, so the sender can poll for proof of delivery without the receipt ever
+// entering any agent's context. Mirrors RECEIPTS_DIR in src/store.ts.
+const RECEIPTS_FILE = path.join(ROOT, "receipts", `${SAFE_ID}.jsonl`);
 const BUFFER_NAME = `coord-${SAFE_ID}`;
 
 mkdirSync(path.dirname(CURSOR_FILE), { recursive: true });
 mkdirSync(path.dirname(TRANSPORT_FILE), { recursive: true });
+mkdirSync(path.dirname(RECEIPTS_FILE), { recursive: true });
 
 // Confirm tmux target exists at startup so we fail loudly instead of silently.
 const probe = spawnSync("tmux", ["display-message", "-p", "-t", TMUX_TARGET, "ok"]);
@@ -240,17 +246,45 @@ async function injectViaTmux(batch) {
   const flushRun = async () => {
     if (run.length === 0) return;
     await pasteAndSubmit(formatBatch(run));
+    writeReceipts(run); // stamp only AFTER the paste+submit resolves
     run = [];
   };
   for (const m of batch) {
     if (isControl(m)) {
       await flushRun();
       await pasteAndSubmit(m.text.trim());
+      writeReceipts([m]);
     } else {
       run.push(m);
     }
   }
   await flushRun();
+}
+
+// Append one delivery receipt per message AFTER it has been typed into the
+// pane. Receipts are out-of-band proof for the sender (it polls this file),
+// never injected into any agent's context — so verification costs zero tokens.
+// Best-effort: a failed receipt write must not break delivery, so we swallow.
+function writeReceipts(msgs) {
+  const lines = [];
+  for (const m of msgs) {
+    if (!m || !m.id) continue;
+    lines.push(
+      JSON.stringify({
+        id: m.id,
+        agentId: AGENT_ID,
+        ts: Date.now(),
+        from: m.from,
+        control: m.control === true,
+      }),
+    );
+  }
+  if (lines.length === 0) return;
+  try {
+    appendFileSync(RECEIPTS_FILE, lines.join("\n") + "\n");
+  } catch (e) {
+    process.stderr.write(`[tmux-pusher] receipt write failed: ${e?.message ?? e}\n`);
+  }
 }
 
 function pasteAndSubmit(payload) {

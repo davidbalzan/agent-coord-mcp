@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented here.
 
+## [0.10.0] — 2026-06-22
+
+### Added
+- **Reversible channel-history compression (CCR pattern).** When a `read_messages` room read finds more backlog than the window (default 50), it now returns the **most recent messages raw** plus a compact `history` digest of the older overflow — instead of draining oldest-first in 50-message chunks. The digest summarizes the overflow (message count, distinct agents, time span, and any error/failure posts) and carries a retrieval `hash`. The agent expands the originals on demand via the new **`retrieve_room_history({agentId, hash, query?})`** tool; `query` returns only matching messages (case-insensitive substring). This kills the "agent joins a busy channel and floods its own context with history" problem without losing any data.
+  - **Scoped + TTL'd.** History entries are content+scope addressed and bound to the `(room, agent)` they were produced for — a hash can't be replayed by another agent to read a channel it never read. Entries expire after 30 minutes (the data is a disposable cache of `rooms/<chan>.jsonl`, so losing one only costs a re-read at a higher `limit`). `prune` sweeps expired entries.
+  - **Peek-safe.** `peek:true` reports the overflow count but never stashes a hash (peek is side-effect-free); read without peek to get an expandable hash.
+
+## [0.9.0] — 2026-06-22
+
+### Added
+- **Out-of-band delivery receipts for `send_command`.** The receiving pusher now stamps a receipt in `~/agent-coord/receipts/<id>.jsonl` *after* it types a control command into the pane. `send_command` blocks until that receipt appears and returns `delivery:"confirmed"` + `deliveredAt` — proof the keystrokes reached the CLI, not just that the message was written to JSONL. If no receipt arrives within `deliveryTimeoutMs` (default 8000ms) it returns `delivery:"pending"` + a warning pointing at a stale/wedged pusher. The room form reports `confirmed:[…]` / `pending:[…]` (`delivery:"partial"` when some lag). This closes the silent-drop class of bug (the original "`/clear` isn't firing" report): a wedged pusher used to ack by silence with no way to tell.
+  - **Zero added agent context.** The receipt lives in a file the *sender* polls — it never enters any inbox or room, so no agent pays tokens for it. The confirmation rides back in the caller's existing tool result.
+  - `waitForDelivery:false` restores the old fire-and-forget behavior; `deliveryTimeoutMs` tunes the wait. Receipts are trimmed by `prune` (and orphan receipt logs removed) like other logs.
+
 ## [0.8.5] — 2026-06-09
 
 ### Added

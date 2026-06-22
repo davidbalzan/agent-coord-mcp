@@ -32,11 +32,16 @@ import {
   pidFile,
   readJson,
   readJsonl,
+  receiptFile,
+  listReceiptFiles,
   removeMember,
   rewriteJsonl,
   roomFile,
   rotateAgentToken,
   setRoomMeta,
+  stashHistory,
+  retrieveHistory,
+  pruneHistory,
   transportFile,
   TRANSPORT_DIR,
   updateJson,
@@ -399,7 +404,34 @@ export const sendCommandSchema = {
   reminderMs: z.number().int().min(0).max(60_000).optional(),
   // Override the auto-generated reminder body if you want something specific.
   reminderText: z.string().optional(),
+  // Block until the receiving pusher confirms it actually typed the command
+  // into the pane (out-of-band receipt poll — zero added agent context).
+  // Default true: a control command you can't confirm is the bug this fixes.
+  // Set false for fire-and-forget. The wait is bounded by deliveryTimeoutMs.
+  waitForDelivery: z.boolean().optional(),
+  deliveryTimeoutMs: z.number().int().min(0).max(30_000).optional(),
 };
+
+// Poll an agent's receipt log until a receipt for `msgId` appears or the
+// deadline passes. Returns the delivery timestamp, or null on timeout. The
+// receipt is written by the receiver's pusher AFTER send-keys, so a hit is
+// genuine proof the keystrokes reached the pane. File-only — no agent context.
+async function waitForReceipt(
+  agentId: string,
+  msgId: string,
+  timeoutMs: number,
+): Promise<number | null> {
+  const file = receiptFile(agentId);
+  const deadline = Date.now() + timeoutMs;
+  // First check is immediate; then poll on a short interval.
+  for (;;) {
+    const receipts = await readJsonl<{ id: string; ts: number }>(file);
+    const hit = receipts.find((r) => r.id === msgId);
+    if (hit) return hit.ts ?? Date.now();
+    if (Date.now() >= deadline) return null;
+    await new Promise((res) => setTimeout(res, 150));
+  }
+}
 
 function defaultReminderText(agentId: string): string {
   return (
@@ -452,6 +484,8 @@ export async function sendCommandTool(args: {
   command: string;
   reminderMs?: number;
   reminderText?: string;
+  waitForDelivery?: boolean;
+  deliveryTimeoutMs?: number;
 }) {
   const cmd = normalizeControlCommand(args.command);
   if (!cmd) {
@@ -489,6 +523,13 @@ export async function sendCommandTool(args: {
     };
     const target = inboxFile(args.to);
     await appendJsonl(target, msg);
+    // Confirm the pusher actually typed it into the pane before we report success
+    // (unless explicitly fire-and-forget). Out-of-band receipt poll — the
+    // confirmation rides back in THIS tool result, costing no extra agent context.
+    const wait = args.waitForDelivery ?? true;
+    const deliveryTimeoutMs = args.deliveryTimeoutMs ?? 8000;
+    const confirmedAt = wait ? await waitForReceipt(args.to, msg.id, deliveryTimeoutMs) : null;
+    const confirmed = confirmedAt !== null;
     // After /clear the receiver forgets its identity and that it's bus-attached
     // (the system prompt isn't re-applied because /clear isn't a session
     // start). Schedule a follow-up DM as a re-anchor; opt out with reminderMs:0.
@@ -501,6 +542,21 @@ export async function sendCommandTool(args: {
       target,
       delivered: [args.to],
       transport: marker.transport,
+      // delivery: confirmed = pusher typed it into the pane; pending = written but
+      // unconfirmed within the timeout (stale/wedged pusher — run doctor). Absent
+      // when waitForDelivery:false.
+      ...(wait
+        ? {
+            delivery: confirmed ? "confirmed" : "pending",
+            confirmed,
+            ...(confirmedAt !== null ? { deliveredAt: confirmedAt } : {}),
+            ...(confirmed
+              ? {}
+              : {
+                  warning: `no delivery receipt from '${args.to}' within ${deliveryTimeoutMs}ms — the command was written but may not have reached the pane (stale/wedged pusher). Run doctor or re-attach the agent.`,
+                }),
+          }
+        : {}),
       ...(reminderMs > 0 ? { reminderScheduled: { delayMs: reminderMs, recipients: [args.to] } } : {}),
     };
   }
@@ -527,6 +583,19 @@ export async function sendCommandTool(args: {
   };
   const target = roomFile(chan);
   await appendJsonl(target, msg);
+  // Confirm each member's pusher typed it in (same msg.id lands in every
+  // member's own receipt file). Poll all in parallel within one timeout.
+  const wait = args.waitForDelivery ?? true;
+  const deliveryTimeoutMs = args.deliveryTimeoutMs ?? 8000;
+  let confirmed: string[] = [];
+  let pending: string[] = [];
+  if (wait) {
+    const results = await Promise.all(
+      delivered.map(async (m) => ({ m, at: await waitForReceipt(m, msg.id, deliveryTimeoutMs) })),
+    );
+    confirmed = results.filter((r) => r.at !== null).map((r) => r.m);
+    pending = results.filter((r) => r.at === null).map((r) => r.m);
+  }
   // Same post-/clear re-anchor as the DM path — one reminder per delivered
   // member, in their own inbox, with their own agentId in the body.
   const reminderMs = cmd === "clear" ? args.reminderMs ?? 3000 : 0;
@@ -539,6 +608,18 @@ export async function sendCommandTool(args: {
     room: chan,
     delivered,
     skipped: skipped.length ? skipped : undefined,
+    ...(wait
+      ? {
+          delivery: pending.length === 0 ? "confirmed" : "partial",
+          confirmed,
+          ...(pending.length
+            ? {
+                pending,
+                warning: `no delivery receipt within ${deliveryTimeoutMs}ms from: ${pending.join(", ")} — written but may not have reached their panes (stale/wedged pusher). Run doctor.`,
+              }
+            : {}),
+        }
+      : {}),
     ...(reminderMs > 0 ? { reminderScheduled: { delayMs: reminderMs, recipients: delivered } } : {}),
   };
 }
@@ -565,7 +646,7 @@ export async function readMessagesTool(args: {
   const file = sourceFile(args.source, args.agentId, args.room);
   const all = await readJsonl<Message | StatusEntry>(file);
 
-  let limited: (Message | StatusEntry)[] = [];
+  let entries: (Message | StatusEntry)[] = [];
   let totalNew = 0;
 
   // Room reads default to 50 messages to prevent agents flooding themselves
@@ -576,20 +657,44 @@ export async function readMessagesTool(args: {
   if (args.peek) {
     const cursor = await readJson<Cursor>(cursorFile(args.agentId), {});
     const startOffset = getOffset(cursor, args.source, args.room);
-    let entries = all.slice(startOffset);
+    entries = all.slice(startOffset);
     if (args.sinceTs !== undefined) entries = entries.filter((e) => e.ts > args.sinceTs!);
     totalNew = entries.length;
-    limited = effectiveLimit ? entries.slice(0, effectiveLimit) : entries;
   } else {
     await updateJson<Cursor>(cursorFile(args.agentId), {}, (current) => {
       const startOffset = getOffset(current, args.source, args.room);
-      let entries = all.slice(startOffset);
-      if (args.sinceTs !== undefined) entries = entries.filter((e) => e.ts > args.sinceTs!);
-      totalNew = entries.length;
-      limited = effectiveLimit ? entries.slice(0, effectiveLimit) : entries;
-      if (limited.length > 0) setOffset(current, args.source, args.room, startOffset + limited.length);
+      let e = all.slice(startOffset);
+      if (args.sinceTs !== undefined) e = e.filter((x) => x.ts > args.sinceTs!);
+      totalNew = e.length;
+      entries = e;
+      // Advance past EVERYTHING we account for here (recent window + any
+      // overflow we stash below). The overflow is recoverable via the history
+      // hash, so it must not requeue for the next read — that would re-flood.
+      if (e.length > 0) setOffset(current, args.source, args.room, startOffset + e.length);
       return current;
     });
+  }
+
+  // CCR overflow handling (room source only). When the backlog exceeds the
+  // window, return the RECENT slice raw and replace the older overflow with a
+  // compact digest carrying a retrieval hash. The agent expands it on demand
+  // via retrieve_room_history. Peek is side-effect-free, so it never stashes —
+  // it reports the count and tells the agent to do a real read to get a hash.
+  let recent = entries;
+  let history: { digest: string; hash?: string; older: number } | undefined;
+  if (args.source === "room" && effectiveLimit && entries.length > effectiveLimit) {
+    const overflow = entries.slice(0, entries.length - effectiveLimit);
+    recent = entries.slice(entries.length - effectiveLimit);
+    const room = normalizeRoom(args.room);
+    if (args.peek) {
+      history = { digest: digestOverflow(overflow, undefined), older: overflow.length };
+    } else {
+      const hash = await stashHistory(room, args.agentId, overflow);
+      history = { digest: digestOverflow(overflow, hash), hash, older: overflow.length };
+    }
+  } else if (effectiveLimit && entries.length > effectiveLimit) {
+    // Non-room sources keep the legacy oldest-first chunking (no stash).
+    recent = entries.slice(0, effectiveLimit);
   }
 
   // Drop the agent's own posts on shared channels — reading your own broadcast
@@ -597,8 +702,8 @@ export async function readMessagesTool(args: {
   // Cursor has already advanced past them, so they won't reappear.
   const visible =
     args.source === "room" || args.source === "status"
-      ? limited.filter((e) => entryAuthor(e) !== args.agentId)
-      : limited;
+      ? recent.filter((e) => entryAuthor(e) !== args.agentId)
+      : recent;
 
   return {
     ok: true,
@@ -606,6 +711,64 @@ export async function readMessagesTool(args: {
     totalNew,
     returned: visible.length,
     room: args.source === "room" ? normalizeRoom(args.room) : undefined,
+    ...(history ? { history } : {}),
+  };
+}
+
+// Lossless summary of a stashed backlog slice: surfaces error/failure posts
+// verbatim (the lines that usually matter most in a flood) and collapses the
+// rest to counts. Mirrors headroom's content-aware digest, kept deliberately
+// simple — the full originals are one retrieve_room_history call away.
+function digestOverflow(over: (Message | StatusEntry)[], hash: string | undefined): string {
+  const authors = new Set(over.map(entryAuthor).filter(Boolean));
+  const errorRe = /\b(error|fatal|fail(ed|ure)?|panic|exception)\b/i;
+  const errors = over.filter((m) => errorRe.test(JSON.stringify(m)));
+  const first = over[0]?.ts;
+  const last = over[over.length - 1]?.ts;
+  const span =
+    first && last && last > first ? ` over ${Math.round((last - first) / 60000)}m` : "";
+  const parts = [
+    `[${over.length} earlier message${over.length === 1 ? "" : "s"} compressed`,
+    `${authors.size} agent${authors.size === 1 ? "" : "s"}${span}`,
+  ];
+  if (errors.length) parts.push(`${errors.length} error post${errors.length === 1 ? "" : "s"}`);
+  const head = parts.join(", ");
+  const tail = hash
+    ? ` hash=${hash}] — call retrieve_room_history(hash="${hash}") to expand`
+    : `] — read without peek to get an expandable hash`;
+  return head + tail;
+}
+
+// ---------- retrieve_room_history ----------
+
+export const retrieveRoomHistorySchema = {
+  agentId: z.string().min(1),
+  hash: z.string().min(1),
+  query: z.string().optional(),
+};
+
+export async function retrieveRoomHistoryTool(args: {
+  agentId: string;
+  hash: string;
+  query?: string;
+}) {
+  const res = await retrieveHistory<Message | StatusEntry>(args.hash, args.agentId, args.query);
+  if (!res.ok) {
+    const reason =
+      res.reason === "expired"
+        ? "That history entry has expired (30m TTL). Re-read the channel with a higher limit to fetch it again."
+        : res.reason === "forbidden"
+          ? "That history hash was produced for a different agent and cannot be retrieved by you."
+          : "No history entry for that hash. It may have expired or never existed.";
+    return { ok: false, reason: res.reason, message: reason };
+  }
+  return {
+    ok: true,
+    room: res.room,
+    hash: args.hash,
+    total: res.total,
+    returned: res.messages.length,
+    messages: res.messages,
   };
 }
 
@@ -744,6 +907,14 @@ export async function pruneTool(args: {
     for (const e of Object.values(rooms)) {
       for (const m of e.members ?? []) if (!knownAgents.has(m)) orphanMembers.add(m);
     }
+    let receiptsRemoved = 0;
+    const orphanReceipts: string[] = [];
+    for (const filePath of await listReceiptFiles()) {
+      const id = path.basename(filePath).replace(/\.jsonl$/, "");
+      const entries = await readJsonl<{ ts: number }>(filePath);
+      if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) orphanReceipts.push(id);
+      receiptsRemoved += entries.filter((e) => e.ts <= cutoff).length;
+    }
     return {
       dryRun: true,
       cutoff,
@@ -754,6 +925,8 @@ export async function pruneTool(args: {
         inboxMessages: inboxRemoved,
         orphanInboxes: orphans,
         orphanMembers: [...orphanMembers],
+        receipts: receiptsRemoved,
+        orphanReceipts,
       },
     };
   }
@@ -845,6 +1018,27 @@ export async function pruneTool(args: {
     return current;
   });
 
+  // Receipts are out-of-band proof logs with no cursor — trim old entries by ts
+  // and delete logs for agents no longer registered. No offset adjustment needed.
+  let receiptsRemoved = 0;
+  const deletedOrphanReceipts: string[] = [];
+  for (const filePath of await listReceiptFiles()) {
+    const id = path.basename(filePath).replace(/\.jsonl$/, "");
+    if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) {
+      const entries = await readJsonl<{ ts: number }>(filePath);
+      receiptsRemoved += entries.length;
+      await deleteFile(filePath);
+      deletedOrphanReceipts.push(id);
+      continue;
+    }
+    const r = await rewriteJsonl<{ ts: number }>(filePath, (e) => e.ts > cutoff);
+    receiptsRemoved += r.removed;
+  }
+
+  // Sweep expired reversible-history entries (TTL'd cache; also self-prunes on
+  // every read, so this just catches entries on a server with few reads).
+  await pruneHistory();
+
   return {
     dryRun: false,
     cutoff,
@@ -855,6 +1049,8 @@ export async function pruneTool(args: {
       inboxMessages: inboxRemoved,
       orphanInboxes: deletedOrphans,
       orphanMembers: [...orphanMembers],
+      receipts: receiptsRemoved,
+      orphanReceipts: deletedOrphanReceipts,
     },
     cursorsAdjusted,
   };
