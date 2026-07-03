@@ -11,7 +11,7 @@
 
 | Lane | Owner | State | Current slice | Next GO |
 |---|---|---|---|---|
-| server | coord-mcp-worker-1 | idle (all P2s done) | — released at v0.13.0 — | P3 pusher reaper / bare-shell guard (post-release, on David's go) |
+| server | coord-mcp-worker-1 | active | v0.14.0 feature: re-apply v0.8.10 compact-injection (salvage of stranded commit 9b710c6) onto post-#4 formatBatch, both pushers — GO sent 2026-07-03. Gate: QA + mcp-coord parse-contract verify (agent-facing banner). | P3 pusher reaper / bare-shell guard |
 
 ## Release readiness (mcp-coord owns the finish line)
 
