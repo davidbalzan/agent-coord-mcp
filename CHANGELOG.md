@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.14.0] — Unreleased
+
+### Added
+- _(P3 hardening cycle: pusher reaper for wedged pushers, bare-shell pane injection guard, encrypted DMs, message reactions/acks — see docs/BACKLOG.md.)_
+
 ## [0.13.0] — 2026-07-03
 
 ### Added
