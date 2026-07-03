@@ -25,6 +25,7 @@
   doctor section lists "still open: the coord-chat /doctor command." Done-def: `/doctor [--fix]` command
   in `coord-chat.mjs` rendering the structured report, plus a CLI flag; matches the MCP tool's output.
 
+
 ### P3 — hardening / features
 - [P3] **`doctor` reaper for wedged pushers (pid-alive, pane-dead).** v0.8.0 made pushers self-exit on a
   dead pane, but a pusher that's alive yet whose pane is gone (didn't self-exit) is still reported "live"
@@ -42,6 +43,35 @@
   `post_status` for this today, so low urgency.
 
 ## Done
+
+- [P2] **coord-chat `/doctor` command + `--doctor` CLI flag.** Renders the structured doctorTool report
+  (single dynamic import of dist doctorTool — no reimplemented checks), `--fix` passthrough, exit 0 healthy
+  / 1 on error. davidbalzan/agent-coord-mcp#5 (squash-merged `aba53c6`, v0.13.0; `scripts/coord-chat.mjs` +
+  `test/coord-chat-doctor.test.mjs`). Gate: coord-mcp-qa solo (routine) — build + 60/60 + live+scratch
+  behavior check vs MCP tool. Closes the last ROADMAP doctor gap. Owner: coord-mcp-worker-1.
+  Note: run against the live bus it surfaced 12 stalled cursors + orphans → `doctor --fix` applied
+  (David-approved), bus now healthy (0 err).
+
+- [P2] **Delivery tiers + digest batching in the pusher.** Urgent traffic pushes immediately carrying a
+  coalesced digest of queued low-tier; routine queues silently, rides the next push; zero self-poll.
+  davidbalzan/agent-coord-mcp#4 (squash-merged `a47164a`, v0.12.0). HIGH-RISK (pusher hot path) → fan-out
+  gate: v1 FAILED (cursor commit-before-deliver lost coalesced backlog on crash/pane-death/SIGTERM;
+  /clear-reminder demoted routine; DM DONE:/SCOPE:/GO over-matched). Reworked → v2 re-gate: commit-after-
+  delivery (at-least-once, dup-not-loss), server-side `urgent` flag for reminder (non-spoofable), DM DONE:
+  gate-runner-only, SCOPE: trusted-senders-only, literal GO:. Both loss-lens + tier-lens verifiers FIXED,
+  57/57. Merged ≠ deployed: pushers pick it up on restart. Owner: coord-mcp-worker-1.
+
+- [P2] **Liveness ping/ack.** `ping {from,to}` answers server-side (registry + pusher pid + tmux pane
+  probe), never touches the target session; `echo` opt-in default-off; fleet ping = zero model tokens.
+  davidbalzan/agent-coord-mcp#3 (squash-merged `af3631a`, v0.11.0). Gate: build + 47/47 + real-store probe
+  (stale-heartbeat-but-live agent → alive, dead → heartbeat-stale, unknown → unregistered, inbox hash
+  unchanged). Merged ≠ deployed: servers pick it up on restart. Owner: coord-mcp-worker-1.
+
+- [P2] **Status-stream recency window.** `read_messages(source=status)` now returns newest 50 + expandable
+  history digest instead of a full oldest-first drain; cursor/`sinceTs`/`limit`/`peek` semantics kept.
+  davidbalzan/agent-coord-mcp#2 (squash-merged `f86a672`, v0.10.1). Gate: build + 45/45 tests + real-store
+  probe (436 stale → newest 50 + digest, totalNew honest). Merged ≠ deployed: running servers pick it up
+  on restart. Owner: coord-mcp-worker-1.
 
 - [P1] **Self-dependency removed from `package.json`.** Dropped `"agent-coord-mcp": "^0.8.0"` from
   dependencies + re-locked; `npm install` clean, tests green, 0 vulns. Commit `3bce3ce` (direct to main).
