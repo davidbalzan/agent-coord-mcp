@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.12.0] — 2026-07-03
+
+### Added
+- **Delivery tiers + digest batching in the pusher.** Only push-now traffic wakes an agent's pane: `BLOCKER:`, `DAVID_DECISION:`, `GO…` work orders, countersigned `SCOPE:` changes, control commands, DM `DONE:`, and room `DONE:` when the agent is a gate runner (QA/coordinator — inferred from the registry role at pusher startup, overridable with `AGENT_COORD_GATE_RUNNER=1|0`). All other traffic (`FYI:`/`AGENT_ACTION:`/`RISK:`/chatter) queues silently: the pusher no longer advances cursors at scan time, only when a batch is actually delivered, so a routine-only backlog stays **unread by design** and is zero-loss by construction (the cursor is shared with `read_messages`). Every push carries at most ONE coalesced `[agent-coord] digest` block containing the queued routine messages alongside the trigger — an idle agent with only low-tier backlog is never woken, so routine ops cost zero model tokens. The tier classifier is pure and dependency-free (`hooks/tier.mjs`) with direct unit tests. `AGENT_COORD_TIERS=0` restores legacy push-everything.
+
 ## [0.11.0] — 2026-07-03
 
 ### Added

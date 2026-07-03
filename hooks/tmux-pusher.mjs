@@ -56,6 +56,7 @@ import {
 import { homedir } from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { classifyTier, isGateRunnerRole } from "./tier.mjs";
 
 const AGENT_ID = process.env.AGENT_COORD_ID;
 const TMUX_TARGET = process.env.AGENT_COORD_TMUX_TARGET;
@@ -77,6 +78,25 @@ const POLL_MS = parseInt(process.env.AGENT_COORD_POLL_MS || "1000", 10);
 // Consecutive missed pane probes before we conclude the target is gone and
 // self-exit. A small grace rides out transient tmux-server hiccups.
 const TARGET_GRACE = parseInt(process.env.AGENT_COORD_TARGET_GRACE || "3", 10);
+// Delivery tiers: only push-now traffic (BLOCKER/DAVID_DECISION/GO/SCOPE/
+// DONE-to-gate, controls) wakes the agent; everything else queues unread and
+// rides the next push as a coalesced digest. AGENT_COORD_TIERS=0 restores
+// legacy push-everything.
+const TIERS_ENABLED = process.env.AGENT_COORD_TIERS !== "0";
+// Gate runners (QA/coordinator) receive room DONE: as push-now; resolved from
+// the registry role once at startup, env-overridable in both directions.
+function resolveGateRunner() {
+  const env = process.env.AGENT_COORD_GATE_RUNNER;
+  if (env === "1" || env === "true") return true;
+  if (env === "0" || env === "false") return false;
+  try {
+    const reg = JSON.parse(readFileSync(path.join(ROOT, "agents.json"), "utf8"));
+    return isGateRunnerRole(reg?.[AGENT_ID]?.role);
+  } catch {
+    return false;
+  }
+}
+const GATE_RUNNER = resolveGateRunner();
 
 const SAFE_ID = AGENT_ID.replace(/[^a-zA-Z0-9._-]/g, "_");
 const INBOX_FILE = path.join(ROOT, "inbox", `${SAFE_ID}.jsonl`);
@@ -156,46 +176,67 @@ function shouldInject(m) {
   return true;
 }
 
-function drainSource(label, file, cursorKey, cur) {
+// Collect fresh messages from one source WITHOUT advancing its cursor; the
+// caller commits offsets only when the batch is actually delivered. With
+// tiers on, a routine-only backlog therefore stays queued AND unread —
+// zero-loss by construction, since the cursor is shared with read_messages.
+function collectSource(label, file, cursorKey, cur, staged) {
   const all = readJsonl(file);
   const off = cur[cursorKey] ?? 0;
   const fresh = all.slice(off);
-  if (fresh.length === 0) return false;
+  if (fresh.length === 0) return;
   for (const m of fresh) {
-    if (shouldInject(m)) pending.push({ kind: label, ...m });
+    if (shouldInject(m)) {
+      const tagged = { kind: label, ...m };
+      // Assigned after the spread so a sender can't smuggle a tier field in.
+      tagged.tier = TIERS_ENABLED ? classifyTier(tagged, { gateRunner: GATE_RUNNER }) : "urgent";
+      staged.msgs.push(tagged);
+    }
   }
-  cur[cursorKey] = off + fresh.length;
-  return true;
+  staged.commits.push(() => {
+    cur[cursorKey] = off + fresh.length;
+  });
 }
 
-// Drain one channel against its per-channel offset (general → roomOffset,
-// others → roomOffsets[chan]); tag injected lines with the channel name.
-function drainRoomChannel(chan, cur) {
+// Collect one channel against its per-channel offset (general → roomOffset,
+// others → roomOffsets[chan]); tag collected lines with the channel name.
+function collectRoomChannel(chan, cur, staged) {
   const c = normalizeRoom(chan);
   const all = readJsonl(roomFile(c));
   const off = getRoomOffset(cur, c);
   const fresh = all.slice(off);
-  if (fresh.length === 0) return false;
+  if (fresh.length === 0) return;
   for (const m of fresh) {
-    if (shouldInject(m)) pending.push({ kind: `room #${c}`, ...m });
+    if (shouldInject(m)) {
+      const tagged = { kind: `room #${c}`, ...m };
+      tagged.tier = TIERS_ENABLED ? classifyTier(tagged, { gateRunner: GATE_RUNNER }) : "urgent";
+      staged.msgs.push(tagged);
+    }
   }
-  setRoomOffset(cur, c, off + fresh.length);
-  return true;
+  staged.commits.push(() => setRoomOffset(cur, c, off + fresh.length));
 }
 
 function checkOnce() {
   const cur = readCursor();
-  let changed = false;
-  if (drainSource("DM", INBOX_FILE, "inboxOffset", cur)) changed = true;
+  const staged = { msgs: [], commits: [] };
+  collectSource("DM", INBOX_FILE, "inboxOffset", cur, staged);
   if (INCLUDE_ROOM) {
     // Tail every channel the agent has joined. checkOnce runs on each poll, so
     // channels joined after startup are picked up automatically.
     for (const chan of joinedRooms()) {
-      if (drainRoomChannel(chan, cur)) changed = true;
+      collectRoomChannel(chan, cur, staged);
       watchRoom(chan);
     }
   }
-  if (changed) writeCursor(cur);
+  if (staged.commits.length === 0) return;
+  // Tiered delivery: push only when the fresh batch contains a push-now
+  // trigger. A routine-only backlog stays queued (offsets untouched) so an
+  // idle agent is never woken — it rides the digest of the next trigger.
+  // Non-injectable-only batches still advance so junk isn't rescanned forever.
+  if (staged.msgs.length > 0 && !staged.msgs.some((m) => m.tier === "urgent")) return;
+  for (const commit of staged.commits) commit();
+  writeCursor(cur);
+  pending.push(...staged.msgs);
   if (pending.length > 0) scheduleFlush();
 }
 
@@ -226,13 +267,24 @@ async function flush() {
 }
 
 function formatBatch(batch) {
-  const lines = [
-    "[agent-coord] incoming peer messages — already consumed from your inbox, do not call read_messages for them:",
-  ];
-  for (const m of batch) {
-    const tag = m.kind;
-    const ts = new Date(m.ts ?? Date.now()).toISOString();
-    lines.push(`  [${tag} ${ts} from=${m.from}] ${m.text ?? ""}`);
+  const line = (m) =>
+    `  [${m.kind} ${new Date(m.ts ?? Date.now()).toISOString()} from=${m.from}] ${m.text ?? ""}`;
+  const urgent = batch.filter((m) => m.tier !== "routine");
+  const routine = batch.filter((m) => m.tier === "routine");
+  const lines = [];
+  if (urgent.length > 0) {
+    lines.push(
+      "[agent-coord] incoming peer messages — already consumed from your inbox, do not call read_messages for them:",
+    );
+    for (const m of urgent) lines.push(line(m));
+  }
+  if (routine.length > 0) {
+    // ONE coalesced digest per push: the queued low-tier rides along with the
+    // trigger instead of ever waking the agent on its own.
+    lines.push(
+      `[agent-coord] digest — ${routine.length} routine message${routine.length === 1 ? "" : "s"} coalesced with this push (also consumed; FYI only, no reply expected):`,
+    );
+    for (const m of routine) lines.push(line(m));
   }
   return lines.join("\n");
 }

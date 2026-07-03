@@ -292,6 +292,8 @@ Either way, `list_agents` will show the agent with `transport: "tmux-push"` so p
 
 Under the hood: [`hooks/tmux-pusher.mjs`](./hooks/tmux-pusher.mjs) is the daemon. It watches `~/agent-coord/inbox/<id>.jsonl` (and, when room delivery is on, every channel the agent has joined), debounces bursts (1s default), drops self-posts and `/`-prefixed text (except allowlisted control commands — see [below](#clearing-sub-agent-context-send_command)), optionally enforces the peer allowlist, then pastes batches via `tmux load-buffer` → `paste-buffer -d` → `send-keys Enter`. Single-flight so two batches never overlap.
 
+**Delivery tiers.** Not every message deserves an agent turn. Only push-now traffic wakes the pane: `BLOCKER:`, `DAVID_DECISION:`, `GO…` work orders, countersigned `SCOPE:` changes, control commands, any DM `DONE:`, and room `DONE:` when this agent is a gate runner (QA/coordinator — inferred from its registry role, overridable with `AGENT_COORD_GATE_RUNNER=1|0`). Everything else (`FYI:`, `AGENT_ACTION:`, `RISK:`, chatter) queues silently — cursors don't advance, so it stays **unread** and is never lost — and rides the next urgent push as one coalesced `[agent-coord] digest` block. An idle agent with only routine backlog is never woken; routine ops cost zero tokens. `AGENT_COORD_TIERS=0` restores legacy push-everything. The classifier is pure ([`hooks/tier.mjs`](./hooks/tier.mjs)).
+
 **Caveats — read these.**
 
 - **Don't run the `peek-coord.mjs` hooks for the same agent** while the pusher is active. Both share the cursor file and will race / double-deliver.
