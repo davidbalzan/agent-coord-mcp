@@ -28,6 +28,8 @@ import {
   leaveRoomTool,
   listAgentsSchema,
   listAgentsTool,
+  pingSchema,
+  pingTool,
   listRoomsSchema,
   listRoomsTool,
   postStatusSchema,
@@ -166,6 +168,13 @@ function buildServer(initialBound?: string): McpServer {
     "Refresh this agent's lastHeartbeat timestamp.",
     heartbeatSchema,
     gate("agentId", heartbeatTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "ping",
+    "Liveness probe for another agent, answered entirely from server-side state (registry entry, transport marker, pusher pid, tmux pane) — it never touches the target's session, so a fleet-wide sweep costs zero model tokens on the targets. Returns alive (fresh heartbeat or live transport), reachable (a DM pushed now would land), granular checks, and latencyMs. Distinct from heartbeat, which is an agent refreshing its OWN activity timestamp. Pass echo:true (default off) to additionally drop a PING DM into the target's inbox — that wakes the target's model, so use it sparingly and only when you need an agent-level acknowledgement. 'from' is enforced against the session's bound identity.",
+    pingSchema,
+    gate("from", pingTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(

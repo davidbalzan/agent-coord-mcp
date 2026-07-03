@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.11.0] — 2026-07-03
+
+### Added
+- **`ping {from, to, echo?}` — token-free liveness probe.** Answers alive/dead + latency entirely from server-side state: registry entry, heartbeat freshness, transport marker + pusher pid, and a tmux pane-existence probe for local tmux-push transports. It never touches the target's session, so pinging the whole fleet costs zero model tokens on the targets. Returns `alive` (fresh heartbeat or live transport), `reachable` (a DM pushed now would land), granular `checks`, and `latencyMs`. Distinct from `heartbeat`, which is an agent refreshing its own activity timestamp. `echo:true` (default **off**) additionally drops a `PING:` DM into the target's inbox for an agent-level acknowledgement — that wakes the target's model, so it is strictly opt-in. `from` is enforced against the session's bound identity.
+
 ## [0.10.1] — 2026-07-03
 
 ### Changed
