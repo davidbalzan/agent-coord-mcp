@@ -191,7 +191,7 @@ function buildServer(initialBound?: string): McpServer {
 
   server.tool(
     "read_messages",
-    "Read new messages from inbox|room|status. For source='room', pass 'room' to read a specific channel (default 'general'). Room reads return the most recent 50 messages per call — pass limit to override (max 500). When a channel backlog exceeds the window, the older overflow is replaced by a compact `history` digest carrying a retrieval hash; call retrieve_room_history(hash) to expand it. Inbox and status drain fully by default. Advances the per-channel cursor unless peek=true.",
+    "Read new messages from inbox|room|status. For source='room', pass 'room' to read a specific channel (default 'general'). Room and status reads return the most recent 50 entries per call — pass limit to override (max 500). When the backlog exceeds the window, the older overflow is replaced by a compact `history` digest carrying a retrieval hash; call retrieve_room_history(hash) to expand it. Inbox drains fully by default. Advances the per-channel cursor unless peek=true.",
     readMessagesSchema,
     gate("agentId", readMessagesTool as (a: Record<string, unknown>) => Promise<unknown>),
   );

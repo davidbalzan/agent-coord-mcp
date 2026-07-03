@@ -649,10 +649,10 @@ export async function readMessagesTool(args: {
   let entries: (Message | StatusEntry)[] = [];
   let totalNew = 0;
 
-  // Room reads default to 50 messages to prevent agents flooding themselves
-  // with full channel history on join. Inbox and status drain fully by default
-  // since they are targeted/bounded by nature.
-  const effectiveLimit = args.limit ?? (args.source === "room" ? 50 : undefined);
+  // Room and status reads default to 50 entries to prevent agents flooding
+  // themselves with full history on join — the status stream grows unbounded
+  // across the fleet. Inbox drains fully since it is targeted by nature.
+  const effectiveLimit = args.limit ?? (args.source === "inbox" ? undefined : 50);
 
   if (args.peek) {
     const cursor = await readJson<Cursor>(cursorFile(args.agentId), {});
@@ -675,25 +675,26 @@ export async function readMessagesTool(args: {
     });
   }
 
-  // CCR overflow handling (room source only). When the backlog exceeds the
-  // window, return the RECENT slice raw and replace the older overflow with a
-  // compact digest carrying a retrieval hash. The agent expands it on demand
+  // CCR overflow handling (room and status sources). When the backlog exceeds
+  // the window, return the RECENT slice raw and replace the older overflow with
+  // a compact digest carrying a retrieval hash. The agent expands it on demand
   // via retrieve_room_history. Peek is side-effect-free, so it never stashes —
   // it reports the count and tells the agent to do a real read to get a hash.
   let recent = entries;
   let history: { digest: string; hash?: string; older: number } | undefined;
-  if (args.source === "room" && effectiveLimit && entries.length > effectiveLimit) {
+  if (args.source !== "inbox" && effectiveLimit && entries.length > effectiveLimit) {
     const overflow = entries.slice(0, entries.length - effectiveLimit);
     recent = entries.slice(entries.length - effectiveLimit);
-    const room = normalizeRoom(args.room);
+    const stashKey = args.source === "room" ? normalizeRoom(args.room) : "status";
     if (args.peek) {
       history = { digest: digestOverflow(overflow, undefined), older: overflow.length };
     } else {
-      const hash = await stashHistory(room, args.agentId, overflow);
+      const hash = await stashHistory(stashKey, args.agentId, overflow);
       history = { digest: digestOverflow(overflow, hash), hash, older: overflow.length };
     }
   } else if (effectiveLimit && entries.length > effectiveLimit) {
-    // Non-room sources keep the legacy oldest-first chunking (no stash).
+    // Inbox keeps the legacy oldest-first chunking (no stash) — targeted
+    // messages must never be skipped over.
     recent = entries.slice(0, effectiveLimit);
   }
 

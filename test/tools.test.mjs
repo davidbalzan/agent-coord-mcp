@@ -353,3 +353,43 @@ test("peek over the window reports overflow count but stashes no hash", async ()
   assert.equal(real.totalNew, 55);
   assert.ok(real.history.hash);
 });
+
+test("status backlog over the window returns newest entries + expandable digest", async () => {
+  for (let i = 0; i < 60; i++) {
+    await t.postStatusTool({ agentId: "st-poster", status: `st-${i}` });
+  }
+  const r = await t.readMessagesTool({ agentId: "st-reader", source: "status" });
+  assert.ok(r.totalNew >= 60);
+  assert.equal(r.returned, 50);
+  assert.equal(r.messages[49].status, "st-59");
+  assert.equal(r.history.older, r.totalNew - 50);
+  assert.ok(r.history.hash);
+
+  const exp = await t.retrieveRoomHistoryTool({ agentId: "st-reader", hash: r.history.hash });
+  assert.equal(exp.returned, r.history.older);
+
+  // Cursor advanced past the stashed overflow too — nothing requeues.
+  const again = await t.readMessagesTool({ agentId: "st-reader", source: "status" });
+  assert.equal(again.totalNew, 0);
+});
+
+test("status reads keep sinceTs/limit semantics and peek stashes no hash", async () => {
+  const reader = "st-reader-2";
+  const before = await t.readMessagesTool({ agentId: reader, source: "status", peek: true });
+  assert.equal(before.history.hash, undefined); // peek digests but never stashes
+  const cutoff = before.messages[before.messages.length - 1].ts;
+
+  await new Promise((res) => setTimeout(res, 5)); // ensure new posts get a later ts
+  for (let i = 0; i < 3; i++) {
+    await t.postStatusTool({ agentId: "st-poster", status: `late-${i}` });
+  }
+
+  const since = await t.readMessagesTool({ agentId: reader, source: "status", peek: true, sinceTs: cutoff });
+  assert.equal(since.totalNew, 3);
+  assert.equal(since.messages[0].status, "late-0");
+
+  const limited = await t.readMessagesTool({ agentId: reader, source: "status", limit: 2 });
+  assert.equal(limited.returned, 2);
+  assert.equal(limited.messages[1].status, "late-2");
+  assert.equal(limited.history.older, limited.totalNew - 2);
+});

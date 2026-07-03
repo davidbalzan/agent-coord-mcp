@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.10.1] — 2026-07-03
+
+### Changed
+- **Status reads get the room recency window.** `read_messages(source="status")` now defaults to the most recent 50 entries (was: full drain) and reuses the CCR overflow path — older entries are replaced by a `history` digest with a retrieval hash, expandable via `retrieve_room_history`. The fleet-wide status stream grows unbounded, so a fresh agent no longer floods its context by draining hundreds of stale status posts on join. Fully backward-compatible: the per-agent cursor still advances past everything accounted for, `sinceTs` still filters, an explicit `limit` overrides the window, and `peek` stays side-effect-free (digest without hash). Inbox behavior is unchanged (full drain — targeted messages must never be skipped).
+
 ## [0.10.0] — 2026-06-22
 
 ### Added
