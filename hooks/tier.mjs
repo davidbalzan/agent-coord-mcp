@@ -68,25 +68,33 @@ export class TierQueue {
   }
 }
 
+// The per-message PARSE CONTRACT line. Agent harnesses read from/room/text
+// back out of this, so its shape is load-bearing and MUST stay byte-identical
+// to coord-pusher.mjs's `injectLine`. Compact form (v0.14.0, salvaged from
+// v0.8.10): `  [<kind> <HH:MM> <from>] <text>` where kind drops the leading
+// "room " ("room #general" → "#general"), the timestamp is HH:MM UTC, and the
+// "from=" label is dropped (bare id). kind/time/from never contain spaces
+// (ids are sanitized), so a parser splits on the first "] " unambiguously.
+export function injectLine(m) {
+  const tag = String(m.kind ?? "").replace(/^room /, "");
+  const d = new Date(m.ts ?? 0);
+  const hhmm = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+  return `  [${tag} ${hhmm} ${m.from}] ${m.text ?? ""}`;
+}
+
 // Render one delivery: urgent verbatim under the banner, then at most ONE
 // coalesced digest block carrying the queued routine messages.
 export function formatBatch(batch) {
-  const line = (m) =>
-    `  [${m.kind} ${new Date(m.ts ?? 0).toISOString()} from=${m.from}] ${m.text ?? ""}`;
   const urgent = batch.filter((m) => m.tier !== "routine");
   const routine = batch.filter((m) => m.tier === "routine");
   const lines = [];
   if (urgent.length > 0) {
-    lines.push(
-      "[agent-coord] incoming peer messages — already consumed from your inbox, do not call read_messages for them:",
-    );
-    for (const m of urgent) lines.push(line(m));
+    lines.push("[agent-coord] msgs (pre-consumed, don't re-read):");
+    for (const m of urgent) lines.push(injectLine(m));
   }
   if (routine.length > 0) {
-    lines.push(
-      `[agent-coord] digest — ${routine.length} routine message${routine.length === 1 ? "" : "s"} coalesced with this push (also consumed; FYI only, no reply expected):`,
-    );
-    for (const m of routine) lines.push(line(m));
+    lines.push(`[agent-coord] +${routine.length} routine (pre-consumed, FYI, no reply):`);
+    for (const m of routine) lines.push(injectLine(m));
   }
   return lines.join("\n");
 }

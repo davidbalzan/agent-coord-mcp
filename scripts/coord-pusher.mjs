@@ -168,13 +168,23 @@ async function flush() {
   }
 }
 
+// The per-message PARSE CONTRACT line — MUST stay byte-identical to
+// hooks/tier.mjs's injectLine (agent harnesses parse from/room/text out of
+// it). Compact form (v0.14.0): `  [<kind> <HH:MM> <from>] <text>`, kind drops
+// the leading "room ", timestamp is HH:MM UTC, no "from=" label. This pusher
+// is standalone (may deploy without hooks/), so the helper is duplicated
+// rather than imported; test/tier.test.mjs locks both to the same shape.
+function injectLine(m) {
+  const tag = String(m.kind ?? "").replace(/^room /, "");
+  const d = new Date(m.ts ?? 0);
+  const hhmm = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+  return `  [${tag} ${hhmm} ${m.from}] ${m.text ?? ""}`;
+}
+
 function formatBatch(batch) {
-  const lines = [
-    "[agent-coord] incoming peer messages — already consumed from your inbox, do not call read_messages for them:",
-  ];
+  const lines = ["[agent-coord] msgs (pre-consumed, don't re-read):"];
   for (const m of batch) {
-    const ts = new Date(m.ts ?? Date.now()).toISOString();
-    lines.push(`  [${m.kind} ${ts} from=${m.from}] ${m.text ?? ""}`);
+    lines.push(injectLine(m));
   }
   return lines.join("\n");
 }
