@@ -11,7 +11,7 @@
 
 | Lane | Owner | State | Current slice | Next GO |
 |---|---|---|---|---|
-| server | coord-mcp-worker-1 | active | v0.14.0 feature: re-apply v0.8.10 compact-injection (salvage of stranded commit 9b710c6) onto post-#4 formatBatch, both pushers — GO sent 2026-07-03. Gate: QA + mcp-coord parse-contract verify (agent-facing banner). | P3 pusher reaper / bare-shell guard |
+| server | coord-mcp-worker-1 | idle | compact-injection salvage merged (#6, v0.14.0). Primary checkout reset to origin/main — divergence resolved. | P3 pusher reaper / bare-shell guard (on David's go) |
 
 ## Release readiness (mcp-coord owns the finish line)
 

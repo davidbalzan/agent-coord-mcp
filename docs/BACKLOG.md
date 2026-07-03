@@ -44,6 +44,15 @@
 
 ## Done
 
+- [feat] **Compact injection format over the tiered formatter (v0.8.10 salvage).** Re-applied the stranded
+  v0.8.10 token optimizations onto the post-#4 formatter, both pushers: short header keeping a "don't
+  re-read" hint, HH:MM UTC timestamps, stripped `room ` prefix, dropped `from=` label — extended to the
+  new routine-digest block too. davidbalzan/agent-coord-mcp#6 (squash-merged `74ae6f4`, v0.14.0). Gate:
+  coord-mcp-qa (build + 64/64) + mcp-coord independent parse-contract verify (adversarial round-trip 5/5:
+  brackets/`] `/nested-header/empty-text all recover). Documented non-regression: newline-in-body still
+  wraps to header-less continuation lines (same as pre-#6). Supersedes stranded local commit `9b710c6`;
+  David's primary checkout reset to origin/main. Owner: coord-mcp-worker-1.
+
 - [P2] **coord-chat `/doctor` command + `--doctor` CLI flag.** Renders the structured doctorTool report
   (single dynamic import of dist doctorTool — no reimplemented checks), `--fix` passthrough, exit 0 healthy
   / 1 on error. davidbalzan/agent-coord-mcp#5 (squash-merged `aba53c6`, v0.13.0; `scripts/coord-chat.mjs` +
