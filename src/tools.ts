@@ -315,6 +315,79 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+// ---------- ping ----------
+
+export const pingSchema = {
+  from: z.string().min(1),
+  to: z.string().min(1),
+  echo: z.boolean().optional(),
+};
+
+// Liveness probe answered entirely from server-side state — registry entry,
+// transport marker, pusher pid, tmux pane. It never touches the target's
+// session, so a fleet-wide sweep costs zero model tokens on the targets.
+// Distinct from `heartbeat` (the target refreshing its own activity
+// timestamp): ping is a third party asking "would a DM land right now?".
+// echo=true is the one exception — it drops a PING DM into the target's inbox
+// (normal delivery, so the target's model DOES wake); opt-in, default off.
+export async function pingTool(args: { from: string; to: string; echo?: boolean }) {
+  const t0 = process.hrtime.bigint();
+  const now = Date.now();
+  const latencyMs = () => Math.round(Number(process.hrtime.bigint() - t0) / 1e3) / 1e3;
+
+  const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
+  const entry = reg[args.to];
+  if (!entry) {
+    return { ok: true, to: args.to, alive: false, reachable: false, reason: "unregistered", latencyMs: latencyMs() };
+  }
+
+  const marker = await readJson<TransportMarker | null>(transportFile(args.to), null);
+  const heartbeatAgeSec = Math.floor((now - entry.lastHeartbeat) / 1000);
+  const heartbeatFresh = now - entry.lastHeartbeat < STALE_MS;
+
+  let transportLive = false;
+  let paneAlive: boolean | undefined;
+  if (marker) {
+    transportLive = isMarkerLive(marker, reg, now);
+    if (transportLive && marker.transport === "tmux-push" && marker.tmuxTarget) {
+      // The pusher can outlive its pane (agent window closed) — probe the pane.
+      const probe = spawnSync("tmux", ["display-message", "-p", "-t", marker.tmuxTarget, "ok"]);
+      paneAlive = probe.status === 0;
+    }
+  }
+
+  const reachable = transportLive && paneAlive !== false;
+  const alive = reachable || heartbeatFresh;
+
+  let echoSent = false;
+  if (args.echo && alive) {
+    await sendMessageTool({
+      from: args.from,
+      to: args.to,
+      text: `PING: echo requested by ${args.from} — DM back if responsive.`,
+    });
+    echoSent = true;
+  }
+
+  return {
+    ok: true,
+    to: args.to,
+    alive,
+    reachable,
+    ...(alive ? {} : { reason: marker ? "transport-dead" : "heartbeat-stale" }),
+    checks: {
+      registered: true,
+      heartbeatFresh,
+      heartbeatAgeSec,
+      transport: marker?.transport ?? null,
+      transportLive,
+      ...(paneAlive !== undefined ? { paneAlive, tmuxTarget: marker?.tmuxTarget } : {}),
+    },
+    ...(args.echo ? { echoSent } : {}),
+    latencyMs: latencyMs(),
+  };
+}
+
 // ---------- send_message ----------
 
 export const sendMessageSchema = {

@@ -393,3 +393,40 @@ test("status reads keep sinceTs/limit semantics and peek stashes no hash", async
   assert.equal(limited.messages[1].status, "late-2");
   assert.equal(limited.history.older, limited.totalNew - 2);
 });
+
+test("ping answers from server-side state without touching the target", async () => {
+  const r0 = await t.pingTool({ from: "pinger", to: "ghost-agent" });
+  assert.equal(r0.alive, false);
+  assert.equal(r0.reason, "unregistered");
+  assert.equal(typeof r0.latencyMs, "number");
+
+  await t.registerTool({ agentId: "ping-target" });
+  const r1 = await t.pingTool({ from: "pinger", to: "ping-target" });
+  assert.equal(r1.alive, true); // fresh heartbeat
+  assert.equal(r1.reachable, false); // no transport attached
+  assert.equal(r1.checks.transport, null);
+  assert.equal(r1.checks.heartbeatFresh, true);
+
+  // Default ping must not deliver anything to the target.
+  const inbox = await t.readMessagesTool({ agentId: "ping-target", source: "inbox" });
+  assert.equal(inbox.totalNew, 0);
+
+  // Stale heartbeat + no transport → dead.
+  const { readFileSync, writeFileSync } = await import("node:fs");
+  const reg = JSON.parse(readFileSync(store.AGENTS_FILE, "utf8"));
+  reg["ping-target"].lastHeartbeat = Date.now() - 10 * 60 * 1000;
+  writeFileSync(store.AGENTS_FILE, JSON.stringify(reg));
+  const r2 = await t.pingTool({ from: "pinger", to: "ping-target" });
+  assert.equal(r2.alive, false);
+  assert.equal(r2.reason, "heartbeat-stale");
+});
+
+test("ping echo=true drops a PING DM into the target inbox (opt-in only)", async () => {
+  await t.registerTool({ agentId: "ping-echo-target" });
+  const r = await t.pingTool({ from: "pinger", to: "ping-echo-target", echo: true });
+  assert.equal(r.alive, true);
+  assert.equal(r.echoSent, true);
+  const inbox = await t.readMessagesTool({ agentId: "ping-echo-target", source: "inbox" });
+  assert.equal(inbox.totalNew, 1);
+  assert.ok(inbox.messages[0].text.startsWith("PING:"));
+});
