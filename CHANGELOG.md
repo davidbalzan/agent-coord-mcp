@@ -4,6 +4,9 @@ All notable changes to this project will be documented here.
 
 ## [0.14.0] — Unreleased
 
+### Changed
+- **Compact injection format (salvaged from v0.8.10, re-applied over the tiered formatter).** The pushers now paste a leaner block: banner `[agent-coord] msgs (pre-consumed, don't re-read):` (routine digest: `[agent-coord] +N routine (pre-consumed, FYI, no reply):`), and each message line is `  [<kind> <HH:MM> <from>] <text>` — the `room ` prefix is stripped from the kind (`room #general` → `#general`), the timestamp is shortened from ISO-8601 to `HH:MM` UTC, and the `from=` label is dropped to a bare id. Applied to both the urgent and routine-digest sections and to **both** delivery paths (`hooks/tier.mjs` `injectLine` and the standalone `scripts/coord-pusher.mjs`), which are locked byte-identical by a source-parity test. The per-message line is the agent parse contract (harnesses read `from`/`room`/`text` back out of it); it stays unambiguously machine-parseable — kind/time/from never contain spaces, so a parser splits on the first `] `. Cuts per-message injection overhead materially on busy panes without losing any field.
+
 ### Added
 - _(P3 hardening cycle: pusher reaper for wedged pushers, bare-shell pane injection guard, encrypted DMs, message reactions/acks — see docs/BACKLOG.md.)_
 
