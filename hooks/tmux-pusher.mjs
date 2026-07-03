@@ -56,7 +56,7 @@ import {
 import { homedir } from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { classifyTier, isGateRunnerRole } from "./tier.mjs";
+import { effectiveTier, isGateRunnerRole, TierQueue, formatBatch } from "./tier.mjs";
 
 const AGENT_ID = process.env.AGENT_COORD_ID;
 const TMUX_TARGET = process.env.AGENT_COORD_TMUX_TARGET;
@@ -78,25 +78,38 @@ const POLL_MS = parseInt(process.env.AGENT_COORD_POLL_MS || "1000", 10);
 // Consecutive missed pane probes before we conclude the target is gone and
 // self-exit. A small grace rides out transient tmux-server hiccups.
 const TARGET_GRACE = parseInt(process.env.AGENT_COORD_TARGET_GRACE || "3", 10);
-// Delivery tiers: only push-now traffic (BLOCKER/DAVID_DECISION/GO/SCOPE/
-// DONE-to-gate, controls) wakes the agent; everything else queues unread and
-// rides the next push as a coalesced digest. AGENT_COORD_TIERS=0 restores
-// legacy push-everything.
+// Delivery tiers: only push-now traffic (BLOCKER/DAVID_DECISION/GO:/
+// trusted SCOPE:/DONE-to-gate, controls, server-flagged reminders) wakes the
+// agent; everything else queues unread and rides the next push as a coalesced
+// digest. AGENT_COORD_TIERS=0 restores legacy push-everything.
 const TIERS_ENABLED = process.env.AGENT_COORD_TIERS !== "0";
-// Gate runners (QA/coordinator) receive room DONE: as push-now; resolved from
-// the registry role once at startup, env-overridable in both directions.
-function resolveGateRunner() {
-  const env = process.env.AGENT_COORD_GATE_RUNNER;
-  if (env === "1" || env === "true") return true;
-  if (env === "0" || env === "false") return false;
+// Gate runners (QA/coordinator) receive DONE: as push-now; countersigned
+// SCOPE: changes are honored only from these trusted ids. Re-resolved from
+// the registry every 30s so a role change doesn't strand a stale pusher;
+// AGENT_COORD_GATE_RUNNER=1|0 overrides in both directions.
+let tierCtx = { enabled: TIERS_ENABLED, gateRunner: false, trustedSenders: new Set() };
+function refreshTierCtx() {
+  let gateRunner = false;
+  const trusted = new Set();
   try {
     const reg = JSON.parse(readFileSync(path.join(ROOT, "agents.json"), "utf8"));
-    return isGateRunnerRole(reg?.[AGENT_ID]?.role);
+    for (const [id, entry] of Object.entries(reg ?? {})) {
+      if (isGateRunnerRole(entry?.role)) trusted.add(id);
+    }
+    gateRunner = trusted.has(AGENT_ID);
   } catch {
-    return false;
+    // No registry yet — conservative default (not a gate runner).
   }
+  const env = process.env.AGENT_COORD_GATE_RUNNER;
+  if (env === "1" || env === "true") gateRunner = true;
+  if (env === "0" || env === "false") gateRunner = false;
+  if (gateRunner !== tierCtx.gateRunner) {
+    process.stderr.write(`[tmux-pusher] gate-runner resolved: ${gateRunner}\n`);
+  }
+  tierCtx = { enabled: TIERS_ENABLED, gateRunner, trustedSenders: trusted };
 }
-const GATE_RUNNER = resolveGateRunner();
+refreshTierCtx();
+setInterval(refreshTierCtx, 30_000).unref();
 
 const SAFE_ID = AGENT_ID.replace(/[^a-zA-Z0-9._-]/g, "_");
 const INBOX_FILE = path.join(ROOT, "inbox", `${SAFE_ID}.jsonl`);
@@ -176,25 +189,36 @@ function shouldInject(m) {
   return true;
 }
 
-// Collect fresh messages from one source WITHOUT advancing its cursor; the
-// caller commits offsets only when the batch is actually delivered. With
-// tiers on, a routine-only backlog therefore stays queued AND unread —
-// zero-loss by construction, since the cursor is shared with read_messages.
+// In-memory delivery ledger. `stagedOffsets` marks how far we've COLLECTED
+// (prevents double-collection across polls); the on-disk cursor — shared
+// with read_messages — advances only after a batch is actually pasted. A
+// crash/SIGTERM/pane-death between the two rewinds to the on-disk cursor, so
+// queued-but-undelivered traffic is redelivered on restart (at-least-once),
+// never lost. Routine messages wait in tierQueue until a push-now trigger
+// coalesces them; their offset commits travel in pendingCommits alongside.
+const stagedOffsets = {};
+const tierQueue = new TierQueue();
+let pendingCommits = [];
+
 function collectSource(label, file, cursorKey, cur, staged) {
   const all = readJsonl(file);
-  const off = cur[cursorKey] ?? 0;
+  const off = Math.max(cur[cursorKey] ?? 0, stagedOffsets[cursorKey] ?? 0);
   const fresh = all.slice(off);
   if (fresh.length === 0) return;
   for (const m of fresh) {
     if (shouldInject(m)) {
       const tagged = { kind: label, ...m };
       // Assigned after the spread so a sender can't smuggle a tier field in.
-      tagged.tier = TIERS_ENABLED ? classifyTier(tagged, { gateRunner: GATE_RUNNER }) : "urgent";
+      tagged.tier = effectiveTier(tagged, tierCtx);
       staged.msgs.push(tagged);
     }
   }
-  staged.commits.push(() => {
-    cur[cursorKey] = off + fresh.length;
+  const newOff = off + fresh.length;
+  stagedOffsets[cursorKey] = newOff;
+  // Offsets are absolute and applied monotonically, so re-applying on a
+  // flush retry is harmless.
+  staged.commits.push((c) => {
+    c[cursorKey] = Math.max(c[cursorKey] ?? 0, newOff);
   });
 }
 
@@ -203,17 +227,28 @@ function collectSource(label, file, cursorKey, cur, staged) {
 function collectRoomChannel(chan, cur, staged) {
   const c = normalizeRoom(chan);
   const all = readJsonl(roomFile(c));
-  const off = getRoomOffset(cur, c);
+  const off = Math.max(getRoomOffset(cur, c), stagedOffsets[`room:${c}`] ?? 0);
   const fresh = all.slice(off);
   if (fresh.length === 0) return;
   for (const m of fresh) {
     if (shouldInject(m)) {
       const tagged = { kind: `room #${c}`, ...m };
-      tagged.tier = TIERS_ENABLED ? classifyTier(tagged, { gateRunner: GATE_RUNNER }) : "urgent";
+      tagged.tier = effectiveTier(tagged, tierCtx);
       staged.msgs.push(tagged);
     }
   }
-  staged.commits.push(() => setRoomOffset(cur, c, off + fresh.length));
+  const newOff = off + fresh.length;
+  stagedOffsets[`room:${c}`] = newOff;
+  staged.commits.push((cc) => setRoomOffset(cc, c, Math.max(getRoomOffset(cc, c), newOff)));
+}
+
+// Fold accumulated offset commits into the on-disk cursor. Called from the
+// flush success path (delivery confirmed) and for junk-only batches.
+function commitOffsets(commits) {
+  if (commits.length === 0) return;
+  const cur = readCursor();
+  for (const c of commits) c(cur);
+  writeCursor(cur);
 }
 
 function checkOnce() {
@@ -228,16 +263,28 @@ function checkOnce() {
       watchRoom(chan);
     }
   }
-  if (staged.commits.length === 0) return;
+  pendingCommits.push(...staged.commits);
+  if (
+    staged.msgs.length === 0 &&
+    tierQueue.size() === 0 &&
+    pending.length === 0 &&
+    !sending &&
+    pendingCommits.length > 0
+  ) {
+    // Everything fresh was filtered (self/allowlist/slash) and nothing is
+    // queued or in flight — fold the offsets forward now instead of leaving
+    // junk to block until a future push.
+    commitOffsets(pendingCommits);
+    pendingCommits = [];
+    return;
+  }
   // Tiered delivery: push only when the fresh batch contains a push-now
-  // trigger. A routine-only backlog stays queued (offsets untouched) so an
-  // idle agent is never woken — it rides the digest of the next trigger.
-  // Non-injectable-only batches still advance so junk isn't rescanned forever.
-  if (staged.msgs.length > 0 && !staged.msgs.some((m) => m.tier === "urgent")) return;
-  for (const commit of staged.commits) commit();
-  writeCursor(cur);
-  pending.push(...staged.msgs);
-  if (pending.length > 0) scheduleFlush();
+  // trigger. A routine-only backlog stays queued (on-disk cursor untouched)
+  // so an idle agent is never woken — it rides the digest of the next trigger.
+  const batch = tierQueue.ingest(staged.msgs);
+  if (!batch) return;
+  pending.push(...batch);
+  scheduleFlush();
 }
 
 function scheduleFlush() {
@@ -254,40 +301,27 @@ async function flush() {
   if (pending.length === 0) return;
   const batch = pending;
   pending = [];
+  const commits = pendingCommits;
+  pendingCommits = [];
   sending = true;
   try {
     await injectViaTmux(batch);
+    // Delivery confirmed — only now advance the shared on-disk cursor past
+    // everything this batch (including its coalesced routine) covers. Dying
+    // before this line means redelivery on restart, never loss.
+    commitOffsets(commits);
   } catch (e) {
     process.stderr.write(`[tmux-pusher] inject failed: ${e?.message ?? e}\n`);
     pending = [...batch, ...pending];
+    pendingCommits = [...commits, ...pendingCommits];
     scheduleFlush();
   } finally {
     sending = false;
   }
 }
 
-function formatBatch(batch) {
-  const line = (m) =>
-    `  [${m.kind} ${new Date(m.ts ?? Date.now()).toISOString()} from=${m.from}] ${m.text ?? ""}`;
-  const urgent = batch.filter((m) => m.tier !== "routine");
-  const routine = batch.filter((m) => m.tier === "routine");
-  const lines = [];
-  if (urgent.length > 0) {
-    lines.push(
-      "[agent-coord] incoming peer messages — already consumed from your inbox, do not call read_messages for them:",
-    );
-    for (const m of urgent) lines.push(line(m));
-  }
-  if (routine.length > 0) {
-    // ONE coalesced digest per push: the queued low-tier rides along with the
-    // trigger instead of ever waking the agent on its own.
-    lines.push(
-      `[agent-coord] digest — ${routine.length} routine message${routine.length === 1 ? "" : "s"} coalesced with this push (also consumed; FYI only, no reply expected):`,
-    );
-    for (const m of routine) lines.push(line(m));
-  }
-  return lines.join("\n");
-}
+// formatBatch lives in tier.mjs (pure, unit-tested): urgent verbatim under
+// the banner, then at most ONE coalesced digest block of queued routine.
 
 // Inject a batch, preserving order. Runs of ordinary peer messages go in as one
 // banner-wrapped paste; each control command (/clear, /compact) is injected on

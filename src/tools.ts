@@ -89,6 +89,10 @@ type Message = {
   // its operator. The tmux pushers inject these RAW (no banner/prefix) so the
   // TUI runs them as real slash commands; every other consumer ignores them.
   control?: boolean;
+  // Server-generated push-now override (e.g. the post-/clear identity
+  // reminder). Only server code can set this — send_message constructs the
+  // Message from fixed fields, so peers cannot smuggle it in.
+  urgent?: boolean;
 };
 
 type StatusEntry = {
@@ -531,6 +535,9 @@ function scheduleReminders(
           from,
           to: r,
           text: override ?? defaultReminderText(r),
+          // A just-cleared agent is contextless until this lands — it must
+          // push immediately, never queue behind the routine tier.
+          urgent: true,
         };
         await appendJsonl(inboxFile(r), reminder);
       } catch (e) {
