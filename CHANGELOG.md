@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.12.0] — 2026-07-03
+
+### Added
+- **Delivery tiers + digest batching in the pusher.** Only push-now traffic wakes an agent's pane: `BLOCKER:`, `DAVID_DECISION:`, literal `GO:` work orders, `SCOPE:`/`SCOPE CHANGE:` from trusted senders (coordinator/gate ids resolved from the registry), `DONE:` when the agent is a gate runner (QA/coordinator — from the registry role, re-resolved every 30s, `AGENT_COORD_GATE_RUNNER=1|0` overrides), control commands, and server-flagged urgent messages (the post-`/clear` identity reminder carries a non-spoofable `urgent: true` set server-side). Prefixes are literal and case-sensitive. All other traffic (`FYI:`/`AGENT_ACTION:`/`RISK:`/chatter) queues silently in memory and rides the next push as ONE coalesced `[agent-coord] digest` block — an idle agent with only low-tier backlog is never woken, so routine ops cost zero model tokens. **Zero-loss by construction:** the on-disk cursor (shared with `read_messages`) advances only after `tmux paste` is confirmed; a crash, `SIGTERM`, or pane-death self-exit before that rewinds to the cursor and redelivers on restart (at-least-once — duplicates are possible after a mid-flush crash, loss is not). Routine messages receive their delivery receipt when their digest lands, not before. The tier classifier and queue are pure and dependency-free (`hooks/tier.mjs`) with direct unit tests. `AGENT_COORD_TIERS=0` restores legacy push-everything.
+
 ## [0.11.0] — 2026-07-03
 
 ### Added
