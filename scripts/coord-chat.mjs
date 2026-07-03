@@ -43,6 +43,9 @@ import lockfile from "proper-lockfile";
 const args = parseArgs(process.argv.slice(2));
 let ID = args.id ?? process.env.USER ?? "human"; // reassignable so /nick can rebind it
 const ROOT = args.dir ?? process.env.AGENT_COORD_DIR ?? path.join(homedir(), "agent-coord");
+// Pin the env so a dynamically-imported dist tool (e.g. /doctor's doctorTool)
+// binds store.js's ROOT to the same dir when --dir overrode the default.
+process.env.AGENT_COORD_DIR = ROOT;
 
 // Message-rendering state + helpers. Declared up here (above the top-level
 // printRecent() call) so they're initialized before first use — const/let
@@ -186,6 +189,15 @@ const AGENT_COLORS = [
 ];
 // Will be initialized after ROOT is set, just below.
 
+// ---------- non-interactive --doctor ----------
+// `coord-chat --doctor [--fix]` runs the same health check as the MCP doctor
+// tool and prints its report, then exits — no registration, no TUI. Same
+// renderer as the /doctor slash command, so CLI and in-chat output match.
+if (args.doctor) {
+  const ok = await runDoctor(!!args.fix, (l) => process.stdout.write(l + "\n"));
+  process.exit(ok ? 0 : 1);
+}
+
 // ---------- register and start UI ----------
 
 await register();
@@ -219,7 +231,7 @@ const SLASH_COMMANDS = [
   "/dm", "/msg", "/list", "/who", "/whoami", "/whois", "/last", "/find",
   "/clear", "/cls", "/me", "/status", "/away", "/back", "/ignore", "/unignore",
   "/nick", "/join", "/part", "/leave", "/rooms", "/channels", "/topic", "/motd",
-  "/rules", "/prune", "/kick", "/wipe-room",
+  "/rules", "/prune", "/kick", "/wipe-room", "/doctor",
   "/help", "/?", "/quit", "/exit",
 ];
 
@@ -442,6 +454,9 @@ async function handleLine(line) {
       const term = text.slice(6).trim();
       if (!term) say(A.red("usage: /find <text>"));
       else await findInHistory(term);
+    } else if (text === "/doctor" || text.startsWith("/doctor ")) {
+      const fix = text.slice(7).trim() === "--fix";
+      await runDoctor(fix, say);
     } else if (text.startsWith("/")) {
       say(A.red(`unknown command: ${text.split(" ")[0]}`) + A.dim("  (try /help)"));
     } else {
@@ -477,10 +492,13 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--id") out.id = argv[++i];
     else if (argv[i] === "--dir") out.dir = argv[++i];
+    else if (argv[i] === "--doctor") out.doctor = true;
+    else if (argv[i] === "--fix") out.fix = true;
     else if (argv[i] === "-h" || argv[i] === "--help") {
       console.log("coord-chat — minimal TUI for agent-coord-mcp");
       console.log("usage: coord-chat [--id <name>] [--dir <path>]");
-      console.log("at prompt: <text>=room  /dm <id> <text>  /list  /quit");
+      console.log("       coord-chat --doctor [--fix]   health-check coord state, print report, exit");
+      console.log("at prompt: <text>=room  /dm <id> <text>  /list  /doctor  /quit");
       process.exit(0);
     }
   }
@@ -624,6 +642,7 @@ function printHelp() {
     ["/prune [days]",       "drop messages older than N days (default 7)"],
     ["/kick <agent>",       "unregister an agent + kill their pusher"],
     ["/wipe-room",          "truncate the current channel (destructive)"],
+    ["/doctor [--fix]",     "health-check coord state (--fix auto-remediates)"],
     [A.dim("---"),          ""],
     ["/help, /?",           "this list"],
     ["/quit [msg], /exit",  "unregister and leave"],
@@ -733,6 +752,44 @@ async function postStatus(status) {
   const entry = { id: randomUUID(), ts: Date.now(), agentId: ID, status };
   appendFileSync(STATUS_FILE_PATH, JSON.stringify(entry) + "\n");
   say(A.dim(`→ status posted: ${status}`));
+}
+
+// Run the shared doctor health check and render its structured report through
+// `emit` (say for the TUI, console for CLI). Delegates to the compiled MCP
+// doctorTool so the output is the single source of truth — no reimplemented,
+// drift-prone checks. Returns true when nothing is at error level. `emit` is
+// injected so the same renderer serves both /doctor and `--doctor`.
+async function runDoctor(fix, emit) {
+  let doctorTool;
+  try {
+    ({ doctorTool } = await import(new URL("../dist/tools.js", import.meta.url)));
+  } catch (e) {
+    emit(A.red(`/doctor unavailable: could not load the doctor tool (${e?.message ?? e}).`));
+    emit(A.dim("  This build may be missing dist/ — run `npm run build` in the package."));
+    return false;
+  }
+  const icon = { ok: A.green("✓"), warn: A.yellow("!"), error: A.red("✗") };
+  const res = await doctorTool({ fix });
+  emit(
+    A.bold("coord doctor") +
+      A.dim(`  root=${res.root}`) +
+      (fix ? A.dim("  (--fix applied)") : ""),
+  );
+  for (const f of res.findings) {
+    emit(`  ${icon[f.level] ?? "?"} ${A.bold(f.check)}  ${f.detail}`);
+    for (const item of f.items ?? []) emit(A.dim(`      - ${item}`));
+  }
+  for (const done of res.fixed ?? []) emit(A.green(`  fixed: ${done}`));
+  const s = res.summary;
+  emit(
+    A.dim("  ") +
+      `${A.green(`${s.ok} ok`)}  ${A.yellow(`${s.warn} warn`)}  ${A.red(`${s.error} error`)}` +
+      (res.healthy ? A.green("  — healthy") : A.red("  — needs attention")),
+  );
+  if (!fix && res.findings.some((f) => f.fixable && f.level !== "ok")) {
+    emit(A.dim("  run /doctor --fix to auto-remediate fixable findings"));
+  }
+  return res.summary.error === 0;
 }
 
 async function pruneOld(days) {

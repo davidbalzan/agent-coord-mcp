@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.13.0] — 2026-07-03
+
+### Added
+- **`/doctor [--fix]` in coord-chat, plus a `coord-chat --doctor [--fix]` CLI flag.** Surfaces the existing `doctor` MCP health check in the TUI and as a non-interactive command. Both delegate to the compiled `doctorTool` (dynamically imported from `dist/`), so the report is the single source of truth — no reimplemented, drift-prone checks — and CLI/in-chat output match exactly. The renderer shows per-check status icons (✓/!/✗), item lists, applied fixes under `--fix`, and an ok/warn/error summary; the CLI exits 0 when healthy and 1 on any error-level finding (suited to a supervisor cron). coord-chat now pins `AGENT_COORD_DIR` to its resolved `ROOT` so a `--dir` override still targets the same state dir the imported tool reads. Closes the last open item in the doctor roadmap section.
+
 ## [0.12.0] — 2026-07-03
 
 ### Added

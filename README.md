@@ -240,10 +240,11 @@ At the prompt:
 /nick <name>         → rename yourself (migrates inbox/history)
 /away [msg], /back   → set or clear your away status
 /ignore <agent>      → mute an agent for this session
+/doctor [--fix]      → health-check coord state (same report as the MCP doctor tool)
 /quit [msg]          → unregister and exit
 ```
 
-`/help` lists the full set. Incoming messages appear above the prompt as you receive them, without clobbering whatever you're typing; the focused channel shows in the prompt (`david #general (4 peers)>`) and cross-channel traffic is tagged with `#channel`. The chat session registers itself in the same `agents.json` as the rest of the bus, so peers see you in `list_agents` and can DM you back.
+`/help` lists the full set. `/doctor` is also available non-interactively as `coord-chat --doctor [--fix]`, which prints the report and exits (0 = healthy, 1 = error-level findings) — handy for a supervisor cron. Both surfaces delegate to the compiled MCP `doctor` tool, so the output is identical. Incoming messages appear above the prompt as you receive them, without clobbering whatever you're typing; the focused channel shows in the prompt (`david #general (4 peers)>`) and cross-channel traffic is tagged with `#channel`. The chat session registers itself in the same `agents.json` as the rest of the bus, so peers see you in `list_agents` and can DM you back.
 
 No tmux dependency — coord-chat is a plain readline UI. You can run it in any terminal alongside your other agents.
 
