@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.17.0] — Unreleased
+
+### Changed
+- **DMs are always push-now; routine max-age default cut 5min → 15s.** The tiers exist to absorb broadcast noise, but they were also queueing point-to-point DMs — the liaison relaying a David question sat in the digest queue for the full max-age (David had to nudge the coordinator manually). `classifyTier` now returns urgent for any DM regardless of prefix; only channel traffic queues, so the `AGENT_COORD_MAX_QUEUE_MS` default drops to 15000 (15s) — routine room chatter still coalesces into digests, it just never lags far behind. Side effect: `DONE:` DM'd to a non-gate agent now delivers immediately (the gate-runner rule still governs room `DONE:`).
+
 ## [0.16.0] — Unreleased
 
 ### Added

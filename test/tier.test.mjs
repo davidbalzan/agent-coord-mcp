@@ -43,12 +43,17 @@ test("routine traffic queues silently", () => {
   assert.equal(classifyTier({ kind: "room #proj", from: "peer" }), "routine"); // no text
 });
 
-test("DONE: routes to the gate runner only — DM or room alike", () => {
+test("DONE: in a room routes to the gate runner only (DMs are always urgent)", () => {
   const done = "DONE: owner/repo#7 — merged scope, 12/12 green";
-  assert.equal(classifyTier(dm(done)), "routine"); // non-gate worker, even DM'd
+  assert.equal(classifyTier(dm(done)), "urgent"); // DM — push-now regardless of gate
   assert.equal(classifyTier(room(done)), "routine");
-  assert.equal(classifyTier(dm(done), { gateRunner: true }), "urgent");
   assert.equal(classifyTier(room(done), { gateRunner: true }), "urgent");
+});
+
+test("DMs are always urgent — point-to-point asks never queue", () => {
+  assert.equal(classifyTier(dm("unprefixed relay of a David question")), "urgent");
+  assert.equal(classifyTier(dm("FYI: even low-priority DMs push now")), "urgent");
+  assert.equal(classifyTier(room("unprefixed chatter stays routine")), "routine");
 });
 
 test("SCOPE: is honored only from trusted (coordinator/gate) senders", () => {
@@ -70,7 +75,7 @@ test("server-set urgent flag pushes regardless of text; not text-spoofable", () 
   assert.equal(classifyTier(dm("[agent-coord] context reset by /clear…", { urgent: true })), "urgent");
   assert.equal(classifyTier(dm("anything at all", { urgent: true })), "urgent");
   // The flag must be the boolean true set server-side, not truthy text games.
-  assert.equal(classifyTier(dm("FYI: fake", { urgent: "yes" })), "routine");
+  assert.equal(classifyTier(room("FYI: fake", { urgent: "yes" })), "routine");
   // system join/part notices stay routine.
   assert.equal(classifyTier(room("worker-9 has joined", { system: true })), "routine");
 });

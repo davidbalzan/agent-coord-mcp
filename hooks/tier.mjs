@@ -14,6 +14,11 @@ export function classifyTier(m, opts = {}) {
   // Server-set push-now override (post-/clear reminder). send_message builds
   // Messages from fixed fields, so a peer cannot smuggle this flag in.
   if (m.urgent === true) return "urgent";
+  // DMs are always push-now: they're addressed to this agent by a peer who
+  // wants it specifically, and DM volume is tiny next to room traffic. The
+  // tiers exist to absorb broadcast noise, not point-to-point asks (the
+  // liaison relaying a David question must not sit in a digest queue).
+  if (m.kind === "DM") return "urgent";
   if (typeof m.text !== "string") return "routine";
   const text = m.text.trimStart();
   // Control/slash commands are injected raw and must fire immediately.

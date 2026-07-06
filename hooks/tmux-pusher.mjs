@@ -19,9 +19,9 @@
  *   AGENT_COORD_DEBOUNCE_MS   coalesce window for bursts (default 1000)
  *   AGENT_COORD_POLL_MS       fallback poll interval (default 1000)
  *   AGENT_COORD_TARGET_GRACE  missed pane probes before self-exit (default 3)
- *   AGENT_COORD_MAX_QUEUE_MS  max time routine traffic may queue without an
- *                             urgent trigger before it flushes as a digest
- *                             (default 300000 = 5min; 0 disables)
+ *   AGENT_COORD_MAX_QUEUE_MS  max time routine (channel) traffic may queue
+ *                             without an urgent trigger before it flushes as
+ *                             a digest (default 15000 = 15s; 0 disables)
  *
  * Safety:
  *   - drops messages where from === AGENT_COORD_ID (no self-echo)
@@ -89,8 +89,9 @@ const TIERS_ENABLED = process.env.AGENT_COORD_TIERS !== "0";
 // Max-age flush: routine traffic never waits longer than this for an urgent
 // trigger — once the oldest queued message is overdue, the backlog flushes as
 // a routine-only digest. Bounds the silent-fleet failure mode where FYI:/DONE:
-// chatter queues forever because nothing urgent ever arrives.
-const MAX_QUEUE_MS = parseInt(process.env.AGENT_COORD_MAX_QUEUE_MS || "300000", 10);
+// chatter queues forever because nothing urgent ever arrives. Only channel
+// traffic queues (DMs are push-now), so the default is short.
+const MAX_QUEUE_MS = parseInt(process.env.AGENT_COORD_MAX_QUEUE_MS || "15000", 10);
 // Gate runners (QA/coordinator) receive DONE: as push-now; countersigned
 // SCOPE: changes are honored only from these trusted ids. Re-resolved from
 // the registry every 30s so a role change doesn't strand a stale pusher;
