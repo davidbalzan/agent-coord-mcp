@@ -21,6 +21,16 @@
   — it has been flagged "intentional" in this environment, but reads as a defect; confirm before fixing.
 
 ### P2 — protocol/tooling gaps
+- [P2] **Guard first-use identity binding against claiming a live agent id.** A fresh MCP session
+  binds to the first agentId it sees (when `AGENT_COORD_BOUND_AGENT` is unset) — even a diagnostic
+  `status {agentId}` call claims it, silently creating a second session acting as an
+  already-registered, heartbeating agent (hit live 2026-07-06: a dev session in the repo bound
+  itself to `disavow-liaison`; its sends were attributed to the real liaison and a `read_messages`
+  would have stolen from the shared cursor). Done-def: (1) binding to an id with a fresh heartbeat
+  or live transport marker requires that agent's token (Phase 9 `coord-token`) or an explicit
+  `force` flag; (2) read-only tools (`status`, `ping`) never establish a binding; (3) `doctor`
+  warns when two live sessions have bound the same id (needs a per-session bind ledger, e.g.
+  `binds/<session>.json`).
 - [P2] **`coord-chat /doctor` command surface.** The `doctor` MCP tool shipped (v0.7.2) but the ROADMAP
   doctor section lists "still open: the coord-chat /doctor command." Done-def: `/doctor [--fix]` command
   in `coord-chat.mjs` rendering the structured report, plus a CLI flag; matches the MCP tool's output.
