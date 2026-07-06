@@ -1,3 +1,5 @@
+import { adjustCursors } from "./admin.js";
+import { ARCHIVE_STATUS_FILE, archiveJsonl, archiveRoomFile } from "../store.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, openSync, watch } from "node:fs";
 import { promises as fsp } from "node:fs";
@@ -72,6 +74,7 @@ export const sendMessageSchema = {
   to: z.string().optional(),
   room: z.string().optional(),
   text: z.string().min(1),
+  kind: z.enum(["decision", "status", "chatter"]).optional(),
 };
 
 export async function sendMessageTool(args: {
@@ -79,6 +82,7 @@ export async function sendMessageTool(args: {
   to?: string;
   room?: string;
   text: string;
+  kind?: "decision" | "status" | "chatter";
 }) {
   // DM → inbox. Otherwise resolve the channel (default `general`), make sure it
   // exists in the registry, and tag the message with its channel.
@@ -110,10 +114,62 @@ export async function sendMessageTool(args: {
     from: args.from,
     room: chan,
     text: args.text,
+    ...(args.kind ? { kind: args.kind } : {}),
   };
   const target = roomFile(chan);
   await appendJsonl(target, msg);
+  await maybeCompactRoom(chan);
   return { ok: true, id: msg.id, target, room: chan };
+}
+
+// ---------- live compaction (self-limiting streams) ----------
+
+// Rooms and the status stream compact themselves on write: once a live file
+// grows past its threshold, the oldest entries move to the archive (never
+// deleted) and every cursor shifts down. Fresh decisions (< decisionDays old)
+// are exempt — they stay in the live file. Cursor adjustment subtracts the
+// full removed count, so an agent parked behind a kept decision may re-read
+// it once; at-least-once beats silently skipping.
+function envInt(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+const ROOM_COMPACT_THRESHOLD = envInt("AGENT_COORD_ROOM_MAX", 1000);
+const ROOM_COMPACT_KEEP = envInt("AGENT_COORD_ROOM_KEEP", 500);
+const STATUS_COMPACT_THRESHOLD = envInt("AGENT_COORD_STATUS_MAX", 2000);
+const STATUS_COMPACT_KEEP = envInt("AGENT_COORD_STATUS_KEEP", 1000);
+// Skip the entry count entirely while the file is small — the common case on
+// every send. ~150 bytes/entry means the threshold can't be hit below this.
+const COMPACT_SIZE_GATE = 100 * 1024;
+const DECISION_FRESH_MS = 30 * 24 * 60 * 60 * 1000;
+
+async function maybeCompactRoom(chan: string): Promise<void> {
+  const file = roomFile(chan);
+  if ((await fileSize(file)) < COMPACT_SIZE_GATE) return;
+  const entries = await readJsonl<Message>(file);
+  if (entries.length <= ROOM_COMPACT_THRESHOLD) return;
+  const boundaryTs = entries[entries.length - ROOM_COMPACT_KEEP]!.ts;
+  const decisionCutoff = Date.now() - DECISION_FRESH_MS;
+  const r = await archiveJsonl<Message>(
+    file,
+    archiveRoomFile(chan),
+    (e) => e.ts >= boundaryTs || (e.kind === "decision" && e.ts > decisionCutoff)
+  );
+  if (r.removed > 0) await adjustCursors({ roomRemovedByChan: { [chan]: r.removed } });
+}
+
+async function maybeCompactStatus(): Promise<void> {
+  if ((await fileSize(STATUS_FILE)) < COMPACT_SIZE_GATE) return;
+  const entries = await readJsonl<StatusEntry>(STATUS_FILE);
+  if (entries.length <= STATUS_COMPACT_THRESHOLD) return;
+  const boundaryTs = entries[entries.length - STATUS_COMPACT_KEEP]!.ts;
+  const r = await archiveJsonl<StatusEntry>(
+    STATUS_FILE,
+    ARCHIVE_STATUS_FILE,
+    (e) => e.ts >= boundaryTs
+  );
+  if (r.removed > 0) await adjustCursors({ statusRemoved: r.removed });
 }
 
 // ---------- read_messages ----------
@@ -229,7 +285,16 @@ function digestOverflow(over: (Message | StatusEntry)[], hash: string | undefine
   const tail = hash
     ? ` hash=${hash}] — call retrieve_room_history(hash="${hash}") to expand`
     : `] — read without peek to get an expandable hash`;
-  return head + tail;
+  // Decisions are the one thing a digest must not bury — quote them verbatim
+  // (capped) below the summary line.
+  const decisions = over.filter((m): m is Message => (m as Message).kind === "decision");
+  const quoted = decisions
+    .slice(-5)
+    .map((d) => `  [decision] ${d.from}: ${d.text.length > 200 ? d.text.slice(0, 200) + "…" : d.text}`);
+  const decisionBlock = decisions.length
+    ? `\n${quoted.join("\n")}${decisions.length > 5 ? `\n  (+${decisions.length - 5} earlier decisions in hash)` : ""}`
+    : "";
+  return head + tail + decisionBlock;
 }
 
 // ---------- retrieve_room_history ----------
@@ -286,6 +351,7 @@ export async function postStatusTool(args: { agentId: string; status: string; de
     detail: args.detail,
   };
   await appendJsonl(STATUS_FILE, entry);
+  await maybeCompactStatus();
   return { ok: true, id: entry.id };
 }
 

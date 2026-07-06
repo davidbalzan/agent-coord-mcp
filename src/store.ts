@@ -44,6 +44,17 @@ export const ROOMS_DIR = path.join(ROOT, "rooms");
 export const ROOMS_FILE = path.join(ROOT, "rooms.json");
 export const DEFAULT_ROOM = "general";
 
+// Cold storage (v0.15.0). Nothing on the bus is ever deleted by prune or
+// compaction — aged-out entries are APPENDED here first, one file per room
+// (general included, despite its live file being the legacy room.jsonl), plus
+// status.jsonl and inbox/<agent>.jsonl. The server never reads these back;
+// they exist for offline analysis of what happened in a room. Receipts are
+// the one exception: delivery proofs carry no analysis value and are deleted.
+export const ARCHIVE_DIR = path.join(ROOT, "archive");
+export const ARCHIVE_ROOMS_DIR = path.join(ARCHIVE_DIR, "rooms");
+export const ARCHIVE_INBOX_DIR = path.join(ARCHIVE_DIR, "inbox");
+export const ARCHIVE_STATUS_FILE = path.join(ARCHIVE_DIR, "status.jsonl");
+
 // Per-agent token map for identity-bound bus auth (v0.7.0). Shape on disk:
 //   { "alice": "tk_<random-secret>", "bob": "tk_<another-secret>" }
 // HTTP transport reverse-looks-up the bearer to bind the session to an
@@ -336,6 +347,57 @@ export async function rewriteJsonl<T>(
     }
     await fs.writeFile(file, out.length ? out.join("\n") + "\n" : "", "utf8");
     return { kept, removed };
+  });
+}
+
+// Archive destinations for each live JSONL stream.
+export function archiveRoomFile(chan: string): string {
+  return path.join(ARCHIVE_ROOMS_DIR, `${sanitize(normalizeRoom(chan))}.jsonl`);
+}
+
+export function archiveInboxFile(agentId: string): string {
+  return path.join(ARCHIVE_INBOX_DIR, `${sanitize(agentId)}.jsonl`);
+}
+
+// Like rewriteJsonl, but entries failing the filter are appended to
+// archiveFile instead of discarded. The archive append happens under the
+// source-file lock and BEFORE the rewrite, so a crash mid-operation can at
+// worst duplicate entries into the archive — never lose them. Malformed
+// lines are archived verbatim rather than parsed.
+export async function archiveJsonl<T>(
+  file: string,
+  archiveFile: string,
+  filter: (entry: T) => boolean
+): Promise<{ kept: number; removed: number; archived: number }> {
+  if (!existsSync(file)) return { kept: 0, removed: 0, archived: 0 };
+  return withLock(file, async () => {
+    const raw = await fs.readFile(file, "utf8");
+    let kept = 0;
+    let removed = 0;
+    const keep: string[] = [];
+    const archive: string[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line) as T;
+        if (filter(entry)) {
+          keep.push(line);
+          kept++;
+        } else {
+          archive.push(line);
+          removed++;
+        }
+      } catch {
+        archive.push(line);
+        removed++;
+      }
+    }
+    if (archive.length) {
+      await fs.mkdir(path.dirname(archiveFile), { recursive: true });
+      await fs.appendFile(archiveFile, archive.join("\n") + "\n", "utf8");
+    }
+    await fs.writeFile(file, keep.length ? keep.join("\n") + "\n" : "", "utf8");
+    return { kept, removed, archived: archive.length };
   });
 }
 

@@ -1,175 +1,70 @@
-import { randomUUID } from "node:crypto";
-import { existsSync, openSync, watch } from "node:fs";
-import { promises as fsp } from "node:fs";
-import { spawn, spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import path from "node:path";
 import {
   AGENTS_FILE,
+  ARCHIVE_STATUS_FILE,
   CURSOR_DIR,
   DEFAULT_ROOM,
   INBOX_DIR,
-  ROOT,
-  ROOM_FILE,
-  ROOMS_DIR,
   ROOMS_FILE,
   STATUS_FILE,
-  addMember,
-  appendJsonl,
-  cursorFile,
+  archiveInboxFile,
+  archiveJsonl,
+  archiveRoomFile,
   deleteFile,
-  ensureRoom,
-  fileSize,
   getRooms,
-  inboxFile,
   listCursorFiles,
   listInboxFiles,
-  listTransportFiles,
-  logFile,
-  memberRooms,
+  listReceiptFiles,
   normalizeRoom,
-  pidFile,
+  pruneHistory,
   readJson,
   readJsonl,
-  receiptFile,
-  listReceiptFiles,
-  removeMember,
   rewriteJsonl,
   roomFile,
-  rotateAgentToken,
-  setRoomMeta,
-  stashHistory,
-  retrieveHistory,
-  pruneHistory,
-  transportFile,
-  TRANSPORT_DIR,
   updateJson,
   type RoomRegistry,
 } from "../store.js";
 import {
-  type AgentEntry,
   type AgentRegistry,
+  type Cursor,
   type Message,
   type StatusEntry,
-  type Cursor,
-  type Source,
-  type TransportMarker,
-  sourceFile,
-  getOffset,
-  setOffset,
-  sysMsg,
-  moveFile,
-  STALE_MS,
-  EVICT_MS,
-  MAX_WAIT_MS,
 } from "./shared.js";
 
 // ---------- prune ----------
 
+export const PRUNE_TARGETS = ["rooms", "status", "inbox", "receipts", "members"] as const;
+export type PruneTarget = (typeof PRUNE_TARGETS)[number];
+
 export const pruneSchema = {
   olderThanDays: z.number().positive().max(365).optional(),
+  decisionDays: z.number().positive().max(365).optional(),
+  room: z.string().optional(),
+  targets: z.array(z.enum(PRUNE_TARGETS)).optional(),
   removeOrphanInboxes: z.boolean().optional(),
+  archiveEmptyRooms: z.boolean().optional(),
   dryRun: z.boolean().optional(),
 };
 
-export async function pruneTool(args: {
-  olderThanDays?: number;
-  removeOrphanInboxes?: boolean;
-  dryRun?: boolean;
-}) {
-  const days = args.olderThanDays ?? 7;
-  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-  const dryRun = args.dryRun ?? false;
+// Retention predicate: kind="decision" messages live by the (longer)
+// decision cutoff; everything else by the standard cutoff.
+function keepEntry(e: { ts: number; kind?: string }, cutoff: number, decisionCutoff: number): boolean {
+  return e.kind === "decision" ? e.ts > decisionCutoff : e.ts > cutoff;
+}
 
-  const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
-  const knownAgents = new Set(Object.keys(reg));
-
-  const channels = Object.keys(await getRooms());
-
-  if (dryRun) {
-    let roomMessages = 0;
-    for (const chan of channels) {
-      const msgs = await readJsonl<Message>(roomFile(chan));
-      roomMessages += msgs.filter((e) => e.ts <= cutoff).length;
-    }
-    const status = await readJsonl<StatusEntry>(STATUS_FILE);
-    const inboxFiles = await listInboxFiles();
-    let inboxRemoved = 0;
-    const orphans: string[] = [];
-    for (const fname of inboxFiles) {
-      const id = fname.replace(/\.jsonl$/, "");
-      if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) orphans.push(fname);
-      const entries = await readJsonl<Message>(path.join(INBOX_DIR, fname));
-      inboxRemoved += entries.filter((e) => e.ts <= cutoff).length;
-    }
-    const rooms = await getRooms();
-    const orphanMembers = new Set<string>();
-    for (const e of Object.values(rooms)) {
-      for (const m of e.members ?? []) if (!knownAgents.has(m)) orphanMembers.add(m);
-    }
-    let receiptsRemoved = 0;
-    const orphanReceipts: string[] = [];
-    for (const filePath of await listReceiptFiles()) {
-      const id = path.basename(filePath).replace(/\.jsonl$/, "");
-      const entries = await readJsonl<{ ts: number }>(filePath);
-      if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) orphanReceipts.push(id);
-      receiptsRemoved += entries.filter((e) => e.ts <= cutoff).length;
-    }
-    return {
-      dryRun: true,
-      cutoff,
-      olderThanDays: days,
-      wouldRemove: {
-        roomMessages,
-        statusEntries: status.filter((e) => e.ts <= cutoff).length,
-        inboxMessages: inboxRemoved,
-        orphanInboxes: orphans,
-        orphanMembers: [...orphanMembers],
-        receipts: receiptsRemoved,
-        orphanReceipts,
-      },
-    };
-  }
-
-  // Per-channel removed counts so we can shift the matching offset in each
-  // cursor (default channel → roomOffset, others → roomOffsets[chan]).
-  const roomRemovedByChan: Record<string, number> = {};
-  let roomRemovedTotal = 0;
-  for (const chan of channels) {
-    const r = await rewriteJsonl<Message>(roomFile(chan), (e) => e.ts > cutoff);
-    if (r.removed > 0) {
-      roomRemovedByChan[chan] = r.removed;
-      roomRemovedTotal += r.removed;
-    }
-  }
-  const statusResult = await rewriteJsonl<StatusEntry>(STATUS_FILE, (e) => e.ts > cutoff);
-
-  const inboxFiles = await listInboxFiles();
-  let inboxRemoved = 0;
-  const deletedOrphans: string[] = [];
-  // perAgentInboxRemoved: how many entries were stripped from each *kept* agent's
-  // inbox, so we can shift only that agent's inboxOffset cursor below.
-  const perAgentInboxRemoved: Record<string, number> = {};
-  for (const fname of inboxFiles) {
-    const id = fname.replace(/\.jsonl$/, "");
-    const filePath = path.join(INBOX_DIR, fname);
-    if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) {
-      const entries = await readJsonl<Message>(filePath);
-      inboxRemoved += entries.length;
-      await deleteFile(filePath);
-      deletedOrphans.push(id);
-      continue;
-    }
-    const r = await rewriteJsonl<Message>(filePath, (e) => e.ts > cutoff);
-    inboxRemoved += r.removed;
-    perAgentInboxRemoved[id] = r.removed;
-  }
-
-  // Cursor adjustment: appendJsonl is time-ordered and rewriteJsonl removes
-  // the oldest entries (ts <= cutoff). Any cursor offset shifts down by the
-  // removed count, clamped at 0. Without this, an offset past the new file
-  // length would make read_messages return [] forever.
+// Shift every agent's cursor offsets down by the number of entries removed
+// ahead of them (append-only + oldest-first removal ⇒ plain subtraction,
+// clamped at 0). Shared by prune and live compaction — without this, an
+// offset past the new file length makes read_messages return [] forever.
+export async function adjustCursors(removals: {
+  roomRemovedByChan?: Record<string, number>;
+  statusRemoved?: number;
+  perAgentInboxRemoved?: Record<string, number>;
+}): Promise<string[]> {
+  const roomRemovedByChan = removals.roomRemovedByChan ?? {};
+  const statusRemoved = removals.statusRemoved ?? 0;
+  const perAgentInboxRemoved = removals.perAgentInboxRemoved ?? {};
   const cursorsAdjusted: string[] = [];
   for (const cname of await listCursorFiles()) {
     const id = cname.replace(/\.json$/, "");
@@ -187,8 +82,8 @@ export async function pruneTool(args: {
           touched = true;
         }
       }
-      if (current.statusOffset !== undefined && statusResult.removed > 0) {
-        current.statusOffset = Math.max(0, current.statusOffset - statusResult.removed);
+      if (current.statusOffset !== undefined && statusRemoved > 0) {
+        current.statusOffset = Math.max(0, current.statusOffset - statusRemoved);
         touched = true;
       }
       const myInboxRemoved = perAgentInboxRemoved[id] ?? 0;
@@ -200,40 +95,229 @@ export async function pruneTool(args: {
     });
     if (touched) cursorsAdjusted.push(id);
   }
+  return cursorsAdjusted;
+}
 
-  // Compact channel memberships: drop any member no longer in the registry so
-  // list_rooms / joinedRooms() stop surfacing ghosts (mirrors orphan-inbox
-  // cleanup). Empty non-default channels are left in place — their history may
-  // still matter and `general` must always persist.
-  const orphanMembers = new Set<string>();
-  await updateJson<RoomRegistry>(ROOMS_FILE, {}, (current) => {
-    for (const e of Object.values(current)) {
-      const before = e.members?.length ?? 0;
-      if (before === 0) continue;
-      e.members = (e.members ?? []).filter((m) => {
-        const keep = knownAgents.has(m);
-        if (!keep) orphanMembers.add(m);
-        return keep;
-      });
+export async function pruneTool(args: {
+  olderThanDays?: number;
+  decisionDays?: number;
+  room?: string;
+  targets?: PruneTarget[];
+  removeOrphanInboxes?: boolean;
+  archiveEmptyRooms?: boolean;
+  dryRun?: boolean;
+}) {
+  const days = args.olderThanDays ?? 7;
+  const decisionDays = args.decisionDays ?? 30;
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const decisionCutoff = Date.now() - decisionDays * 24 * 60 * 60 * 1000;
+  const dryRun = args.dryRun ?? false;
+  // room-scoped prune touches only that channel's messages; targets narrows
+  // the sweep otherwise. Default remains "everything".
+  const scopedRoom = args.room ? normalizeRoom(args.room) : undefined;
+  const targets = new Set<PruneTarget>(
+    scopedRoom ? ["rooms"] : args.targets ?? [...PRUNE_TARGETS]
+  );
+  const keep = (e: { ts: number; kind?: string }) => keepEntry(e, cutoff, decisionCutoff);
+
+  const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
+  const knownAgents = new Set(Object.keys(reg));
+  // A member is stale when its agent is gone from the registry (orphan) or
+  // hasn't heartbeated since the cutoff (dead session).
+  const staleAgent = (m: string) => !knownAgents.has(m) || (reg[m]?.lastHeartbeat ?? 0) <= cutoff;
+
+  const channels = scopedRoom ? [scopedRoom] : Object.keys(await getRooms());
+
+  if (dryRun) {
+    let roomMessages = 0;
+    if (targets.has("rooms")) {
+      for (const chan of channels) {
+        const msgs = await readJsonl<Message>(roomFile(chan));
+        roomMessages += msgs.filter((e) => !keep(e)).length;
+      }
     }
-    return current;
+    const status = targets.has("status") ? await readJsonl<StatusEntry>(STATUS_FILE) : [];
+    let inboxRemoved = 0;
+    const orphans: string[] = [];
+    if (targets.has("inbox")) {
+      for (const fname of await listInboxFiles()) {
+        const id = fname.replace(/\.jsonl$/, "");
+        if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) orphans.push(fname);
+        const entries = await readJsonl<Message>(path.join(INBOX_DIR, fname));
+        inboxRemoved += entries.filter((e) => e.ts <= cutoff).length;
+      }
+    }
+    const orphanMembers = new Set<string>();
+    const staleMembers = new Set<string>();
+    const emptyRooms: string[] = [];
+    if (targets.has("members")) {
+      const rooms = await getRooms();
+      for (const [chan, e] of Object.entries(rooms)) {
+        const remaining: string[] = [];
+        for (const m of e.members ?? []) {
+          if (!knownAgents.has(m)) orphanMembers.add(m);
+          else if (staleAgent(m)) staleMembers.add(m);
+          else remaining.push(m);
+        }
+        if (
+          (args.archiveEmptyRooms ?? true) &&
+          chan !== DEFAULT_ROOM &&
+          remaining.length === 0
+        ) {
+          const msgs = await readJsonl<Message>(roomFile(chan));
+          const lastTs = msgs[msgs.length - 1]?.ts ?? 0;
+          if (lastTs <= cutoff) emptyRooms.push(chan);
+        }
+      }
+    }
+    let receiptsRemoved = 0;
+    const orphanReceipts: string[] = [];
+    if (targets.has("receipts")) {
+      for (const filePath of await listReceiptFiles()) {
+        const id = path.basename(filePath).replace(/\.jsonl$/, "");
+        const entries = await readJsonl<{ ts: number }>(filePath);
+        if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) orphanReceipts.push(id);
+        receiptsRemoved += entries.filter((e) => e.ts <= cutoff).length;
+      }
+    }
+    return {
+      dryRun: true,
+      cutoff,
+      olderThanDays: days,
+      decisionDays,
+      ...(scopedRoom ? { room: scopedRoom } : {}),
+      wouldRemove: {
+        roomMessages,
+        statusEntries: status.filter((e) => e.ts <= cutoff).length,
+        inboxMessages: inboxRemoved,
+        orphanInboxes: orphans,
+        orphanMembers: [...orphanMembers],
+        staleMembers: [...staleMembers],
+        archivedRooms: emptyRooms,
+        receipts: receiptsRemoved,
+        orphanReceipts,
+      },
+    };
+  }
+
+  // Per-channel removed counts so we can shift the matching offset in each
+  // cursor (default channel → roomOffset, others → roomOffsets[chan]).
+  // Aged-out entries are archived to archive/rooms/<chan>.jsonl, never deleted.
+  const roomRemovedByChan: Record<string, number> = {};
+  let roomRemovedTotal = 0;
+  if (targets.has("rooms")) {
+    for (const chan of channels) {
+      const r = await archiveJsonl<Message>(roomFile(chan), archiveRoomFile(chan), keep);
+      if (r.removed > 0) {
+        roomRemovedByChan[chan] = r.removed;
+        roomRemovedTotal += r.removed;
+      }
+    }
+  }
+  const statusResult = targets.has("status")
+    ? await archiveJsonl<StatusEntry>(STATUS_FILE, ARCHIVE_STATUS_FILE, (e) => e.ts > cutoff)
+    : { kept: 0, removed: 0, archived: 0 };
+
+  let inboxRemoved = 0;
+  const deletedOrphans: string[] = [];
+  // perAgentInboxRemoved: how many entries were stripped from each *kept* agent's
+  // inbox, so we can shift only that agent's inboxOffset cursor below.
+  const perAgentInboxRemoved: Record<string, number> = {};
+  if (targets.has("inbox")) {
+    for (const fname of await listInboxFiles()) {
+      const id = fname.replace(/\.jsonl$/, "");
+      const filePath = path.join(INBOX_DIR, fname);
+      if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) {
+        // Orphan inbox: archive everything it held, then drop the live file.
+        const r = await archiveJsonl<Message>(filePath, archiveInboxFile(id), () => false);
+        inboxRemoved += r.removed;
+        await deleteFile(filePath);
+        deletedOrphans.push(id);
+        continue;
+      }
+      const r = await archiveJsonl<Message>(filePath, archiveInboxFile(id), (e) => e.ts > cutoff);
+      inboxRemoved += r.removed;
+      perAgentInboxRemoved[id] = r.removed;
+    }
+  }
+
+  const cursorsAdjusted = await adjustCursors({
+    roomRemovedByChan,
+    statusRemoved: statusResult.removed,
+    perAgentInboxRemoved,
   });
 
-  // Receipts are out-of-band proof logs with no cursor — trim old entries by ts
-  // and delete logs for agents no longer registered. No offset adjustment needed.
+  // Membership sweep: drop orphans (not in registry) and stale members (no
+  // heartbeat since cutoff) so list_rooms / joinedRooms() stop surfacing
+  // ghosts. Then archive non-default rooms left with no members and no
+  // activity since the cutoff: remaining messages move to the archive, the
+  // room leaves the registry, and every cursor forgets its offset — the same
+  // cleanup delete_room performs, minus the data loss.
+  const orphanMembers = new Set<string>();
+  const staleMembers = new Set<string>();
+  const archivedRooms: string[] = [];
+  if (targets.has("members")) {
+    await updateJson<RoomRegistry>(ROOMS_FILE, {}, (current) => {
+      for (const e of Object.values(current)) {
+        if ((e.members?.length ?? 0) === 0) continue;
+        e.members = (e.members ?? []).filter((m) => {
+          if (!knownAgents.has(m)) {
+            orphanMembers.add(m);
+            return false;
+          }
+          if (staleAgent(m)) {
+            staleMembers.add(m);
+            return false;
+          }
+          return true;
+        });
+      }
+      return current;
+    });
+
+    if (args.archiveEmptyRooms ?? true) {
+      const rooms = await getRooms();
+      for (const [chan, e] of Object.entries(rooms)) {
+        if (chan === DEFAULT_ROOM || (e.members?.length ?? 0) > 0) continue;
+        const file = roomFile(chan);
+        const msgs = await readJsonl<Message>(file);
+        const lastTs = msgs[msgs.length - 1]?.ts ?? 0;
+        if (lastTs > cutoff) continue;
+        await archiveJsonl<Message>(file, archiveRoomFile(chan), () => false);
+        await deleteFile(file);
+        await updateJson<RoomRegistry>(ROOMS_FILE, {}, (current) => {
+          delete current[chan];
+          return current;
+        });
+        for (const cname of await listCursorFiles()) {
+          await updateJson<Cursor>(path.join(CURSOR_DIR, cname), {}, (current) => {
+            if (current.roomOffsets?.[chan] !== undefined) delete current.roomOffsets[chan];
+            return current;
+          });
+        }
+        archivedRooms.push(chan);
+      }
+    }
+  }
+
+  // Receipts are out-of-band proof logs with no cursor and no analysis value —
+  // trim old entries by ts and delete logs for agents no longer registered.
+  // The one stream that is genuinely deleted, not archived.
   let receiptsRemoved = 0;
   const deletedOrphanReceipts: string[] = [];
-  for (const filePath of await listReceiptFiles()) {
-    const id = path.basename(filePath).replace(/\.jsonl$/, "");
-    if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) {
-      const entries = await readJsonl<{ ts: number }>(filePath);
-      receiptsRemoved += entries.length;
-      await deleteFile(filePath);
-      deletedOrphanReceipts.push(id);
-      continue;
+  if (targets.has("receipts")) {
+    for (const filePath of await listReceiptFiles()) {
+      const id = path.basename(filePath).replace(/\.jsonl$/, "");
+      if (!knownAgents.has(id) && (args.removeOrphanInboxes ?? true)) {
+        const entries = await readJsonl<{ ts: number }>(filePath);
+        receiptsRemoved += entries.length;
+        await deleteFile(filePath);
+        deletedOrphanReceipts.push(id);
+        continue;
+      }
+      const r = await rewriteJsonl<{ ts: number }>(filePath, (e) => e.ts > cutoff);
+      receiptsRemoved += r.removed;
     }
-    const r = await rewriteJsonl<{ ts: number }>(filePath, (e) => e.ts > cutoff);
-    receiptsRemoved += r.removed;
   }
 
   // Sweep expired reversible-history entries (TTL'd cache; also self-prunes on
@@ -244,16 +328,20 @@ export async function pruneTool(args: {
     dryRun: false,
     cutoff,
     olderThanDays: days,
+    decisionDays,
+    ...(scopedRoom ? { room: scopedRoom } : {}),
     removed: {
       roomMessages: roomRemovedTotal,
       statusEntries: statusResult.removed,
       inboxMessages: inboxRemoved,
       orphanInboxes: deletedOrphans,
       orphanMembers: [...orphanMembers],
+      staleMembers: [...staleMembers],
+      archivedRooms,
       receipts: receiptsRemoved,
       orphanReceipts: deletedOrphanReceipts,
     },
+    archivedTo: "archive/ (rooms/<chan>.jsonl, status.jsonl, inbox/<agent>.jsonl; receipts deleted)",
     cursorsAdjusted,
   };
 }
-

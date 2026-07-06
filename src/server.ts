@@ -186,7 +186,7 @@ function buildServer(initialBound?: string): McpServer {
 
   server.tool(
     "send_message",
-    "Send a message. If 'to' is set, goes to that agent's inbox (DM); otherwise to a channel — pass 'room' (e.g. 'seo' or '#seo') to target a specific channel, or omit it for the default 'general' channel. The 'from' field is enforced against the session's bound identity when binding is configured.",
+    "Send a message. If 'to' is set, goes to that agent's inbox (DM); otherwise to a channel — pass 'room' (e.g. 'seo' or '#seo') to target a specific channel, or omit it for the default 'general' channel. For channel posts, tag 'kind': 'decision' for GOs/verdicts/agreements that must outlive routine cleanup (kept ~30 days, quoted verbatim in digests), 'status' for progress notes, omit for ordinary chatter. The 'from' field is enforced against the session's bound identity when binding is configured.",
     sendMessageSchema,
     gate("from", sendMessageTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
@@ -221,7 +221,7 @@ function buildServer(initialBound?: string): McpServer {
 
   server.tool(
     "prune",
-    "Trim room/status/inbox JSONL to entries newer than `olderThanDays` (default 7). Removes inbox files for agents no longer in the registry unless removeOrphanInboxes=false. Pass dryRun=true to preview.",
+    "Trim room/status/inbox JSONL to entries newer than `olderThanDays` (default 7); kind='decision' posts keep a longer `decisionDays` retention (default 30). Nothing is lost: aged-out entries are archived under archive/ (rooms/<chan>.jsonl, status.jsonl, inbox/<agent>.jsonl) — only receipts are truly deleted. Pass `room` to prune a single channel, or `targets` (rooms|status|inbox|receipts|members) to narrow the sweep. Sweeps room members that are unregistered or haven't heartbeated since the cutoff, and archives+removes non-default rooms left empty and inactive (disable via archiveEmptyRooms=false). Removes inbox files for agents no longer in the registry unless removeOrphanInboxes=false. Pass dryRun=true to preview.",
     pruneSchema,
     gate(null, pruneTool as (a: Record<string, unknown>) => Promise<unknown>),
   );

@@ -93,6 +93,10 @@ export type Message = {
   // reminder). Only server code can set this — send_message constructs the
   // Message from fixed fields, so peers cannot smuggle it in.
   urgent?: boolean;
+  // Semantic weight of a room post (absent = chatter). Decisions get a longer
+  // prune retention (decisionDays), survive live compaction while fresh, and
+  // are surfaced verbatim in overflow digests.
+  kind?: "decision" | "status" | "chatter";
 };
 
 export type StatusEntry = {

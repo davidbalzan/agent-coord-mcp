@@ -68,7 +68,7 @@ If you're building an agent with the official MCP SDKs (`@modelcontextprotocol/s
 | `status({agentId})` | Introspect: registration, attached transport, inbox depth/unread, whether the MCP server is in tmux. Debug "why isn't my DM landing." |
 | `heartbeat({agentId})` | Manual heartbeat. Usually unnecessary — agents with a live transport get heartbeats auto-bumped on every `list_agents`. |
 | `list_agents()` | See all known agents, who looks online, and which `transport` (if any) they have attached. Validates transport pid liveness on every call. |
-| `send_message({from, to?, room?, text})` | If `to` set → that agent's inbox (DM). Else → a channel: `room` names it (`"seo"` / `"#seo"`), omit for the default `general` channel. |
+| `send_message({from, to?, room?, text, kind?})` | If `to` set → that agent's inbox (DM). Else → a channel: `room` names it (`"seo"` / `"#seo"`), omit for the default `general` channel. Tag channel posts with `kind: "decision"` for GOs/verdicts (longer retention, quoted in digests), `"status"` for progress notes; absent = chatter. |
 | `send_command({from, to?, command, reminderMs?, reminderText?})` / `send_command({from, room, command, ...})` | Inject a context-management slash command (`/clear` or `/compact`) **directly into a sub-agent's CLI** — delivered raw (no banner/prefix) so the receiving TUI runs it as a real slash command. `to` targets one agent; `room` broadcasts to a channel's tmux-attached members (never the sender). **Gated to tmux:** returns `ok:false` unless the target has a live `tmux-push`(`-remote`) transport. Command allowlist is locked to `/clear` + `/compact`. After `/clear`, a follow-up identity-reminder DM is auto-scheduled (`reminderMs:0` to opt out, `reminderText` to override) so the freshly-cleared worker re-anchors on its agentId and bus attach state. **Blocks until an out-of-band delivery receipt confirms the command reached the pane** (`delivery:"confirmed"`+`deliveredAt`, or `"pending"`+`warning` on a stale pusher); `waitForDelivery:false` for fire-and-forget, `deliveryTimeoutMs` to tune. See [clearing sub-agent context](#clearing-sub-agent-context-send_command). |
 | `read_messages({agentId, source, room?, limit?, peek?, sinceTs?})` | Read new messages. `source` is `inbox`/`room`/`status`; for `room`, `room` picks the channel (default `general`). Advances the per-channel cursor unless `peek:true`. Room reads return the most recent `limit` (default 50); any older overflow is replaced by a compact `history` digest carrying a retrieval hash. |
 | `retrieve_room_history({agentId, hash, query?})` | Expand a `history` digest from `read_messages` into the original overflow messages. `query` filters to matching messages (case-insensitive substring). Scoped to the producing agent; entries expire after 30 min. |
@@ -83,7 +83,7 @@ If you're building an agent with the official MCP SDKs (`@modelcontextprotocol/s
 | `detach_agent({agentId})` | Stop the tmux-push transport: kill the pusher and clear the transport marker. |
 | `report_transport({agentId, transport, host?, tmuxTarget?, since?})` | Publish a transport marker for an agent. Used by the **remote** pusher (`coord-pusher`, see [Remote agents](#remote-agents-streamable-http)) to surface itself in `list_agents`. Local tmux push uses `attach_agent` instead. |
 | `clear_transport({agentId})` | Idempotent delete of an agent's transport marker — wire-callable counterpart to `detach_agent` for the remote pusher. Removes the marker only; nothing local to kill. |
-| `prune({olderThanDays?, removeOrphanInboxes?, dryRun?})` | Trim room/status/inbox JSONL to entries newer than N days (default 7). Removes inbox files for agents no longer in the registry, and compacts orphan channel memberships. Pass `dryRun:true` to preview. |
+| `prune({olderThanDays?, decisionDays?, room?, targets?, archiveEmptyRooms?, removeOrphanInboxes?, dryRun?})` | Archive room/status/inbox entries older than N days (default 7; decisions 30) to `archive/` — nothing is deleted except receipts. Scope with `room` or `targets`. Sweeps unregistered *and* heartbeat-stale members, archives empty inactive rooms. Pass `dryRun:true` to preview. |
 | `doctor({fix?, maxFileBytes?})` | Bus-wide health check — inspects the whole state dir for drift/leaks/corruption (orphan transport markers, **stale pusher daemons whose loaded code predates the on-disk script**, orphan memberships, orphan inbox/cursor files, cursor offsets past EOF, malformed JSONL, stale agents, oversized files, stale locks, channel/registry mismatches, environment). Read-only by default; `fix:true` applies the safe, reversible repairs (malformed-line rewrites are backed up to `.bak`). `healthy:true` means the bus is internally consistent. |
 
 ## First session checklist
@@ -131,13 +131,23 @@ tail -f ~/agent-coord/room.jsonl | jq -c '{ts: (.ts/1000|todate), from, to, text
   status.jsonl           # status broadcasts
   inbox/<agentId>.jsonl  # per-agent inboxes
   cursors/<agentId>.json # last-read offsets (per-channel under roomOffsets)
+  archive/               # cold storage (v0.15.0) — nothing on the bus is deleted
+    rooms/<chan>.jsonl   #   aged-out channel messages, one file per room (incl. general)
+    status.jsonl         #   aged-out status broadcasts
+    inbox/<agent>.jsonl  #   aged-out DMs
 ```
 
 To reset everything: `rm -rf ~/agent-coord && mkdir -p ~/agent-coord/{inbox,cursors}`.
 
-### Cleanup
+### Cleanup, archiving & retention (v0.15.0)
 
-The registry auto-evicts agents whose last heartbeat is older than 24h on every `list_agents` call. For chat history and inbox trimming, call `prune` periodically (e.g. weekly) — it's safe to run from any agent and supports `dryRun`.
+Nothing is ever deleted from rooms, status, or inboxes — `prune` and live compaction move aged entries into `archive/` (append-only JSONL the server never reads back; it exists for offline analysis of what happened in a room). Delivery receipts are the one stream that is genuinely deleted.
+
+- **`prune`** trims entries older than `olderThanDays` (default 7). Room posts tagged `kind: "decision"` get the longer `decisionDays` retention (default 30). Scope with `room` (single channel) or `targets` (`rooms|status|inbox|receipts|members`). The member sweep drops agents that are unregistered *or* haven't heartbeated since the cutoff, then archives non-default rooms left empty and inactive (`archiveEmptyRooms: false` to keep them). Supports `dryRun`.
+- **Live compaction**: rooms self-compact on write once they exceed 1000 entries (down to 500; env `AGENT_COORD_ROOM_MAX` / `AGENT_COORD_ROOM_KEEP`), status at 2000/1000 (`AGENT_COORD_STATUS_MAX` / `AGENT_COORD_STATUS_KEEP`). Fresh decisions are exempt. Cursors are adjusted, so readers never wedge.
+- **Message kinds**: `send_message` accepts `kind: "decision" | "status" | "chatter"` on channel posts (absent = chatter). Tag GOs/verdicts/agreements as decisions — they outlive routine cleanup and are quoted verbatim in overflow digests.
+
+The registry auto-evicts agents whose last heartbeat is older than 24h on every `list_agents` call.
 
 ## Override location
 
