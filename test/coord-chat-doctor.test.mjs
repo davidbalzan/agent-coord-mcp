@@ -1,5 +1,5 @@
 // CLI-surface tests for `coord-chat --doctor [--fix]`. Spawns the real script
-// as a subprocess so the wiring under test — dynamic import of dist/tools.js,
+// as a subprocess so the wiring under test — dynamic import of dist/tools/index.js,
 // arg parsing, exit codes, --dir → AGENT_COORD_DIR pinning — is exercised
 // end-to-end. The doctor logic itself is covered in doctor.test.mjs.
 import { test, after } from "node:test";

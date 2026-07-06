@@ -762,7 +762,7 @@ async function postStatus(status) {
 async function runDoctor(fix, emit) {
   let doctorTool;
   try {
-    ({ doctorTool } = await import(new URL("../dist/tools.js", import.meta.url)));
+    ({ doctorTool } = await import(new URL("../dist/tools/index.js", import.meta.url)));
   } catch (e) {
     emit(A.red(`/doctor unavailable: could not load the doctor tool (${e?.message ?? e}).`));
     emit(A.dim("  This build may be missing dist/ — run `npm run build` in the package."));

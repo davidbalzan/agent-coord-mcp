@@ -10,7 +10,7 @@ const tmp = mkdtempSync(path.join(tmpdir(), "coord-doctor-"));
 process.env.AGENT_COORD_DIR = path.join(tmp, "coord");
 
 const store = await import("../dist/store.js");
-const t = await import("../dist/tools.js");
+const t = await import("../dist/tools/index.js");
 store.ensureDirs();
 
 after(() => rmSync(tmp, { recursive: true, force: true }));

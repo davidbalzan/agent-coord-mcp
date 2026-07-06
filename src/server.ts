@@ -62,7 +62,7 @@ import {
   quitTool,
   waitForMessageSchema,
   waitForMessageTool,
-} from "./tools.js";
+} from "./tools/index.js";
 
 function jsonResult(data: unknown) {
   return {

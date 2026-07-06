@@ -1,0 +1,359 @@
+import { randomUUID } from "node:crypto";
+import { existsSync, openSync, watch } from "node:fs";
+import { promises as fsp } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { z } from "zod";
+import path from "node:path";
+import {
+  AGENTS_FILE,
+  CURSOR_DIR,
+  DEFAULT_ROOM,
+  INBOX_DIR,
+  ROOT,
+  ROOM_FILE,
+  ROOMS_DIR,
+  ROOMS_FILE,
+  STATUS_FILE,
+  addMember,
+  appendJsonl,
+  cursorFile,
+  deleteFile,
+  ensureRoom,
+  fileSize,
+  getRooms,
+  inboxFile,
+  listCursorFiles,
+  listInboxFiles,
+  listTransportFiles,
+  logFile,
+  memberRooms,
+  normalizeRoom,
+  pidFile,
+  readJson,
+  readJsonl,
+  receiptFile,
+  listReceiptFiles,
+  removeMember,
+  rewriteJsonl,
+  roomFile,
+  rotateAgentToken,
+  setRoomMeta,
+  stashHistory,
+  retrieveHistory,
+  pruneHistory,
+  transportFile,
+  TRANSPORT_DIR,
+  updateJson,
+  type RoomRegistry,
+} from "../store.js";
+import {
+  type AgentEntry,
+  type AgentRegistry,
+  type Message,
+  type StatusEntry,
+  type Cursor,
+  type Source,
+  type TransportMarker,
+  sourceFile,
+  getOffset,
+  setOffset,
+  sysMsg,
+  moveFile,
+  STALE_MS,
+  EVICT_MS,
+  MAX_WAIT_MS,
+} from "./shared.js";
+
+// ---------- send_message ----------
+
+export const sendMessageSchema = {
+  from: z.string().min(1),
+  to: z.string().optional(),
+  room: z.string().optional(),
+  text: z.string().min(1),
+};
+
+export async function sendMessageTool(args: {
+  from: string;
+  to?: string;
+  room?: string;
+  text: string;
+}) {
+  // DM → inbox. Otherwise resolve the channel (default `general`), make sure it
+  // exists in the registry, and tag the message with its channel.
+  if (args.to) {
+    const msg: Message = {
+      id: randomUUID(),
+      ts: Date.now(),
+      from: args.from,
+      to: args.to,
+      text: args.text,
+    };
+    const target = inboxFile(args.to);
+    await appendJsonl(target, msg);
+    // Offline delivery is intentional (the inbox is created on demand), but a
+    // typo'd recipient shouldn't vanish silently — surface a warning when the
+    // target isn't a known agent so the caller can catch the mistake.
+    const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
+    const warning = reg[args.to]
+      ? undefined
+      : `recipient '${args.to}' is not a registered agent — message stored in their inbox but no one may be listening`;
+    return { ok: true, id: msg.id, target, room: undefined, warning };
+  }
+
+  const chan = normalizeRoom(args.room);
+  if (chan !== DEFAULT_ROOM) await ensureRoom(chan, args.from);
+  const msg: Message = {
+    id: randomUUID(),
+    ts: Date.now(),
+    from: args.from,
+    room: chan,
+    text: args.text,
+  };
+  const target = roomFile(chan);
+  await appendJsonl(target, msg);
+  return { ok: true, id: msg.id, target, room: chan };
+}
+
+// ---------- read_messages ----------
+
+export const readMessagesSchema = {
+  agentId: z.string().min(1),
+  source: z.enum(["inbox", "room", "status"]),
+  room: z.string().optional(),
+  limit: z.number().int().positive().max(500).optional(),
+  peek: z.boolean().optional(),
+  sinceTs: z.number().optional(),
+};
+
+export async function readMessagesTool(args: {
+  agentId: string;
+  source: Source;
+  room?: string;
+  limit?: number;
+  peek?: boolean;
+  sinceTs?: number;
+}) {
+  const file = sourceFile(args.source, args.agentId, args.room);
+  const all = await readJsonl<Message | StatusEntry>(file);
+
+  let entries: (Message | StatusEntry)[] = [];
+  let totalNew = 0;
+
+  // Room and status reads default to 50 entries to prevent agents flooding
+  // themselves with full history on join — the status stream grows unbounded
+  // across the fleet. Inbox drains fully since it is targeted by nature.
+  const effectiveLimit = args.limit ?? (args.source === "inbox" ? undefined : 50);
+
+  if (args.peek) {
+    const cursor = await readJson<Cursor>(cursorFile(args.agentId), {});
+    const startOffset = getOffset(cursor, args.source, args.room);
+    entries = all.slice(startOffset);
+    if (args.sinceTs !== undefined) entries = entries.filter((e) => e.ts > args.sinceTs!);
+    totalNew = entries.length;
+  } else {
+    await updateJson<Cursor>(cursorFile(args.agentId), {}, (current) => {
+      const startOffset = getOffset(current, args.source, args.room);
+      let e = all.slice(startOffset);
+      if (args.sinceTs !== undefined) e = e.filter((x) => x.ts > args.sinceTs!);
+      totalNew = e.length;
+      entries = e;
+      // Advance past EVERYTHING we account for here (recent window + any
+      // overflow we stash below). The overflow is recoverable via the history
+      // hash, so it must not requeue for the next read — that would re-flood.
+      if (e.length > 0) setOffset(current, args.source, args.room, startOffset + e.length);
+      return current;
+    });
+  }
+
+  // CCR overflow handling (room and status sources). When the backlog exceeds
+  // the window, return the RECENT slice raw and replace the older overflow with
+  // a compact digest carrying a retrieval hash. The agent expands it on demand
+  // via retrieve_room_history. Peek is side-effect-free, so it never stashes —
+  // it reports the count and tells the agent to do a real read to get a hash.
+  let recent = entries;
+  let history: { digest: string; hash?: string; older: number } | undefined;
+  if (args.source !== "inbox" && effectiveLimit && entries.length > effectiveLimit) {
+    const overflow = entries.slice(0, entries.length - effectiveLimit);
+    recent = entries.slice(entries.length - effectiveLimit);
+    const stashKey = args.source === "room" ? normalizeRoom(args.room) : "status";
+    if (args.peek) {
+      history = { digest: digestOverflow(overflow, undefined), older: overflow.length };
+    } else {
+      const hash = await stashHistory(stashKey, args.agentId, overflow);
+      history = { digest: digestOverflow(overflow, hash), hash, older: overflow.length };
+    }
+  } else if (effectiveLimit && entries.length > effectiveLimit) {
+    // Inbox keeps the legacy oldest-first chunking (no stash) — targeted
+    // messages must never be skipped over.
+    recent = entries.slice(0, effectiveLimit);
+  }
+
+  // Drop the agent's own posts on shared channels — reading your own broadcast
+  // back is never useful and confuses turn-based agents into self-replies.
+  // Cursor has already advanced past them, so they won't reappear.
+  const visible =
+    args.source === "room" || args.source === "status"
+      ? recent.filter((e) => entryAuthor(e) !== args.agentId)
+      : recent;
+
+  return {
+    ok: true,
+    messages: visible,
+    totalNew,
+    returned: visible.length,
+    room: args.source === "room" ? normalizeRoom(args.room) : undefined,
+    ...(history ? { history } : {}),
+  };
+}
+
+// Lossless summary of a stashed backlog slice: surfaces error/failure posts
+// verbatim (the lines that usually matter most in a flood) and collapses the
+// rest to counts. Mirrors headroom's content-aware digest, kept deliberately
+// simple — the full originals are one retrieve_room_history call away.
+function digestOverflow(over: (Message | StatusEntry)[], hash: string | undefined): string {
+  const authors = new Set(over.map(entryAuthor).filter(Boolean));
+  const errorRe = /\b(error|fatal|fail(ed|ure)?|panic|exception)\b/i;
+  const errors = over.filter((m) => errorRe.test(JSON.stringify(m)));
+  const first = over[0]?.ts;
+  const last = over[over.length - 1]?.ts;
+  const span =
+    first && last && last > first ? ` over ${Math.round((last - first) / 60000)}m` : "";
+  const parts = [
+    `[${over.length} earlier message${over.length === 1 ? "" : "s"} compressed`,
+    `${authors.size} agent${authors.size === 1 ? "" : "s"}${span}`,
+  ];
+  if (errors.length) parts.push(`${errors.length} error post${errors.length === 1 ? "" : "s"}`);
+  const head = parts.join(", ");
+  const tail = hash
+    ? ` hash=${hash}] — call retrieve_room_history(hash="${hash}") to expand`
+    : `] — read without peek to get an expandable hash`;
+  return head + tail;
+}
+
+// ---------- retrieve_room_history ----------
+
+export const retrieveRoomHistorySchema = {
+  agentId: z.string().min(1),
+  hash: z.string().min(1),
+  query: z.string().optional(),
+};
+
+export async function retrieveRoomHistoryTool(args: {
+  agentId: string;
+  hash: string;
+  query?: string;
+}) {
+  const res = await retrieveHistory<Message | StatusEntry>(args.hash, args.agentId, args.query);
+  if (!res.ok) {
+    const reason =
+      res.reason === "expired"
+        ? "That history entry has expired (30m TTL). Re-read the channel with a higher limit to fetch it again."
+        : res.reason === "forbidden"
+          ? "That history hash was produced for a different agent and cannot be retrieved by you."
+          : "No history entry for that hash. It may have expired or never existed.";
+    return { ok: false, reason: res.reason, message: reason };
+  }
+  return {
+    ok: true,
+    room: res.room,
+    hash: args.hash,
+    total: res.total,
+    returned: res.messages.length,
+    messages: res.messages,
+  };
+}
+
+function entryAuthor(e: Message | StatusEntry): string | undefined {
+  return "from" in e ? e.from : e.agentId;
+}
+
+// ---------- post_status ----------
+
+export const postStatusSchema = {
+  agentId: z.string().min(1),
+  status: z.string().min(1),
+  detail: z.string().optional(),
+};
+
+export async function postStatusTool(args: { agentId: string; status: string; detail?: string }) {
+  const entry: StatusEntry = {
+    id: randomUUID(),
+    ts: Date.now(),
+    agentId: args.agentId,
+    status: args.status,
+    detail: args.detail,
+  };
+  await appendJsonl(STATUS_FILE, entry);
+  return { ok: true, id: entry.id };
+}
+
+// ---------- wait_for_message ----------
+
+export const waitForMessageSchema = {
+  agentId: z.string().min(1),
+  source: z.enum(["inbox", "room", "status"]),
+  room: z.string().optional(),
+  timeoutMs: z.number().int().positive().max(MAX_WAIT_MS).optional(),
+};
+
+export async function waitForMessageTool(args: {
+  agentId: string;
+  source: Source;
+  room?: string;
+  timeoutMs?: number;
+}) {
+  const totalTimeout = Math.min(args.timeoutMs ?? 30_000, MAX_WAIT_MS);
+  const file = sourceFile(args.source, args.agentId, args.room);
+  const deadline = Date.now() + totalTimeout;
+
+  // Loop so that file growth caused only by the agent's own self-posts (which
+  // readMessagesTool now filters out for room/status) doesn't return an empty
+  // result — keep waiting until we have something to deliver or time out.
+  while (Date.now() < deadline) {
+    const startSize = await fileSize(file);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+
+    const changed = await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (v: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(poll);
+        try {
+          watcher?.close();
+        } catch {
+          // ignore
+        }
+        clearTimeout(t);
+        resolve(v);
+      };
+
+      const check = async () => {
+        const sz = await fileSize(file);
+        if (sz > startSize) finish(true);
+      };
+
+      let watcher: ReturnType<typeof watch> | undefined;
+      try {
+        watcher = watch(file, () => {
+          void check();
+        });
+      } catch {
+        // file may not exist; polling will handle
+      }
+      const poll = setInterval(() => void check(), 500);
+      const t = setTimeout(() => finish(false), remaining);
+    });
+
+    if (!changed) break;
+    const result = await readMessagesTool({ agentId: args.agentId, source: args.source, room: args.room });
+    if (result.returned > 0) return result;
+    // otherwise, only self-posts arrived; keep waiting on the remaining budget
+  }
+
+  return { ok: false, timedOut: true };
+}
+
