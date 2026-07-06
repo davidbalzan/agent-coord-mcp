@@ -363,6 +363,13 @@ Defaults to `127.0.0.1`. To bind to a LAN address (Tailscale, WireGuard, etc.) s
 
 The server can run as a long-lived daemon on one machine (the "host") while local agents on that host keep using stdio per-session; the two modes don't conflict — they're separate processes.
 
+**Binding beyond loopback (fail-closed gate).** The example above binds `127.0.0.1` (the default) — safe for a same-host daemon. The moment you set `AGENT_COORD_BIND` to a non-loopback address, it becomes a real network listener and the server refuses to start unless:
+
+- **enforced per-agent identity** — a `tokens.json` is present (a single shared `AGENT_COORD_TOKEN` lets any node impersonate any agent, so it's rejected for network binds); and
+- **a secured transport** — either the hop is on a private overlay / behind a TLS proxy and you set `AGENT_COORD_INSECURE=1` to acknowledge that, or the bind stays on loopback. Plaintext bearer tokens on an open network are refused.
+
+Mint the per-agent tokens with `coord-token` (below). Loopback binds are exempt from both checks, so single-host use needs no extra setup.
+
 ### Point a Claude Code session at the remote server
 
 In `~/.claude.json`:
@@ -381,6 +388,21 @@ In `~/.claude.json`:
 
 Then `join({agentId:"me"})` and call any tool exactly as you would locally. `send_message`, `read_messages`, `wait_for_message`, `list_rooms`, `join_room`, etc. all work identically.
 
+### `coord-node` — one-command onboarding (recommended)
+
+`coord-node` is the low-barrier way to add a machine to a networked bus — the remote counterpart to `spawn-agent.sh`. It starts your agent in tmux, auto-resolves the pane, and launches the `coord-pusher` daemon pointed at the bus, collapsing the manual `coord-pusher` wiring below into one command.
+
+```sh
+# on the bus host — mint this node's token (prints it + the next command):
+scripts/coord-token.mjs add worker-2
+
+# on the new machine:
+AGENT_COORD_TOKEN=tk_… scripts/coord-node.sh \
+  --server https://bus:8765/mcp --id worker-2 --cmd claude
+```
+
+Pass the token via `AGENT_COORD_TOKEN` (not `--token`) so it never lands in `ps` / shell history. It reuses `spawn-agent.sh`'s `coord-<id>` session and `pusher-<id>.pid` conventions, so `scripts/stop-agent.sh --id worker-2` tears a node down.
+
 ### `coord-pusher` — real-time push, cross-machine
 
 The local `attach_agent` / `tmux-pusher` path can't reach across machines (it needs filesystem access to the inbox + a local tmux pane). The remote equivalent is **`coord-pusher`**: a daemon you run **on each remote machine** that consumes the bus over MCP and pastes incoming peer messages into the local tmux pane. Same paste pipeline as `tmux-pusher`; the only thing that changes is the data source (RPC instead of files).
@@ -393,6 +415,8 @@ coord-pusher --server http://host:8765/mcp \
 ```
 
 Or via env (`AGENT_COORD_SERVER` / `AGENT_COORD_TOKEN` / `AGENT_COORD_ID` / `AGENT_COORD_TMUX_TARGET`). Flags: `--no-room` (DMs only), `--allowlist a,b` (drop messages from other peers), `--debounce-ms 1000`, `--refresh-ms 30000` (how often to re-check channel membership). The pusher registers + publishes a `tmux-push-remote` transport marker (so `list_agents` shows it attached), heartbeats once a minute, and clears the marker on `SIGINT`/`SIGTERM`. Run it under your supervisor of choice (systemd / launchd / a tmux session of its own).
+
+**Injection safety.** Peer content is delivered as *bracketed paste* (inert data — embedded newlines can't submit a line or smuggle a `/command`), and the pusher refuses to inject at all when the target pane has dropped to a shell (`bash`/`zsh`/…) instead of the agent CLI, leaving the message for redelivery. Only validated `send_command` control commands (`/clear`, `/compact`) are ever pasted raw.
 
 ### Identity binding (v0.7.0 / TOFU in v0.7.1)
 
@@ -412,6 +436,16 @@ TOFU stops mid-session switching. It does *not* stop a fresh session claiming an
 { "alice": "tk_$(openssl rand -hex 24)",
   "bob":   "tk_$(openssl rand -hex 24)" }
 ```
+
+Rather than hand-editing this file, use `scripts/coord-token.mjs` — it writes the correct `{ agentId: token }` shape at mode 600 (and re-chmods on every write) and prints the token to hand to `coord-node`:
+
+```sh
+scripts/coord-token.mjs add worker-2      # mint/rotate a token, prints it
+scripts/coord-token.mjs list              # agent ids (never prints tokens)
+scripts/coord-token.mjs revoke worker-2
+```
+
+After an `add`/`revoke`, `SIGHUP` the running server to hot-reload the token map (`kill -HUP <bus-pid>`).
 
 Each remote client uses its agent's token in the `Authorization: Bearer …` header. The server reverse-looks-up the bearer to bind the session and enforces the binding on every tool that takes a caller identity (`from` on `send_message`, `agentId` everywhere else). Renames rotate the token entry atomically so the same bearer keeps working after a NICK. `kill -HUP <pid>` reloads the file without a restart.
 
