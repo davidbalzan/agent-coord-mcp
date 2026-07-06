@@ -422,12 +422,41 @@ async function startHttp(port: number): Promise<void> {
   const bindAddr = process.env.AGENT_COORD_BIND ?? "127.0.0.1";
   const sharedExpected = sharedToken ? `Bearer ${sharedToken}` : null;
 
+  // Fail-closed network gate. A non-loopback bind is a real network listener, so
+  // it must have (a) enforced per-agent identity and (b) a secured transport. We
+  // refuse rather than warn: a shared/advisory token lets any node impersonate
+  // any agent, and plaintext leaks bearer tokens to anyone on the path.
+  const isLoopbackBind =
+    bindAddr === "127.0.0.1" || bindAddr === "localhost" || bindAddr === "::1";
+  if (!isLoopbackBind) {
+    if (!bound) {
+      console.error(
+        `[agent-coord-mcp] refusing to bind ${bindAddr} without per-agent tokens: a ` +
+          `shared/advisory token lets any node impersonate any agent. Create ` +
+          `~/agent-coord/tokens.json (per-agent, enforced identity) for network binds.`,
+      );
+      process.exit(1);
+    }
+    if (process.env.AGENT_COORD_INSECURE !== "1") {
+      console.error(
+        `[agent-coord-mcp] refusing plaintext bind to ${bindAddr}: bearer tokens would ` +
+          `travel in cleartext. Put the bus behind TLS or a private overlay ` +
+          `(Tailscale/WireGuard), then set AGENT_COORD_INSECURE=1 to acknowledge the ` +
+          `transport is secured out-of-band.`,
+      );
+      process.exit(1);
+    }
+  }
+
   // One transport+server pair per client session. The SDK exposes session
   // affinity via the `mcp-session-id` header: a new request without it is
   // an init (create new pair); follow-ups carry the id (look up the pair).
   // We cannot share one stateful transport across clients (it errors with
   // "Server already initialized"), and stateless mode rejects reuse.
   const sessions = new Map<string, StreamableHTTPServerTransport>();
+  // Which bound agent each session id belongs to, so a session can't be driven
+  // by a *different* bearer that merely presents its id (session hijack).
+  const sessionAgents = new Map<string, string | undefined>();
 
   async function makeSessionTransport(boundAgent?: string): Promise<StreamableHTTPServerTransport> {
     // `let` + explicit type lets the SDK callbacks close over the binding
@@ -435,10 +464,16 @@ async function startHttp(port: number): Promise<void> {
     let transport: StreamableHTTPServerTransport;
     transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (id: string) => { sessions.set(id, transport); },
+      onsessioninitialized: (id: string) => {
+        sessions.set(id, transport);
+        sessionAgents.set(id, boundAgent);
+      },
     });
     transport.onclose = () => {
-      if (transport.sessionId) sessions.delete(transport.sessionId);
+      if (transport.sessionId) {
+        sessions.delete(transport.sessionId);
+        sessionAgents.delete(transport.sessionId);
+      }
     };
     const server = buildServer(boundAgent);
     await server.connect(transport);
@@ -487,6 +522,20 @@ async function startHttp(port: number): Promise<void> {
       // bearer's agent; anything else is a protocol error.
       const sid = req.headers["mcp-session-id"];
       let transport = typeof sid === "string" ? sessions.get(sid) : undefined;
+      // Re-bind check: a session is pinned to the agent whose bearer opened it.
+      // In bound mode, reject a request whose bearer resolves to a *different*
+      // agent than the session was created for — otherwise any valid token plus
+      // a leaked session id could drive that session's identity (session hijack).
+      if (
+        transport &&
+        tokenMap &&
+        typeof sid === "string" &&
+        sessionAgents.get(sid) !== resolved.agent
+      ) {
+        res.writeHead(403, { "Content-Type": "text/plain" });
+        res.end("session/identity mismatch\n");
+        return;
+      }
       if (!transport) {
         if (req.method !== "POST") {
           res.writeHead(400, { "Content-Type": "text/plain" });

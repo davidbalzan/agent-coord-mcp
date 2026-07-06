@@ -128,6 +128,24 @@ let sending = false;
 // Allowlisted control commands (mirrors CONTROL_COMMANDS in src/tools.ts).
 const CONTROL_COMMANDS = new Set(["/clear", "/compact"]);
 
+// Shells we refuse to inject into: if the pane's foreground command is one of
+// these, the agent CLI has exited and typing would run pasted text as commands.
+const SHELL_COMMANDS = new Set(["bash", "zsh", "sh", "fish", "dash", "ksh"]);
+
+// Foreground command of the target pane, or null if it can't be determined
+// (in which case we do NOT block — fall back to the bracketed-paste protection).
+function paneCurrentCommand() {
+  const r = spawnSync("tmux", [
+    "display-message",
+    "-p",
+    "-t",
+    TMUX_TARGET,
+    "#{pane_current_command}",
+  ]);
+  if (r.status !== 0) return null;
+  return (r.stdout ?? "").toString().trim() || null;
+}
+
 function isControl(m) {
   return (
     !!m &&
@@ -193,16 +211,27 @@ function formatBatch(batch) {
 // control command (/clear, /compact) goes in on its own as a RAW line so the
 // CLI runs it as a slash command rather than echoing it as chat text.
 async function injectViaTmux(batch) {
+  // Fail-closed pane guard: never type into a pane that has dropped to a shell
+  // (crashed/exited agent CLI). Bracketed paste protects a compliant TUI, but a
+  // raw shell would execute pasted lines — so refuse and let the at-least-once
+  // cursor redeliver once the agent CLI is back.
+  const cmd = paneCurrentCommand();
+  if (cmd !== null && SHELL_COMMANDS.has(cmd)) {
+    process.stderr.write(
+      `[coord-pusher] pane '${TMUX_TARGET}' is at a shell ('${cmd}'), not the agent CLI — skipping inject (will redeliver)\n`,
+    );
+    return;
+  }
   let run = [];
   const flushRun = async () => {
     if (run.length === 0) return;
-    await pasteAndSubmit(formatBatch(run));
+    await pasteAndSubmit(formatBatch(run), true); // peer content: inert bracketed paste
     run = [];
   };
   for (const m of batch) {
     if (isControl(m)) {
       await flushRun();
-      await pasteAndSubmit(m.text.trim());
+      await pasteAndSubmit(m.text.trim(), false); // validated control: raw slash command
     } else {
       run.push(m);
     }
@@ -210,13 +239,17 @@ async function injectViaTmux(batch) {
   await flushRun();
 }
 
-function pasteAndSubmit(payload) {
+// bracketed=true wraps the paste in bracketed-paste markers (paste-buffer -p) so
+// a compliant TUI treats the payload as inert data — embedded newlines can't
+// submit lines or smuggle a "/command". Control commands (/clear, /compact) must
+// paste RAW (bracketed=false) so the TUI still runs them as slash commands.
+function pasteAndSubmit(payload, bracketed = false) {
   return new Promise((resolve, reject) => {
     const load = spawn("tmux", ["load-buffer", "-b", BUFFER_NAME, "-"]);
     load.on("error", reject);
     load.on("exit", (code) => {
       if (code !== 0) return reject(new Error(`tmux load-buffer exit ${code}`));
-      const paste = spawnSync("tmux", ["paste-buffer", "-b", BUFFER_NAME, "-t", TMUX_TARGET, "-d"]);
+      const paste = spawnSync("tmux", ["paste-buffer", ...(bracketed ? ["-p"] : []), "-b", BUFFER_NAME, "-t", TMUX_TARGET, "-d"]);
       if (paste.status !== 0) return reject(new Error(`tmux paste-buffer: ${(paste.stderr ?? "").toString().trim()}`));
       const enter = spawnSync("tmux", ["send-keys", "-t", TMUX_TARGET, "Enter"]);
       if (enter.status !== 0) return reject(new Error(`tmux send-keys: ${(enter.stderr ?? "").toString().trim()}`));
