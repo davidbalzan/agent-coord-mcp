@@ -422,6 +422,32 @@ async function startHttp(port: number): Promise<void> {
   const bindAddr = process.env.AGENT_COORD_BIND ?? "127.0.0.1";
   const sharedExpected = sharedToken ? `Bearer ${sharedToken}` : null;
 
+  // Fail-closed network gate. A non-loopback bind is a real network listener, so
+  // it must have (a) enforced per-agent identity and (b) a secured transport. We
+  // refuse rather than warn: a shared/advisory token lets any node impersonate
+  // any agent, and plaintext leaks bearer tokens to anyone on the path.
+  const isLoopbackBind =
+    bindAddr === "127.0.0.1" || bindAddr === "localhost" || bindAddr === "::1";
+  if (!isLoopbackBind) {
+    if (!bound) {
+      console.error(
+        `[agent-coord-mcp] refusing to bind ${bindAddr} without per-agent tokens: a ` +
+          `shared/advisory token lets any node impersonate any agent. Create ` +
+          `~/agent-coord/tokens.json (per-agent, enforced identity) for network binds.`,
+      );
+      process.exit(1);
+    }
+    if (process.env.AGENT_COORD_INSECURE !== "1") {
+      console.error(
+        `[agent-coord-mcp] refusing plaintext bind to ${bindAddr}: bearer tokens would ` +
+          `travel in cleartext. Put the bus behind TLS or a private overlay ` +
+          `(Tailscale/WireGuard), then set AGENT_COORD_INSECURE=1 to acknowledge the ` +
+          `transport is secured out-of-band.`,
+      );
+      process.exit(1);
+    }
+  }
+
   // One transport+server pair per client session. The SDK exposes session
   // affinity via the `mcp-session-id` header: a new request without it is
   // an init (create new pair); follow-ups carry the id (look up the pair).
