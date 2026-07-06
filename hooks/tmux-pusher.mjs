@@ -19,6 +19,9 @@
  *   AGENT_COORD_DEBOUNCE_MS   coalesce window for bursts (default 1000)
  *   AGENT_COORD_POLL_MS       fallback poll interval (default 1000)
  *   AGENT_COORD_TARGET_GRACE  missed pane probes before self-exit (default 3)
+ *   AGENT_COORD_MAX_QUEUE_MS  max time routine traffic may queue without an
+ *                             urgent trigger before it flushes as a digest
+ *                             (default 300000 = 5min; 0 disables)
  *
  * Safety:
  *   - drops messages where from === AGENT_COORD_ID (no self-echo)
@@ -83,6 +86,11 @@ const TARGET_GRACE = parseInt(process.env.AGENT_COORD_TARGET_GRACE || "3", 10);
 // agent; everything else queues unread and rides the next push as a coalesced
 // digest. AGENT_COORD_TIERS=0 restores legacy push-everything.
 const TIERS_ENABLED = process.env.AGENT_COORD_TIERS !== "0";
+// Max-age flush: routine traffic never waits longer than this for an urgent
+// trigger — once the oldest queued message is overdue, the backlog flushes as
+// a routine-only digest. Bounds the silent-fleet failure mode where FYI:/DONE:
+// chatter queues forever because nothing urgent ever arrives.
+const MAX_QUEUE_MS = parseInt(process.env.AGENT_COORD_MAX_QUEUE_MS || "300000", 10);
 // Gate runners (QA/coordinator) receive DONE: as push-now; countersigned
 // SCOPE: changes are honored only from these trusted ids. Re-resolved from
 // the registry every 30s so a role change doesn't strand a stale pusher;
@@ -215,7 +223,7 @@ function shouldInject(m) {
 // never lost. Routine messages wait in tierQueue until a push-now trigger
 // coalesces them; their offset commits travel in pendingCommits alongside.
 const stagedOffsets = {};
-const tierQueue = new TierQueue();
+const tierQueue = new TierQueue({ maxAgeMs: TIERS_ENABLED ? MAX_QUEUE_MS : 0 });
 let pendingCommits = [];
 
 function collectSource(label, file, cursorKey, cur, staged) {
@@ -298,8 +306,10 @@ function checkOnce() {
   }
   // Tiered delivery: push only when the fresh batch contains a push-now
   // trigger. A routine-only backlog stays queued (on-disk cursor untouched)
-  // so an idle agent is never woken — it rides the digest of the next trigger.
-  const batch = tierQueue.ingest(staged.msgs);
+  // so an idle agent is never woken — it rides the digest of the next trigger,
+  // or flushes on its own once the oldest queued message exceeds MAX_QUEUE_MS.
+  const now = Date.now();
+  const batch = tierQueue.ingest(staged.msgs, now) ?? tierQueue.flushOverdue(now);
   if (!batch) return;
   pending.push(...batch);
   scheduleFlush();

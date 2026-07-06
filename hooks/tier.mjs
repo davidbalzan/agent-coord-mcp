@@ -51,17 +51,37 @@ export function isGateRunnerRole(role) {
 // returns the batch to deliver (trigger(s) + entire queued routine backlog)
 // or null when nothing urgent arrived — the caller then leaves cursors alone
 // so the backlog stays unread and cannot be lost.
+//
+// maxAgeMs bounds how long routine traffic can sit without an urgent trigger:
+// once the OLDEST queued message exceeds it, flushOverdue() drains the whole
+// backlog as a routine-only digest. 0 (default) disables age-based flushing.
+// Callers pass `now` explicitly so the class stays clock-free and testable.
 export class TierQueue {
-  constructor() {
+  constructor(opts = {}) {
     this.routine = [];
+    this.maxAgeMs = opts.maxAgeMs ?? 0;
+    this.oldestAt = null;
   }
-  ingest(msgs) {
+  ingest(msgs, now = 0) {
     const urgent = msgs.filter((m) => m.tier === "urgent");
-    this.routine.push(...msgs.filter((m) => m.tier !== "urgent"));
+    const routine = msgs.filter((m) => m.tier !== "urgent");
+    if (routine.length > 0 && this.oldestAt === null) this.oldestAt = now;
+    this.routine.push(...routine);
     if (urgent.length === 0) return null;
     const batch = [...urgent, ...this.routine];
     this.routine = [];
+    this.oldestAt = null;
     return batch;
+  }
+  // Drain the backlog when its oldest entry has waited past maxAgeMs.
+  // Returns the routine-only batch to deliver, or null if nothing is overdue.
+  flushOverdue(now) {
+    if (this.maxAgeMs <= 0 || this.oldestAt === null) return null;
+    if (now - this.oldestAt < this.maxAgeMs) return null;
+    const batch = this.routine;
+    this.routine = [];
+    this.oldestAt = null;
+    return batch.length > 0 ? batch : null;
   }
   size() {
     return this.routine.length;

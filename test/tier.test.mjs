@@ -106,6 +106,38 @@ test("TierQueue: routine-only ingest never pushes; trigger drains the backlog", 
   assert.equal(q.size(), 0); // drained — next push starts a fresh digest
 });
 
+test("TierQueue: max-age flush drains an overdue routine backlog", () => {
+  const q = new TierQueue({ maxAgeMs: 1000 });
+  const r1 = { ...room("FYI: one"), tier: "routine" };
+  const r2 = { ...room("RISK: two"), tier: "routine" };
+  assert.equal(q.ingest([r1], 0), null);
+  assert.equal(q.ingest([r2], 400), null);
+  // Age is measured from the OLDEST entry, not the newest.
+  assert.equal(q.flushOverdue(999), null);
+  assert.deepEqual(q.flushOverdue(1000), [r1, r2]);
+  assert.equal(q.size(), 0);
+  // Drained — nothing further to flush, and the age clock has reset.
+  assert.equal(q.flushOverdue(5000), null);
+  assert.equal(q.ingest([{ ...room("FYI: three"), tier: "routine" }], 6000), null);
+  assert.equal(q.flushOverdue(6999), null); // not overdue relative to new oldest
+  assert.equal(q.flushOverdue(7000)?.length, 1);
+});
+
+test("TierQueue: urgent drain resets the max-age clock", () => {
+  const q = new TierQueue({ maxAgeMs: 1000 });
+  q.ingest([{ ...room("FYI: old"), tier: "routine" }], 0);
+  const trigger = { ...dm("GO: now"), tier: "urgent" };
+  assert.equal(q.ingest([trigger], 500).length, 2); // backlog rode the trigger
+  assert.equal(q.flushOverdue(10_000), null); // nothing left to age out
+});
+
+test("TierQueue: maxAgeMs of 0 (default) never age-flushes", () => {
+  const q = new TierQueue();
+  q.ingest([{ ...room("FYI: forever"), tier: "routine" }], 0);
+  assert.equal(q.flushOverdue(Number.MAX_SAFE_INTEGER), null);
+  assert.equal(q.size(), 1);
+});
+
 // 2026-01-01T08:05:00Z — fixed instant so the HH:MM assertion is stable.
 const TS_0805 = Date.UTC(2026, 0, 1, 8, 5, 0);
 
