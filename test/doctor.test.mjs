@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { spawn, spawnSync } from "node:child_process";
 
 const tmp = mkdtempSync(path.join(tmpdir(), "coord-doctor-"));
 process.env.AGENT_COORD_DIR = path.join(tmp, "coord");
@@ -15,9 +16,11 @@ store.ensureDirs();
 
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
-// Ignore the environment check — it warns when tmux isn't on PATH, which is
-// machine-dependent and orthogonal to bus state.
-const stateFindings = (r) => r.findings.filter((f) => f.check !== "environment");
+// Ignore checks that depend on real external state rather than bus JSONL
+// contents: `environment` warns when tmux isn't on PATH, and
+// `wedged-local-pushers` probes real tmux panes by target id — both
+// machine-dependent and orthogonal to what these tests seed on disk.
+const stateFindings = (r) => r.findings.filter((f) => f.check !== "environment" && f.check !== "wedged-local-pushers");
 
 test("doctor reports a clean bus as healthy and touches nothing", async () => {
   await t.registerTool({ agentId: "solo" });
@@ -121,6 +124,71 @@ test("doctor flags a stale local pusher (loaded mtime < on-disk mtime)", async (
   assert.ok(f.items.some((i) => i.includes("staleagent")));
   assert.ok(f.detail.includes("control commands"));
 });
+
+// Real tmux state, not fixtures — a "wedged" pusher (pid alive, pane dead) is
+// only distinguishable from a healthy one by actually probing the pane, so
+// this test creates and kills a real tmux session rather than faking targets.
+const tmuxOnMachine = spawnSync("tmux", ["-V"]).status === 0;
+(tmuxOnMachine ? test : test.skip)(
+  "doctor reaps a wedged local pusher (pid-alive, pane-dead) under fix:true, leaves a live one alone",
+  async () => {
+    const session = `coord-doctor-test-${process.pid}`;
+    spawnSync("tmux", ["new-session", "-d", "-s", session]);
+    const paneId = spawnSync("tmux", ["display-message", "-p", "-t", session, "#{pane_id}"])
+      .stdout.toString()
+      .trim();
+    assert.ok(paneId, "failed to create a real tmux pane for the test");
+
+    // A real, disposable process for the wedged marker's pid — doctor's
+    // fix SIGTERMs it, which must NOT be this test's own pid.
+    const dummy = spawn("sleep", ["300"]);
+    await new Promise((resolve) => dummy.once("spawn", resolve));
+
+    try {
+      // Alive: our own pid, a pane that genuinely exists.
+      await t.registerTool({ agentId: "liveagent" });
+      await store.updateJson(store.transportFile("liveagent"), {}, () => ({
+        agentId: "liveagent",
+        transport: "tmux-push",
+        pid: process.pid,
+        tmuxTarget: paneId,
+        since: Date.now(),
+      }));
+
+      // Wedged: a real, alive pid (so isPidAlive/isMarkerLive still call it
+      // "live"), but a pane id that cannot exist.
+      await t.registerTool({ agentId: "wedgedagent" });
+      await store.updateJson(store.transportFile("wedgedagent"), {}, () => ({
+        agentId: "wedgedagent",
+        transport: "tmux-push",
+        pid: dummy.pid,
+        tmuxTarget: "%999999",
+        since: Date.now(),
+      }));
+
+      const dry = await t.doctorTool({});
+      const dryFinding = dry.findings.find((x) => x.check === "wedged-local-pushers");
+      assert.ok(dryFinding, "wedged-local-pushers finding present");
+      assert.equal(dryFinding.level, "warn");
+      assert.ok(dryFinding.items.some((i) => i.includes("wedgedagent")));
+      assert.ok(!dryFinding.items.some((i) => i.includes("liveagent")), "live pusher must not be flagged");
+      // Dry run doesn't touch anything — the marker is still on disk.
+      assert.ok(await store.readJson(store.transportFile("wedgedagent"), null));
+
+      const fixed = await t.doctorTool({ fix: true });
+      assert.ok(fixed.fixed.some((f) => f.includes("wedgedagent")));
+      assert.equal(await store.readJson(store.transportFile("wedgedagent"), null), null, "marker cleared");
+      assert.ok(await store.readJson(store.transportFile("liveagent"), null), "live pusher's marker untouched");
+
+      const after = await t.doctorTool({});
+      const afterFinding = after.findings.find((x) => x.check === "wedged-local-pushers");
+      assert.equal(afterFinding.level, "ok", "clean on a follow-up run");
+    } finally {
+      spawnSync("tmux", ["kill-session", "-t", session]);
+      try { dummy.kill("SIGKILL"); } catch { /* already reaped by doctor's fix */ }
+    }
+  },
+);
 
 test("doctor doesn't warn when the marker has no scriptMtime (pre-v0.8.2 marker)", async () => {
   await t.registerTool({ agentId: "legacy" });
