@@ -83,17 +83,36 @@ try {
 // Call a tool and JSON-parse the wrapped text content. The server's tool
 // handlers return { content: [{ type:"text", text: JSON.stringify(payload) }] }
 // (see jsonResult in src/server.ts), so we unwrap exactly once.
-async function call(name, args) {
+//
+// { strict: true } makes an MCP tool error (isError:true — e.g. an
+// identity-mismatch on register/report_transport) throw instead of being
+// silently returned as parsed data. Startup uses this so a failed
+// register/report_transport can't be mistaken for success.
+async function call(name, args, { strict = false } = {}) {
   // SDK zod schemas reject arguments:undefined; send {} for parameter-less tools.
   const r = await client.callTool({ name, arguments: args ?? {} });
   const text = r?.content?.[0]?.text;
-  if (typeof text !== "string") return r;
-  try { return JSON.parse(text); } catch { return text; }
+  const data = typeof text !== "string" ? r : parseOr(text, text);
+  if (strict && r?.isError) {
+    throw new Error(typeof data === "string" ? data : JSON.stringify(data));
+  }
+  return data;
+}
+
+function parseOr(text, fallback) {
+  try { return JSON.parse(text); } catch { return fallback; }
 }
 
 // Register (idempotent), then publish the transport marker so list_agents
-// shows us attached. Marker liveness is heartbeat-based server-side.
-await call("register", { agentId: AGENT_ID });
+// shows us attached. Marker liveness is heartbeat-based server-side. Both
+// calls are strict: a server-side isError (e.g. identity-mismatch on a
+// stale/reused token) must hard-fail the process rather than let us log
+// "attached" and heartbeat into the void while delivering nothing.
+try {
+  await call("register", { agentId: AGENT_ID }, { strict: true });
+} catch (e) {
+  die(`register failed: ${e?.message ?? e}`);
+}
 // Stamp the mtime of THIS process's loaded script so doctor() can spot a
 // stale remote pusher after a remote-side upgrade (see v0.8.2 stale-pusher
 // check — same hazard as the local tmux-pusher).
@@ -103,14 +122,22 @@ try {
   const { fileURLToPath } = await import("node:url");
   scriptMtime = statSync(fileURLToPath(import.meta.url)).mtimeMs;
 } catch { /* non-fatal */ }
-await call("report_transport", {
-  agentId: AGENT_ID,
-  transport: "tmux-push-remote",
-  host: hostname(),
-  tmuxTarget: TMUX_TARGET,
-  since: Date.now(),
-  ...(scriptMtime !== undefined ? { scriptMtime } : {}),
-});
+try {
+  await call(
+    "report_transport",
+    {
+      agentId: AGENT_ID,
+      transport: "tmux-push-remote",
+      host: hostname(),
+      tmuxTarget: TMUX_TARGET,
+      since: Date.now(),
+      ...(scriptMtime !== undefined ? { scriptMtime } : {}),
+    },
+    { strict: true },
+  );
+} catch (e) {
+  die(`report_transport failed: ${e?.message ?? e}`);
+}
 process.stderr.write(
   `[coord-pusher] attached agent='${AGENT_ID}' tmux=${TMUX_TARGET} server=${SERVER} (room=${INCLUDE_ROOM ? "on" : "off"})\n`,
 );
