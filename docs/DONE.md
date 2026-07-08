@@ -16,6 +16,7 @@ those glyphs; an ASCII hyphen/period renders the panel empty.
 
 ## Done
 
+- [x] `rename_agent` refreshes in-process token map without requiring SIGHUP — davidbalzan/agent-coord-mcp#8 · 2026-07-08
 - [x] Compact injection format over the tiered formatter (v0.14.0) — davidbalzan/agent-coord-mcp#6 · 2026-07-03
 - [x] coord-chat `/doctor` command + `--doctor` CLI flag (v0.13.0) — davidbalzan/agent-coord-mcp#5 · 2026-07-03
 - [x] Delivery tiers + digest batching in the pusher (v0.12.0) — davidbalzan/agent-coord-mcp#4 · 2026-07-03
