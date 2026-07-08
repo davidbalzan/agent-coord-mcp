@@ -105,18 +105,59 @@ export function readTokenMapSync(): Map<string, string> | null {
   return out;
 }
 
+// In-process cache of the token map, shared by the HTTP identity-binding
+// layer (server.ts) and rotateAgentToken below. A module-level cache (rather
+// than each caller re-reading the file) is what lets a rename refresh the
+// live server's view without an operator SIGHUP.
+let tokenMapCache: Map<string, string> | null = null;
+let tokenMapInitialized = false;
+
+// Current in-process token map (bearer -> agentId), or null if unbound (no
+// tokens.json). Lazily loads from disk on first call.
+export function getTokenMap(): Map<string, string> | null {
+  if (!tokenMapInitialized) {
+    tokenMapCache = readTokenMapSync();
+    tokenMapInitialized = true;
+  }
+  return tokenMapCache;
+}
+
+// Re-read tokens.json from disk and replace the in-process cache. Throws on
+// a malformed file — callers decide whether that's fatal (startup) or
+// recoverable (SIGHUP, post-rotate refresh).
+export function reloadTokenMapSync(): Map<string, string> | null {
+  tokenMapCache = readTokenMapSync();
+  tokenMapInitialized = true;
+  return tokenMapCache;
+}
+
 // Atomically rotate the token entry for an agent rename (used by
 // rename_agent so the same bearer continues to authenticate the renamed
 // identity). No-op if the file is absent or the old id isn't in the map.
 export async function rotateAgentToken(oldAgentId: string, newAgentId: string): Promise<void> {
   if (!existsSync(TOKENS_FILE)) return;
+  let rotated = false;
   await updateJson<Record<string, string>>(TOKENS_FILE, {}, (current) => {
     if (current[oldAgentId] !== undefined) {
       current[newAgentId] = current[oldAgentId];
       delete current[oldAgentId];
+      rotated = true;
     }
     return current;
   });
+  if (rotated) {
+    // Refresh the in-process cache immediately: without this, the renamed
+    // agent's bearer keeps resolving to the OLD id in this process until an
+    // operator sends SIGHUP, silently misattributing its calls.
+    try {
+      reloadTokenMapSync();
+    } catch (e) {
+      console.error(
+        `[agent-coord-mcp] rename_agent: token map reload after rotate failed: ${(e as Error).message} ` +
+          `(keeping previous in-process map; send SIGHUP to retry)`,
+      );
+    }
+  }
 }
 
 export type RoomEntry = {

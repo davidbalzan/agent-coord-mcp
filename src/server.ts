@@ -4,7 +4,7 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { ensureDirs, readTokenMapSync } from "./store.js";
+import { ensureDirs, getTokenMap, reloadTokenMapSync } from "./store.js";
 import {
   attachAgentSchema,
   attachAgentTool,
@@ -344,12 +344,13 @@ function buildServer(initialBound?: string): McpServer {
   return server;
 }
 
-// Lazy-loaded token map for HTTP identity binding. Hot-reloaded on SIGHUP so
-// operators can rotate / add agents without a server restart.
-let tokenMap: Map<string, string> | null = null;
+// Token map for HTTP identity binding, held in-process via store.ts's
+// shared cache. Hot-reloaded on SIGHUP so operators can rotate / add agents
+// without a server restart; also refreshed automatically by rename_agent
+// (see rotateAgentToken) so a live rename doesn't need one.
 function loadTokenMap(initial: boolean): void {
   try {
-    tokenMap = readTokenMapSync();
+    reloadTokenMapSync();
   } catch (e) {
     // On initial load a bad file is fatal — refuse to start in a known-bad
     // auth state. On SIGHUP, log and keep the previous (valid) map.
@@ -361,7 +362,7 @@ function loadTokenMap(initial: boolean): void {
     return;
   }
   if (!initial) {
-    console.error(`[agent-coord-mcp] SIGHUP: token map reloaded (${tokenMap?.size ?? 0} agents)`);
+    console.error(`[agent-coord-mcp] SIGHUP: token map reloaded (${getTokenMap()?.size ?? 0} agents)`);
   }
 }
 
@@ -396,7 +397,7 @@ async function main() {
 
 async function startHttp(port: number): Promise<void> {
   const sharedToken = process.env.AGENT_COORD_TOKEN;
-  const bound = tokenMap !== null;
+  const bound = getTokenMap() !== null;
   if (!bound && !sharedToken) {
     console.error(
       "[agent-coord-mcp] HTTP mode needs auth: either set AGENT_COORD_TOKEN (legacy " +
@@ -486,6 +487,7 @@ async function startHttp(port: number): Promise<void> {
   function resolveBoundAgent(authHeader: string | undefined): { ok: boolean; agent?: string } {
     if (!authHeader || !authHeader.startsWith("Bearer ")) return { ok: false };
     const bearer = authHeader.slice("Bearer ".length);
+    const tokenMap = getTokenMap();
     if (tokenMap) {
       const agent = tokenMap.get(bearer);
       return agent ? { ok: true, agent } : { ok: false };
@@ -528,7 +530,7 @@ async function startHttp(port: number): Promise<void> {
       // a leaked session id could drive that session's identity (session hijack).
       if (
         transport &&
-        tokenMap &&
+        getTokenMap() &&
         typeof sid === "string" &&
         sessionAgents.get(sid) !== resolved.agent
       ) {
@@ -555,7 +557,7 @@ async function startHttp(port: number): Promise<void> {
   });
 
   http.listen(port, bindAddr, () => {
-    const mode = bound ? `pre-bound (${tokenMap?.size ?? 0} agents)` : "TOFU";
+    const mode = bound ? `pre-bound (${getTokenMap()?.size ?? 0} agents)` : "TOFU";
     console.error(`[agent-coord-mcp] http listening on ${bindAddr}:${port} — identity ${mode}`);
     if (bindAddr !== "127.0.0.1" && bindAddr !== "localhost") {
       console.error(

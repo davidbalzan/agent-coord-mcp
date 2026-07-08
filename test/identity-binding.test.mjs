@@ -86,3 +86,23 @@ test("renameAgentTool rotates the token entry when binding is configured", async
   assert.equal(m.get("tk_o"), "other", "unrelated entries untouched");
   unlinkSync(store.TOKENS_FILE);
 });
+
+test("rotateAgentToken refreshes the in-process cache without a SIGHUP reload", async () => {
+  // Simulate the live server: an initial load populates the in-process cache
+  // (what loadTokenMap(true) does at startup).
+  writeFileSync(store.TOKENS_FILE, JSON.stringify({ grace: "tk_g" }));
+  store.reloadTokenMapSync();
+  assert.equal(store.getTokenMap().get("tk_g"), "grace", "cache reflects the initial load");
+
+  await store.rotateAgentToken("grace", "grace-prime");
+
+  // No reloadTokenMapSync()/SIGHUP in between — getTokenMap() must already
+  // resolve the bearer to the new id, or a renamed agent's live HTTP
+  // connections would keep authenticating as the pre-rename identity.
+  assert.equal(
+    store.getTokenMap().get("tk_g"),
+    "grace-prime",
+    "in-process cache is refreshed by the rotate itself",
+  );
+  unlinkSync(store.TOKENS_FILE);
+});
