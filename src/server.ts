@@ -88,16 +88,25 @@ function buildServer(initialBound?: string): McpServer {
 
   // Gate every tool that takes a caller identity. `field: null` (list_agents,
   // list_rooms, prune) bypasses the check entirely.
+  //
+  // `bindOnClaim: false` (status, ping) means the tool still enforces a
+  // mismatch against an *existing* binding, but a fresh (unbound) session
+  // never claims one just by naming an agentId — a diagnostic status/ping
+  // call must not be able to silently TOFU-bind a session to some other,
+  // already-live agent's identity.
   function gate(
     field: "agentId" | "from" | null,
     handler: (args: Record<string, unknown>) => Promise<unknown>,
+    { bindOnClaim = true }: { bindOnClaim?: boolean } = {},
   ) {
     return async (args: Record<string, unknown>) => {
       if (field) {
         const claimed = args[field];
         if (typeof claimed === "string") {
           if (bound === undefined) {
-            bound = claimed; // TOFU: first claim wins, then sticky.
+            if (bindOnClaim) {
+              bound = claimed; // TOFU: first claim wins, then sticky.
+            }
           } else if (bound !== claimed) {
             throw new Error(
               `identity bound to '${bound}'; rejected attempt to act as '${claimed}'`,
@@ -158,9 +167,9 @@ function buildServer(initialBound?: string): McpServer {
 
   server.tool(
     "status",
-    "Introspect this agent's coord state: registration, attached transport, inbox depth and unread count, and whether this MCP server is running inside tmux. Useful for debugging 'why isn't my DM landing'.",
+    "Introspect this agent's coord state: registration, attached transport, inbox depth and unread count, and whether this MCP server is running inside tmux. Useful for debugging 'why isn't my DM landing'. Read-only — naming an agentId here never binds this session's identity.",
     statusSchema,
-    gate("agentId", statusTool as (a: Record<string, unknown>) => Promise<unknown>),
+    gate("agentId", statusTool as (a: Record<string, unknown>) => Promise<unknown>, { bindOnClaim: false }),
   );
 
   server.tool(
@@ -172,9 +181,9 @@ function buildServer(initialBound?: string): McpServer {
 
   server.tool(
     "ping",
-    "Liveness probe for another agent, answered entirely from server-side state (registry entry, transport marker, pusher pid, tmux pane) — it never touches the target's session, so a fleet-wide sweep costs zero model tokens on the targets. Returns alive (fresh heartbeat or live transport), reachable (a DM pushed now would land), granular checks, and latencyMs. Distinct from heartbeat, which is an agent refreshing its OWN activity timestamp. Pass echo:true (default off) to additionally drop a PING DM into the target's inbox — that wakes the target's model, so use it sparingly and only when you need an agent-level acknowledgement. 'from' is enforced against the session's bound identity.",
+    "Liveness probe for another agent, answered entirely from server-side state (registry entry, transport marker, pusher pid, tmux pane) — it never touches the target's session, so a fleet-wide sweep costs zero model tokens on the targets. Returns alive (fresh heartbeat or live transport), reachable (a DM pushed now would land), granular checks, and latencyMs. Distinct from heartbeat, which is an agent refreshing its OWN activity timestamp. Pass echo:true (default off) to additionally drop a PING DM into the target's inbox — that wakes the target's model, so use it sparingly and only when you need an agent-level acknowledgement. 'from' is enforced against the session's bound identity, but read-only — naming 'from' here never binds this session's identity.",
     pingSchema,
-    gate("from", pingTool as (a: Record<string, unknown>) => Promise<unknown>),
+    gate("from", pingTool as (a: Record<string, unknown>) => Promise<unknown>, { bindOnClaim: false }),
   );
 
   server.tool(

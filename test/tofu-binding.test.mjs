@@ -139,3 +139,31 @@ test("identity-less tools (list_agents, list_rooms) don't establish a TOFU bind"
   assert.equal(parsed(reg).ok, true);
   await c.close();
 });
+
+test("diagnostic status/ping never establish a TOFU bind, even when passed a live agent's id", async () => {
+  const dir = path.join(tmp, "diagnostic-noclaim");
+  // First session registers and heartbeats "victim" so it has a fresh
+  // heartbeat by the time the second (fresh, dev) session probes it.
+  const owner = await spawn(dir);
+  await owner.callTool({ name: "register", arguments: { agentId: "victim" } });
+
+  const dev = await spawn(dir);
+  // A diagnostic status/ping call naming the already-live "victim" must not
+  // silently bind this fresh session to that identity.
+  await dev.callTool({ name: "status", arguments: { agentId: "victim" } });
+  await dev.callTool({ name: "ping", arguments: { from: "victim", to: "victim" } });
+  // The dev session should still be free to claim its own identity.
+  const reg = await dev.callTool({ name: "register", arguments: { agentId: "dev-session" } });
+  assert.equal(parsed(reg).ok, true);
+  // And acting as "victim" now must be rejected as an identity mismatch,
+  // proving status/ping truly never bound this session to it.
+  let threw, result;
+  try {
+    result = await dev.callTool({ name: "register", arguments: { agentId: "victim" } });
+  } catch (e) {
+    threw = e;
+  }
+  assert.match(errMsg(threw, result), /identity bound to 'dev-session'/);
+  await owner.close();
+  await dev.close();
+});
