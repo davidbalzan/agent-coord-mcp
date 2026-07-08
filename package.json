@@ -10,10 +10,10 @@
   },
   "scripts": {
     "build": "tsc",
-    "prepare": "tsc",
+    "prepare": "node scripts/check-self-dependency.mjs && tsc",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
-    "pretest": "tsc",
+    "pretest": "node scripts/check-self-dependency.mjs && tsc",
     "test": "node --test \"test/*.test.mjs\""
   },
   "files": [
