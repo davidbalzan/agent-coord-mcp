@@ -364,7 +364,7 @@ AGENT_COORD_DIR=~/agent-coord \
 agent-coord-mcp
 ```
 
-Defaults to `127.0.0.1`. To bind to a LAN address (Tailscale, WireGuard, etc.) set `AGENT_COORD_BIND=10.x.y.z`; the process logs a warning if it binds to anything non-loopback so you don't accidentally serve unauthenticated traffic. `GET /healthz` is unauthenticated (for reverse-proxy probes); everything else requires `Authorization: Bearer <AGENT_COORD_TOKEN>`. TLS is out of scope — front with Caddy/nginx, or skip TLS entirely on a private overlay network.
+Defaults to `127.0.0.1`. To bind to a LAN / overlay address (Tailscale, WireGuard, etc.) set `AGENT_COORD_BIND=10.x.y.z`; a non-loopback bind trips the fail-closed gate below — the server **refuses to start** (rather than warns) unless identity and transport are both secured. `GET /healthz` is unauthenticated (for reverse-proxy / orchestrator probes); everything else requires `Authorization: Bearer <token>`. TLS is out of scope — front with Caddy/nginx, or skip TLS entirely on a private overlay network.
 
 The server can run as a long-lived daemon on one machine (the "host") while local agents on that host keep using stdio per-session; the two modes don't conflict — they're separate processes.
 
@@ -375,9 +375,31 @@ The server can run as a long-lived daemon on one machine (the "host") while loca
 
 Mint the per-agent tokens with `coord-token` (below). Loopback binds are exempt from both checks, so single-host use needs no extra setup.
 
+**Example — bind to a Tailscale IP.** Tailscale/WireGuard *is* the secured transport (WireGuard-encrypted), so `AGENT_COORD_INSECURE=1` is the correct acknowledgement here, not a hack. On the host, after minting at least one token (see [Identity binding](#identity-binding-v070)):
+
+```bash
+node scripts/coord-token.mjs add worker-2      # creates ~/agent-coord/tokens.json, prints the token
+AGENT_COORD_HTTP_PORT=8765 \
+AGENT_COORD_BIND=100.x.y.z \                    # this host's Tailscale IP (`tailscale ip -4`)
+AGENT_COORD_INSECURE=1 \                        # ack: WireGuard is the encryption layer
+  node dist/server.js
+```
+
+Remote nodes then reach it at `http://100.x.y.z:8765/mcp`. Add or rotate tokens later without a restart: `coord-token add <id>` then `kill -HUP <bus-pid>` reloads the map. `GET http://100.x.y.z:8765/healthz` (no auth) is a quick reachability check from another tailnet device.
+
+### Joining from another machine
+
+A remote participant is just an **MCP client with a bearer token** — there is nothing to build or clone. What you need depends on how you connect:
+
+- **Claude Code (or any MCP client that speaks HTTP): nothing to install.** The client already speaks MCP; a config entry (below) is the entire setup. You do *not* need this package on the client to use the tools.
+- **Optional real-time push into a tmux pane:** install the package globally (`npm i -g agent-coord-mcp`) for the `coord-pusher` bin (the MCP SDK ships with it — no repo needed). See [`coord-pusher`](#coord-pusher--real-time-push-cross-machine) below. Without it you simply poll with `read_messages` / `wait_for_message`.
+- **Operator-side tools** (`coord-token`, `coord-node.sh`) live in the repo and run on the **bus host**, not on a pure client. `coord-node.sh` is not a published bin, so a client without the repo can't (and needn't) run it.
+
+> ⚠️ **Installing the package globally does not connect you to a remote bus.** The `agent-coord-mcp` bin is the *stdio server* — pointing a Claude config at it spins up a **separate, local, file-backed bus on your own machine**, not a connection to anyone else's. To join a networked bus you must add the **HTTP** entry below (with `"type": "http"` and a URL), never the stdio server.
+
 ### Point a Claude Code session at the remote server
 
-In `~/.claude.json`:
+In `~/.claude.json` (or a project `.mcp.json`) — the token must be the one minted for *this* agent's id; the bus enforces that the id you `join` as matches the token:
 
 ```json
 {
@@ -385,11 +407,13 @@ In `~/.claude.json`:
     "agent-coord": {
       "type": "http",
       "url": "http://host:8765/mcp",
-      "headers": { "Authorization": "Bearer <AGENT_COORD_TOKEN>" }
+      "headers": { "Authorization": "Bearer <this-agent's-token>" }
     }
   }
 }
 ```
+
+Or via the CLI (no hand-editing): `claude mcp add --transport http --scope user agent-coord http://host:8765/mcp --header "Authorization: Bearer <token>"`.
 
 Then `join({agentId:"me"})` and call any tool exactly as you would locally. `send_message`, `read_messages`, `wait_for_message`, `list_rooms`, `join_room`, etc. all work identically.
 
@@ -469,7 +493,7 @@ Backward-compat: if `tokens.json` is absent, the legacy single shared `AGENT_COO
 ### Auth posture, briefly
 
 - Threat model: misbehaving / buggy / compromised same-LAN cooperator can no longer assert another agent's identity. Not a hostile-attacker model (TLS + per-message signing is a separate, larger task).
-- Don't bind to a public address without TLS. The server prints a warning if you do anyway.
+- Don't bind to a public address without TLS. A non-loopback bind is refused outright unless per-agent tokens are configured **and** `AGENT_COORD_INSECURE=1` is set — and that acknowledgement is meant for a private overlay (Tailscale/WireGuard) or a TLS reverse proxy, not the open internet.
 
 ### Other clients
 
