@@ -862,6 +862,55 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
     });
   }
 
+  // 1c. Wedged local pushers (pid-alive, pane-dead). v0.8.0 made pushers
+  //     self-exit when their own tmux-target probe finds the pane gone, but
+  //     that only fires from inside the pusher's own poll loop — if the pane
+  //     is killed in a way that loop never observes (or the loop itself is
+  //     wedged), the pid stays alive, isMarkerLive's pid-alive check keeps
+  //     treating it as live, and list_agents reports it "live" while nothing
+  //     can actually be delivered. Local tmux-push only — a tmux-push-remote
+  //     marker's pane lives on a different host, unprobeable from here.
+  {
+    // Without a tmux binary we can't tell "wedged" from "can't probe" — skip
+    // rather than flag every local marker as dead.
+    const tmuxAvailable = spawnSync("tmux", ["-V"]).status === 0;
+    const wedged: { agentId: string; pid: number; file: string; target: string }[] = [];
+    if (tmuxAvailable) {
+      for (const fname of await listTransportFiles()) {
+        const file = path.join(TRANSPORT_DIR, fname);
+        const marker = await readJson<TransportMarker | null>(file, null);
+        if (!marker || !isMarkerLive(marker, reg, now)) continue;
+        if (marker.transport !== "tmux-push") continue; // remote = no local pane to probe
+        if (!marker.tmuxTarget) continue; // no target recorded, can't probe
+        // has-session actually validates the target and fails on a dead
+        // pane/session; `display-message -p -t <target> <literal>` does NOT
+        // (tmux 3.6b exits 0 for any target, even a just-killed one, when
+        // the format string has no #{...} needing that target resolved).
+        const probe = spawnSync("tmux", ["has-session", "-t", marker.tmuxTarget]);
+        if (probe.status === 0) continue; // pane alive
+        wedged.push({ agentId: marker.agentId, pid: marker.pid, file, target: marker.tmuxTarget });
+      }
+    }
+    if (fix) {
+      for (const w of wedged) {
+        try { process.kill(w.pid, "SIGTERM"); } catch { /* already gone */ }
+        await deleteFile(w.file);
+        fixed.push(`reaped wedged pusher for ${w.agentId} (pid ${w.pid}, tmux target '${w.target}' gone)`);
+      }
+    }
+    findings.push({
+      check: "wedged-local-pushers",
+      level: wedged.length ? "warn" : "ok",
+      detail: wedged.length
+        ? `${wedged.length} local pusher(s) alive (pid) but their tmux pane is gone — looks attached, delivers nothing. ${fix ? "Reaped (SIGTERM + marker cleared)." : "Run doctor with fix:true to SIGTERM and clear the marker."}`
+        : tmuxAvailable
+          ? "no wedged local pushers (pid-alive, pane-dead)"
+          : "tmux not available — skipped wedged-pusher pane probe",
+      fixable: true,
+      items: wedged.length ? wedged.map((w) => `${w.agentId} (pid ${w.pid}, tmux target '${w.target}')`) : undefined,
+    });
+  }
+
   // 2. Orphan room memberships (member not in the registry).
   {
     const orphans = new Set<string>();
