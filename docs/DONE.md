@@ -16,6 +16,7 @@ those glyphs; an ASCII hyphen/period renders the panel empty.
 
 ## Done
 
+- [x] Read-only status/ping never establish a TOFU identity binding (P2 partial — item 2 of 3; items 1 & 3 pending architecture steer) — davidbalzan/agent-coord-mcp#12 · 2026-07-08
 - [x] `coord-pusher` hard-fails on startup register/report_transport errors — davidbalzan/agent-coord-mcp#10 · 2026-07-08
 - [x] `rename_agent` refreshes in-process token map without requiring SIGHUP — davidbalzan/agent-coord-mcp#8 · 2026-07-08
 - [x] Compact injection format over the tiered formatter (v0.14.0) — davidbalzan/agent-coord-mcp#6 · 2026-07-03
