@@ -39,11 +39,18 @@
  * while this daemon runs — both consume the same cursor and would race.
  *
  * Caveats:
- *   - Pasting types into whatever pane state exists. If you're mid-typing in
- *     the same pane, your buffer gets corrupted. Run the receiving agent in a
- *     dedicated pane you don't normally edit in.
- *   - The pusher can't tell if the agent is idle, mid-tool, or showing a
- *     permission prompt. send-keys is unconditional.
+ *   - PEER MESSAGES paste into whatever pane state exists. If you're mid-typing
+ *     in the same pane, your buffer gets corrupted. Run the receiving agent in
+ *     a dedicated pane you don't normally edit in.
+ *   - CONTROL COMMANDS (/clear, /compact) are the exception: since they paste
+ *     RAW, a pane that is busy or holds an unsent draft would either queue them
+ *     behind a running turn or append them to the draft and ship the result to
+ *     the model as ordinary text — both observed live, both reporting
+ *     delivery:"confirmed". So control submission is CONDITIONAL: it waits
+ *     (bounded) for a busy pane to go idle, refuses to paste onto a draft, and
+ *     verifies via capture-pane that the command left the input. An unverified
+ *     submission reports delivery:"pending" with a reason, never "confirmed".
+ *     See hooks/submit.mjs, shared with scripts/coord-pusher.mjs.
  */
 
 import {
