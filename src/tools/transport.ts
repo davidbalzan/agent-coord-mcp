@@ -189,25 +189,66 @@ export const sendCommandSchema = {
   deliveryTimeoutMs: z.number().int().min(0).max(30_000).optional(),
 };
 
+// A receipt as the pusher writes it. `submitted` is present only on control
+// receipts from a pusher new enough to VERIFY submission (v0.19.0+).
+type Receipt = { id: string; ts: number; control?: boolean; submitted?: boolean; verified?: boolean; reason?: string };
+
 // Poll an agent's receipt log until a receipt for `msgId` appears or the
-// deadline passes. Returns the delivery timestamp, or null on timeout. The
-// receipt is written by the receiver's pusher AFTER send-keys, so a hit is
-// genuine proof the keystrokes reached the pane. File-only — no agent context.
-async function waitForReceipt(
-  agentId: string,
-  msgId: string,
-  timeoutMs: number,
-): Promise<number | null> {
+// deadline passes. Returns the receipt, or null on timeout. File-only — no
+// agent context.
+//
+// A receipt proves the pusher TYPED the payload into the pane. For a control
+// command that is NOT proof it ran: the command can sit in the input behind an
+// autocomplete menu, delivered and inert. `submitted` is the field that
+// distinguishes them, and `deliveryOutcome` below is the only place allowed to
+// turn a receipt into a "confirmed".
+async function waitForReceipt(agentId: string, msgId: string, timeoutMs: number): Promise<Receipt | null> {
   const file = receiptFile(agentId);
   const deadline = Date.now() + timeoutMs;
   // First check is immediate; then poll on a short interval.
   for (;;) {
-    const receipts = await readJsonl<{ id: string; ts: number }>(file);
+    const receipts = await readJsonl<Receipt>(file);
     const hit = receipts.find((r) => r.id === msgId);
-    if (hit) return hit.ts ?? Date.now();
+    if (hit) return { ...hit, ts: hit.ts ?? Date.now() };
     if (Date.now() >= deadline) return null;
     await new Promise((res) => setTimeout(res, 150));
   }
+}
+
+// Turn a receipt (or its absence) into the delivery verdict for a CONTROL
+// command. Only `submitted === true` earns "confirmed" — anything else is
+// pending with a reason the caller can act on. Reporting an unverified
+// submission as confirmed is the defect this exists to remove: a check that
+// cannot fail loudly is worse than no check.
+export function deliveryOutcome(
+  agentId: string,
+  receipt: Receipt | null,
+  timeoutMs: number,
+): { delivery: "confirmed" | "pending"; at?: number; reason?: string } {
+  if (!receipt) {
+    return {
+      delivery: "pending",
+      reason: `no delivery receipt from '${agentId}' within ${timeoutMs}ms — the command was written but may not have reached the pane (stale/wedged pusher). Run doctor or re-attach the agent.`,
+    };
+  }
+  if (receipt.submitted === true) return { delivery: "confirmed", at: receipt.ts };
+  if (receipt.submitted === false) {
+    return {
+      delivery: "pending",
+      at: receipt.ts,
+      reason:
+        receipt.reason ??
+        `'${agentId}' pasted the command but could not confirm it was submitted — it may be sitting in the input.`,
+    };
+  }
+  // No `submitted` field: a pre-v0.19.0 pusher that stamps on paste. It may
+  // well have worked — but it cannot tell us, and guessing "confirmed" is the
+  // lie we are removing. Say what is actually known.
+  return {
+    delivery: "pending",
+    at: receipt.ts,
+    reason: `'${agentId}' typed the command into its pane, but its pusher predates submit verification and cannot confirm the command ran — re-attach the agent (detach_agent + attach_agent) to upgrade it.`,
+  };
 }
 
 function defaultReminderText(agentId: string): string {
@@ -308,8 +349,9 @@ export async function sendCommandTool(args: {
     // confirmation rides back in THIS tool result, costing no extra agent context.
     const wait = args.waitForDelivery ?? true;
     const deliveryTimeoutMs = args.deliveryTimeoutMs ?? 8000;
-    const confirmedAt = wait ? await waitForReceipt(args.to, msg.id, deliveryTimeoutMs) : null;
-    const confirmed = confirmedAt !== null;
+    const receipt = wait ? await waitForReceipt(args.to, msg.id, deliveryTimeoutMs) : null;
+    const outcome = wait ? deliveryOutcome(args.to, receipt, deliveryTimeoutMs) : null;
+    const confirmed = outcome?.delivery === "confirmed";
     // After /clear the receiver forgets its identity and that it's bus-attached
     // (the system prompt isn't re-applied because /clear isn't a session
     // start). Schedule a follow-up DM as a re-anchor; opt out with reminderMs:0.
@@ -325,16 +367,12 @@ export async function sendCommandTool(args: {
       // delivery: confirmed = pusher typed it into the pane; pending = written but
       // unconfirmed within the timeout (stale/wedged pusher — run doctor). Absent
       // when waitForDelivery:false.
-      ...(wait
+      ...(wait && outcome
         ? {
-            delivery: confirmed ? "confirmed" : "pending",
+            delivery: outcome.delivery,
             confirmed,
-            ...(confirmedAt !== null ? { deliveredAt: confirmedAt } : {}),
-            ...(confirmed
-              ? {}
-              : {
-                  warning: `no delivery receipt from '${args.to}' within ${deliveryTimeoutMs}ms — the command was written but may not have reached the pane (stale/wedged pusher). Run doctor or re-attach the agent.`,
-                }),
+            ...(outcome.at !== undefined ? { deliveredAt: outcome.at } : {}),
+            ...(confirmed ? {} : { warning: outcome.reason }),
           }
         : {}),
       ...(reminderMs > 0 ? { reminderScheduled: { delayMs: reminderMs, recipients: [args.to] } } : {}),
@@ -369,12 +407,19 @@ export async function sendCommandTool(args: {
   const deliveryTimeoutMs = args.deliveryTimeoutMs ?? 8000;
   let confirmed: string[] = [];
   let pending: string[] = [];
+  let pendingReasons: string[] = [];
   if (wait) {
     const results = await Promise.all(
-      delivered.map(async (m) => ({ m, at: await waitForReceipt(m, msg.id, deliveryTimeoutMs) })),
+      delivered.map(async (m) => ({
+        m,
+        outcome: deliveryOutcome(m, await waitForReceipt(m, msg.id, deliveryTimeoutMs), deliveryTimeoutMs),
+      })),
     );
-    confirmed = results.filter((r) => r.at !== null).map((r) => r.m);
-    pending = results.filter((r) => r.at === null).map((r) => r.m);
+    confirmed = results.filter((r) => r.outcome.delivery === "confirmed").map((r) => r.m);
+    pending = results.filter((r) => r.outcome.delivery !== "confirmed").map((r) => r.m);
+    pendingReasons = results
+      .filter((r) => r.outcome.delivery !== "confirmed")
+      .map((r) => `${r.m}: ${r.outcome.reason}`);
   }
   // Same post-/clear re-anchor as the DM path — one reminder per delivered
   // member, in their own inbox, with their own agentId in the body.
@@ -395,7 +440,7 @@ export async function sendCommandTool(args: {
           ...(pending.length
             ? {
                 pending,
-                warning: `no delivery receipt within ${deliveryTimeoutMs}ms from: ${pending.join(", ")} — written but may not have reached their panes (stale/wedged pusher). Run doctor.`,
+                warning: `not confirmed as submitted within ${deliveryTimeoutMs}ms — ${pendingReasons.join(" | ")}`,
               }
             : {}),
         }

@@ -15,7 +15,7 @@
 
 import { spawn } from "node:child_process";
 
-const EXPECTED_TESTS = 186;
+const EXPECTED_TESTS = 196;
 
 const expected = Number(process.env.AGENT_COORD_EXPECTED_TESTS ?? EXPECTED_TESTS);
 // Same glob the suite always used — `--test test/` would recurse differently
