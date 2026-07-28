@@ -38,6 +38,8 @@ import {
   pruneTool,
   readMessagesSchema,
   readMessagesTool,
+  retrieveMessageSchema,
+  retrieveMessageTool,
   retrieveRoomHistorySchema,
   retrieveRoomHistoryTool,
   registerSchema,
@@ -227,6 +229,13 @@ function buildServer(initialBound?: string): McpServer {
     "Expand a compressed channel-history digest returned by read_messages. Pass the `hash` from the `history` field; optionally pass `query` to return only matching messages (case-insensitive substring). Entries are scoped to the agent that produced them and expire after 30 minutes — if expired, re-read the channel with a higher limit instead.",
     retrieveRoomHistorySchema,
     gate("agentId", retrieveRoomHistoryTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "retrieve_message",
+    "Expand a `retrieve_message id=<uuid>` handle from a pane digest into the full message and its typed `record`. A record whose text rendering spans multiple lines (a DAVID_DECISION packet) is delivered to a pane as ONE attributed line plus this handle; call it to get the structured record back. Reads the message by id from the channels you can read (your inbox and rooms you belong to), falling through to the append-only archive if compaction moved it — so unlike retrieve_room_history there is no TTL and nothing to expire. A handle for a message never delivered to you is simply not found.",
+    retrieveMessageSchema,
+    gate("agentId", retrieveMessageTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(

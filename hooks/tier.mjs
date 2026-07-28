@@ -177,7 +177,27 @@ export function injectLine(m) {
   const tag = String(m.tag ?? "").replace(/^room /, "");
   const d = new Date(m.ts ?? 0);
   const hhmm = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
-  return `  [${tag} ${hhmm} ${m.from}] ${m.text ?? ""}`;
+  let text = m.text ?? "";
+  // Phase 8 Task 6: a TYPED record whose rendering spans lines is delivered as
+  // ONE attributed line — first line, a count of what was withheld, and the
+  // message id as the retrieval handle. Continuation lines used to arrive bare,
+  // with no `[tag HH:MM from]` header, so a parser could not attribute them.
+  //
+  // The handle is the message id, NOT a stashed copy: the full record is
+  // already persisted in rooms/<chan>.jsonl or inbox/<id>.jsonl, and
+  // retrieve_message reads it back by id (falling through to the append-only
+  // archive if compaction moved it). A cache would have had a TTL and lost the
+  // record permanently on expiry.
+  //
+  // Gated on `m.record`: a record-LESS multi-line message is untouched and
+  // still arrives unattributed past line 1, exactly as today. Task 6 does not
+  // fix hand-typed multi-line messages, and must not change their bytes.
+  const nl = text.indexOf("\n");
+  if (nl !== -1 && m.record && typeof m.record.type === "string" && m.id) {
+    const held = text.split("\n").length - 1;
+    text = `${text.slice(0, nl)} [+${held} lines · record:${m.record.type} · retrieve_message id=${m.id}]`;
+  }
+  return `  [${tag} ${hhmm} ${m.from}] ${text}`;
 }
 
 // Render one delivery: urgent verbatim under the banner, then at most ONE
