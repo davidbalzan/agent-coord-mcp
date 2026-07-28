@@ -246,13 +246,15 @@ function collectSource(label, file, cursorKey, cur, staged) {
   if (fresh.length === 0) return;
   for (const m of fresh) {
     if (shouldInject(m)) {
-      // `kind` AFTER the spread: a stored Message carries its own `kind`
-      // ("decision"/"status"/"chatter" — retention weight), which is a
-      // different field with the same name. Spread-last let it overwrite the
-      // channel tag, so a room post tagged kind:"decision" (what the README
-      // recommends for GOs and verdicts) rendered as `[decision …]` instead of
-      // `[#general …]` and broke injectLine's parse contract.
-      const tagged = { ...m, kind: label };
+      // The channel tag lives in `tag`, not `kind`. A stored Message carries
+      // its own `kind` ("decision"/"status"/"chatter" — retention weight);
+      // sharing the name meant a room post tagged kind:"decision" (what the
+      // README recommends for GOs and verdicts) overwrote the channel tag and
+      // rendered as `[decision …]` instead of `[#general …]`, breaking
+      // injectLine's parse contract. Distinct names remove the collision at
+      // the source; assignment still follows the spread so a sender cannot
+      // smuggle a `tag` in either.
+      const tagged = { ...m, tag: label };
       // Assigned after the spread so a sender can't smuggle a tier field in.
       tagged.tier = effectiveTier(tagged, tierCtx);
       staged.msgs.push(tagged);
@@ -277,7 +279,7 @@ function collectRoomChannel(chan, cur, staged) {
   if (fresh.length === 0) return;
   for (const m of fresh) {
     if (shouldInject(m)) {
-      const tagged = { ...m, kind: `room #${c}` }; // see spread-order note above
+      const tagged = { ...m, tag: `room #${c}` }; // see channel-tag note above
       tagged.tier = effectiveTier(tagged, tierCtx);
       staged.msgs.push(tagged);
     }

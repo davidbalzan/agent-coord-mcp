@@ -48,7 +48,15 @@ export function classifyTier(m, opts = {}) {
   // wants it specifically, and DM volume is tiny next to room traffic. The
   // tiers exist to absorb broadcast noise, not point-to-point asks (the
   // liaison relaying a David question must not sit in a digest queue).
-  if (m.kind === "DM") return "urgent";
+  //
+  // `tag`, not `kind`: this is the pushers' synthetic channel tag ("DM" /
+  // "room #general"), set on their own copy of the message. It used to be
+  // called `kind`, which collided with the stored Message.kind (retention
+  // weight, "decision"/"status"/"chatter") — a room post tagged
+  // kind:"decision" overwrote the channel tag and rendered as `[decision …]`.
+  // The tag is process-local and never persisted, so it was the safe half of
+  // the collision to rename; Message.kind is on disk in every JSONL file.
+  if (m.tag === "DM") return "urgent";
   // Typed record wins outright when present — it is the sender's explicit
   // declaration, where a prefix is an inference from prose. No max() with the
   // prefix result: two sources that can each override the other is the
@@ -132,12 +140,12 @@ export class TierQueue {
 // The per-message PARSE CONTRACT line. Agent harnesses read from/room/text
 // back out of this, so its shape is load-bearing and MUST stay byte-identical
 // to coord-pusher.mjs's `injectLine`. Compact form (v0.14.0, salvaged from
-// v0.8.10): `  [<kind> <HH:MM> <from>] <text>` where kind drops the leading
+// v0.8.10): `  [<tag> <HH:MM> <from>] <text>` where tag drops the leading
 // "room " ("room #general" → "#general"), the timestamp is HH:MM UTC, and the
-// "from=" label is dropped (bare id). kind/time/from never contain spaces
+// "from=" label is dropped (bare id). tag/time/from never contain spaces
 // (ids are sanitized), so a parser splits on the first "] " unambiguously.
 export function injectLine(m) {
-  const tag = String(m.kind ?? "").replace(/^room /, "");
+  const tag = String(m.tag ?? "").replace(/^room /, "");
   const d = new Date(m.ts ?? 0);
   const hhmm = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
   return `  [${tag} ${hhmm} ${m.from}] ${m.text ?? ""}`;

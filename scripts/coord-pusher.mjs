@@ -215,12 +215,12 @@ async function flush() {
 
 // The per-message PARSE CONTRACT line — MUST stay byte-identical to
 // hooks/tier.mjs's injectLine (agent harnesses parse from/room/text out of
-// it). Compact form (v0.14.0): `  [<kind> <HH:MM> <from>] <text>`, kind drops
+// it). Compact form (v0.14.0): `  [<tag> <HH:MM> <from>] <text>`, tag drops
 // the leading "room ", timestamp is HH:MM UTC, no "from=" label. This pusher
 // is standalone (may deploy without hooks/), so the helper is duplicated
 // rather than imported; test/tier.test.mjs locks both to the same shape.
 function injectLine(m) {
-  const tag = String(m.kind ?? "").replace(/^room /, "");
+  const tag = String(m.tag ?? "").replace(/^room /, "");
   const d = new Date(m.ts ?? 0);
   const hhmm = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
   return `  [${tag} ${hhmm} ${m.from}] ${m.text ?? ""}`;
@@ -302,7 +302,9 @@ function startLoop(source, room) {
   if (loops.has(key)) return;
   const state = { cancelled: false };
   loops.set(key, state);
-  const tag = source === "inbox" ? "DM" : `room #${normalizeRoom(room)}`;
+  // Named `label` to match hooks/tmux-pusher.mjs, and to leave `tag` free as
+  // the field name it is assigned to below.
+  const label = source === "inbox" ? "DM" : `room #${normalizeRoom(room)}`;
   (async () => {
     while (!state.cancelled) {
       let r;
@@ -310,17 +312,18 @@ function startLoop(source, room) {
         r = await call("wait_for_message", { agentId: AGENT_ID, source, room, timeoutMs: 60_000 });
       } catch (e) {
         // Transport hiccup — back off briefly so we don't spin against a dead server.
-        process.stderr.write(`[coord-pusher] wait_for_message(${tag}) error: ${e?.message ?? e}\n`);
+        process.stderr.write(`[coord-pusher] wait_for_message(${label}) error: ${e?.message ?? e}\n`);
         await sleep(2_000);
         continue;
       }
       if (state.cancelled) break;
       const msgs = Array.isArray(r?.messages) ? r.messages : [];
       for (const m of msgs) {
-        // `kind` after the spread — a stored Message's own kind (retention
-        // weight) must not overwrite the channel tag injectLine renders.
-        // Mirrors hooks/tmux-pusher.mjs; the two must stay byte-identical.
-        if (shouldInject(m)) pending.push({ ...m, kind: tag });
+        // The channel tag lives in `tag` — a stored Message's own `kind`
+        // (retention weight) shared the name and overwrote what injectLine
+        // renders. Mirrors hooks/tmux-pusher.mjs; the two must stay
+        // byte-identical.
+        if (shouldInject(m)) pending.push({ ...m, tag: label });
       }
       if (pending.length > 0) scheduleFlush();
     }

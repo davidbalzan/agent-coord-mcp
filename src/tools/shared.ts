@@ -139,11 +139,12 @@ export type Message = {
   // prune retention (decisionDays), survive live compaction while fresh, and
   // are surfaced verbatim in overflow digests.
   //
-  // NAME COLLISION, load-bearing: the pushers render a *synthetic* `kind` on
-  // their own copy of the message ("DM" / "room #general") which injectLine
-  // and classifyTier read as the channel tag. Never let a stored Message's
-  // kind reach those — see the spread order at tmux-pusher.mjs:237. Phase 8
-  // Task 3 should rename one of the two.
+  // This field is on disk in every JSONL file, so it is the half of the old
+  // name collision that could not move. The pushers' *synthetic* channel tag
+  // ("DM" / "room #general"), read by injectLine and classifyTier, was also
+  // called `kind` until Phase 8 Task 3 renamed it to `tag` — it is
+  // process-local and never persisted, so renaming it cost no migration.
+  // The two no longer collide; see hooks/tmux-pusher.mjs's collectSource.
   kind?: "decision" | "status" | "chatter";
   // Typed protocol record (Phase 8). Optional and additive; see MessageRecord.
   record?: MessageRecord;

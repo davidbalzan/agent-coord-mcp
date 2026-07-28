@@ -15,8 +15,11 @@ import {
   injectLine,
 } from "../hooks/tier.mjs";
 
-const dm = (text, extra = {}) => ({ kind: "DM", from: "peer", to: "me", text, ...extra });
-const room = (text, extra = {}) => ({ kind: "room #proj", from: "peer", text, ...extra });
+// `tag` is the pushers' synthetic channel tag. It was called `kind` until the
+// Phase 8 rename, which collided with the stored Message.kind (retention
+// weight) — see "a stored Message.kind must not overwrite the channel tag".
+const dm = (text, extra = {}) => ({ tag: "DM", from: "peer", to: "me", text, ...extra });
+const room = (text, extra = {}) => ({ tag: "room #proj", from: "peer", text, ...extra });
 
 test("push-now prefixes classify urgent in DMs and rooms", () => {
   for (const make of [dm, room]) {
@@ -40,7 +43,7 @@ test("routine traffic queues silently", () => {
   assert.equal(classifyTier(room("AGENT_ACTION: rebasing lane branch")), "routine");
   assert.equal(classifyTier(room("RISK: flaky test on main")), "routine");
   assert.equal(classifyTier(room("unprefixed chatter")), "routine");
-  assert.equal(classifyTier({ kind: "room #proj", from: "peer" }), "routine"); // no text
+  assert.equal(classifyTier({ tag: "room #proj", from: "peer" }), "routine"); // no text
 });
 
 test("DONE: in a room routes to the gate runner only (DMs are always urgent)", () => {
@@ -147,26 +150,26 @@ test("TierQueue: maxAgeMs of 0 (default) never age-flushes", () => {
 const TS_0805 = Date.UTC(2026, 0, 1, 8, 5, 0);
 
 test("injectLine: compact parse-contract format (v0.14.0)", () => {
-  // room kind → "#" stripped of "room "; HH:MM UTC; no "from=" label.
+  // room tag → "#" stripped of "room "; HH:MM UTC; no "from=" label.
   assert.equal(
-    injectLine({ kind: "room #general", from: "mcp-coord", ts: TS_0805, text: "GO: start" }),
+    injectLine({ tag: "room #general", from: "mcp-coord", ts: TS_0805, text: "GO: start" }),
     "  [#general 08:05 mcp-coord] GO: start",
   );
-  // DM kind is left as-is (no "room " prefix to strip).
+  // DM tag is left as-is (no "room " prefix to strip).
   assert.equal(
-    injectLine({ kind: "DM", from: "peer", ts: TS_0805, text: "hi" }),
+    injectLine({ tag: "DM", from: "peer", ts: TS_0805, text: "hi" }),
     "  [DM 08:05 peer] hi",
   );
   // Missing text renders as empty, hours/minutes always zero-padded.
-  assert.equal(injectLine({ kind: "DM", from: "a", ts: Date.UTC(2026, 0, 1, 3, 9) }), "  [DM 03:09 a] ");
+  assert.equal(injectLine({ tag: "DM", from: "a", ts: Date.UTC(2026, 0, 1, 3, 9) }), "  [DM 03:09 a] ");
 });
 
 test("parse contract: from/room/text recoverable from an injectLine", () => {
   // The shape a harness relies on: split on the FIRST "] ", then the 3
-  // space-separated header tokens are [kind, HH:MM, from]. text may contain
+  // space-separated header tokens are [tag, HH:MM, from]. text may contain
   // anything (including "]") and is preserved intact.
   const line = injectLine({
-    kind: "room #coord-mcp",
+    tag: "room #coord-mcp",
     from: "coord-mcp-worker-1",
     ts: TS_0805,
     text: "DONE: owner/repo#5 [gate green] merged",
@@ -181,9 +184,9 @@ test("parse contract: from/room/text recoverable from an injectLine", () => {
 
 test("formatBatch: compact banners + ONE digest block, compact lines", () => {
   const batch = [
-    { kind: "DM", from: "coord", ts: TS_0805, text: "BLOCKER: fix now", tier: "urgent" },
-    { kind: "room #proj", from: "peer", ts: TS_0805, text: "FYI: earlier note", tier: "routine" },
-    { kind: "room #proj", from: "peer", ts: TS_0805, text: "RISK: also queued", tier: "routine" },
+    { tag: "DM", from: "coord", ts: TS_0805, text: "BLOCKER: fix now", tier: "urgent" },
+    { tag: "room #proj", from: "peer", ts: TS_0805, text: "FYI: earlier note", tier: "routine" },
+    { tag: "room #proj", from: "peer", ts: TS_0805, text: "RISK: also queued", tier: "routine" },
   ];
   const lines = formatBatch(batch).split("\n");
   assert.equal(lines[0], "[agent-coord] msgs (pre-consumed, don't re-read):");
@@ -196,7 +199,7 @@ test("formatBatch: compact banners + ONE digest block, compact lines", () => {
 
 test("formatBatch: urgent-only batch emits no routine banner", () => {
   const lines = formatBatch([
-    { kind: "DM", from: "coord", ts: TS_0805, text: "GO: go", tier: "urgent" },
+    { tag: "DM", from: "coord", ts: TS_0805, text: "GO: go", tier: "urgent" },
   ]).split("\n");
   assert.equal(lines.length, 2);
   assert.ok(!lines.some((l) => l.includes("routine")));
@@ -216,24 +219,24 @@ test("parse-contract line is byte-identical across both pushers", () => {
   assert.equal(extract("../hooks/tier.mjs"), extract("../scripts/coord-pusher.mjs"));
 });
 
-// --- Phase 8 Task 1: typed envelope is additive, and the kind collision ---
+// --- Phase 8 Task 1: typed envelope is additive, and the kind→tag collision ---
 
 test("record-less messages render byte-identically (v1 regression lock)", () => {
   // The whole additive premise: a v1 sender that has never heard of `record`
   // must produce the same bytes as before. Locked against the literal strings
   // so a future change to injectLine can't drift them silently.
   assert.equal(
-    injectLine({ kind: "DM", ts: TS_0805, from: "peer", text: "hello" }),
+    injectLine({ tag: "DM", ts: TS_0805, from: "peer", text: "hello" }),
     "  [DM 08:05 peer] hello",
   );
   assert.equal(
-    injectLine({ kind: "room #proj", ts: TS_0805, from: "peer", text: "hello" }),
+    injectLine({ tag: "room #proj", ts: TS_0805, from: "peer", text: "hello" }),
     "  [#proj 08:05 peer] hello",
   );
 });
 
 test("an attached record does not change the rendered line", () => {
-  const base = { kind: "DM", ts: TS_0805, from: "peer", text: "BLOCKER: db down" };
+  const base = { tag: "DM", ts: TS_0805, from: "peer", text: "BLOCKER: db down" };
   assert.equal(
     injectLine({ ...base, record: { type: "blocker", cites: [{ kind: "pr", ref: "o/r#1" }] } }),
     injectLine(base),
@@ -241,14 +244,31 @@ test("an attached record does not change the rendered line", () => {
 });
 
 test("a stored Message.kind must not overwrite the channel tag", () => {
-  // Message.kind ("decision"/"status"/"chatter" — retention weight) collides
-  // by name with the pushers' synthetic channel tag. Spread-last let the
-  // stored value win, so a room post tagged kind:"decision" — what the README
-  // recommends for GOs and verdicts — rendered as `[decision …]` and broke the
-  // parse contract. Both pushers now assign the tag after the spread.
+  // Message.kind ("decision"/"status"/"chatter" — retention weight) used to
+  // share its name with the pushers' synthetic channel tag. Spread-last let
+  // the stored value win, so a room post tagged kind:"decision" — what the
+  // README recommends for GOs and verdicts — rendered as `[decision …]` and
+  // broke the parse contract. The tag now lives in `tag`, so the two fields
+  // coexist and neither can clobber the other.
   const stored = { ts: TS_0805, from: "coord", room: "proj", text: "GO: ship it", kind: "decision" };
-  const tagged = { ...stored, kind: "room #proj" };
+  const tagged = { ...stored, tag: "room #proj" };
   assert.equal(injectLine(tagged), "  [#proj 08:05 coord] GO: ship it");
+  // The stored kind must survive the tagging copy untouched — it is what
+  // prune() reads for the longer decision retention.
+  assert.equal(tagged.kind, "decision");
+});
+
+test("a caller-supplied `tag` cannot forge the channel a line renders as", () => {
+  // `tag` is now a real field name on the wire's blast radius: `record` and
+  // `from` are untrusted, and so is anything else a peer puts on a message.
+  // The pushers assign the tag after the spread, so a forged one is dropped.
+  const forged = { ts: TS_0805, from: "peer", text: "FYI: not really general", tag: "room #general" };
+  assert.equal(injectLine({ ...forged, tag: "DM" }), "  [DM 08:05 peer] FYI: not really general");
+  // What the source-level lock below is actually protecting: a forged
+  // tag:"DM" WOULD buy urgent delivery if it ever reached classifyTier, since
+  // DMs bypass the routine queue. The pushers assigning the tag last is the
+  // only thing standing between a peer and a forced interrupt.
+  assert.equal(classifyTier({ ...forged, tag: "DM" }), "urgent");
 });
 
 test("both pushers tag AFTER the spread (source-level lock)", () => {
@@ -257,16 +277,23 @@ test("both pushers tag AFTER the spread (source-level lock)", () => {
   // Line-positional, not pattern-matched: the tag value is a template literal
   // (`room #${c}`) whose own braces defeat any naive object-literal regex —
   // an earlier version of this check silently matched nothing. On every line
-  // that builds a tagged copy, `...m` must appear before `kind:`.
+  // that builds a tagged copy, `...m` must appear before `tag:`.
+  //
+  // Post-rename this guards a different attacker than it originally did. The
+  // stored Message.kind can no longer collide — the names differ now. What
+  // remains is that `m` is caller-supplied: a peer that sets `tag` on its own
+  // message would forge the channel a line appears to come from (a DM
+  // rendering as `[#general …]`). Assigning after the spread makes the
+  // pusher's own value win regardless.
   const src = (url) => readFileSync(fileURLToPath(new URL(url, import.meta.url)), "utf8");
   let checked = 0;
   for (const f of ["../hooks/tmux-pusher.mjs", "../scripts/coord-pusher.mjs"]) {
     for (const line of src(f).split("\n")) {
-      if (!line.includes("...m") || !line.includes("kind:")) continue;
+      if (!line.includes("...m") || !line.includes("tag:")) continue;
       checked++;
       assert.ok(
-        line.indexOf("...m") < line.indexOf("kind:"),
-        `${f}: spread before kind lets a stored kind overwrite the channel tag: ${line.trim()}`,
+        line.indexOf("...m") < line.indexOf("tag:"),
+        `${f}: spread after tag lets a caller-supplied tag forge the channel: ${line.trim()}`,
       );
     }
   }
@@ -351,6 +378,6 @@ test("the record wins over a contradicting prefix, both directions", () => {
 });
 
 test("record changes tier only — never the rendered line", () => {
-  const base = { kind: "room #proj", ts: TS_0805, from: "peer", text: "BLOCKER: db down" };
+  const base = { tag: "room #proj", ts: TS_0805, from: "peer", text: "BLOCKER: db down" };
   assert.equal(injectLine({ ...base, record: { type: "blocker" } }), injectLine(base));
 });
