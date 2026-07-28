@@ -267,7 +267,7 @@ Phase 8 deliberately does **not** touch transport. tmux keeps working exactly as
 - **One tiering source.** `classifyTier` prefers `record.type` when present and falls back to prefix parsing when absent. Delivery tier and UI alert priority derive from the same field.
 - **Typed decision packet** as a first-class payload, so the UI renders a card from data instead of parsing prose.
 - **Verifiable citations.** `cites: [{kind:"pr"|"file"|"commit", ref}]` — a `DONE:` carries its PR ref as a field a claim-verifier can resolve via `gh` without touching the message body.
-- **Permissions model.** Generalize one-writer-per-file into server-enforced write scopes (QUEUE → aide/David/UI; DONE → coordinator, append-only; board → coordinator; facts → verifier). Today the filesystem and convention are the only enforcement.
+- **Permissions model.** Generalize one-writer-per-file into declared write scopes (QUEUE → aide/David/UI; DONE → coordinator, append-only; board → coordinator; facts → verifier). Today the filesystem and convention are the only enforcement. **Enforcement splits by surface:** record *authority* (which role may emit which record type) is enforceable immediately, because the server constructs every Message; *document* ownership is declaration + `doctor` detection until Task 5 moves work state into the store, since the bus never sees a filesystem write to `docs/QUEUE.md`. Advertising the weaker half as enforced would be exactly the kind of assumed-guarantee this phase exists to remove.
 - **Stable role identity.** Roles become `{id, displayName}` — id immutable, name mutable. The aide role has been renamed twice (curator → liaison → aide), each pass churning 500+ occurrences across skills, ids, and scripts.
 - **Work state as data.** Queue/done/board in the store, with markdown export to git preserved (diffability and David-edits-in-repo are why markdown was chosen — the goal is to stop *parsing* it, not to stop *having* it).
 
@@ -323,12 +323,14 @@ Phase 8 deliberately does **not** touch transport. tmux keeps working exactly as
 
 **Priority**: HIGH · **Dependencies**: Task 1
 
-- [ ] 4.1 Role registry entries gain `{id, displayName}`; ids frozen, names free
-- [ ] 4.2 Declare write scopes per managed document
-- [ ] 4.3 Enforce on write; reject with the same shape as the identity-binding error
-- [ ] 4.4 `doctor` check: a document whose on-disk writer disagrees with its declared scope
+- [ ] 4.1 Role registry entries gain `{roleId, displayName}`; ids frozen, names free; `isGateRunnerRole` resolves from the id instead of regex-matching prose
+- [ ] 4.2 Record authority — which role may emit which `record.type` (`verdict` → gate runners, `go`/`scope` → coordinators). Enforced at the send path, rejecting in the identity-binding error shape
+- [ ] 4.3 Declare write scopes per managed document (`scopes.json`, opt-in — absent file means nothing is owned)
+- [ ] 4.4 `doctor` check: a document whose last writer disagrees with its declared scope. `warn`, never `fixable` — rewriting someone's file is not a safe automatic repair
 
-**Deliverables**: one-writer-per-file enforced by the server, not convention.
+**Deliverables**: role identity that survives a rename; record authority enforced; document ownership declared and drift detected.
+
+**Not delivered here — pre-emptive document enforcement.** The bus has no interception point for `docs/QUEUE.md` writes; agents edit those with ordinary file tools. That arrives with Task 5. Code comments must state the guarantee is advisory rather than let a reader assume otherwise. Note also that a role is self-declared at `register`/`join`, so 4.2 is a *consistency* check, not authentication — it must never be relied on as a trust boundary.
 
 #### Task 5: Work state as data
 
@@ -347,7 +349,7 @@ Phase 8 deliberately does **not** touch transport. tmux keeps working exactly as
 - A `BLOCKER` sent as a typed record wakes the target even when the text begins with a greeting — the case that silently fails today.
 - Tiering and UI alerting derive from one field; no second parser exists.
 - A `DONE` record's PR cite is resolvable via `gh` without reading the message body.
-- A write to a document the caller doesn't own is rejected by the server, and `doctor` reports scope drift.
+- A record type the caller's role may not emit is rejected at the send path, and `doctor` warns when a declared document's last writer isn't its owner. (Pre-emptive rejection of the *document* write itself is Task 5's criterion, not this phase's.)
 - `import → export` on this repo's real `QUEUE.md` / `DONE.md` is byte-identical.
 
 ---
