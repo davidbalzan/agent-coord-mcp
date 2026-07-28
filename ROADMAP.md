@@ -245,6 +245,171 @@ A `doctor({ fix?: boolean })` MCP tool (and a `coord-chat /doctor` command + `co
 
 ---
 
+## Phase 8 — Typed protocol  📋 planned
+
+> **The bus v2 core.** Everything below is additive to the wire format — v1 and v2 agents share a bus throughout.
+
+The fleet already runs a rich workflow protocol — escalation priority, decision packets, work contracts, gate verdicts, cited completions, one-writer-per-file ownership. All of it is implemented as **case-sensitive string parsing over chat text and exact-glyph markdown**. That substrate is now the top source of silent failures:
+
+- `hooks/tier.mjs:26-38` decides who wakes up by `text.startsWith("BLOCKER:")`. A greeting before the prefix silently downgrades a production blocker to routine.
+- The UI's alert priority re-derives the same prefixes independently (`notificationPriority.ts`), so server-side tiering and human-facing alerting can disagree about the same message.
+- The `DAVID_DECISION` packet is a five-field record (title/context/options/recommendation/if-no-action) reconstructed from prose by `decisionPacket.ts`.
+- `docs/QUEUE.md` / `docs/DONE.md` require exact `U+2014` and `U+00B7` glyphs; a parser once returned zero items on the real file while passing every synthetic test.
+- `injectLine` (`hooks/tier.mjs:103`) is a documented byte-identical *parse contract* — agent harnesses read `from`/`room`/`text` back out of a rendered string.
+
+Each is the same defect class: **semantics that matter are carried as text and recovered by regex.** Phase 8 promotes them to typed records the server understands, so tiering, alerting, and rendering all read one field instead of three parsers racing each other.
+
+Phase 8 deliberately does **not** touch transport. tmux keeps working exactly as today; see Phase 9.
+
+### Scope
+
+- **Typed message envelope.** Extend `Message` (`src/tools/shared.ts:79`) with an optional structured `record`: `{ type: "blocker"|"decision"|"risk"|"done"|"fyi"|"go"|"scope"|"verdict", payload, cites }`. `send_message` accepts it; `text` stays required as the human-readable rendering.
+- **One tiering source.** `classifyTier` prefers `record.type` when present and falls back to prefix parsing when absent. Delivery tier and UI alert priority derive from the same field.
+- **Typed decision packet** as a first-class payload, so the UI renders a card from data instead of parsing prose.
+- **Verifiable citations.** `cites: [{kind:"pr"|"file"|"commit", ref}]` — a `DONE:` carries its PR ref as a field a claim-verifier can resolve via `gh` without touching the message body.
+- **Permissions model.** Generalize one-writer-per-file into declared write scopes (QUEUE → aide/David/UI; DONE → coordinator, append-only; board → coordinator; facts → verifier). Today the filesystem and convention are the only enforcement. **Enforcement splits by surface:** record *authority* (which role may emit which record type) is enforceable immediately, because the server constructs every Message; *document* ownership is declaration + `doctor` detection until Task 5 moves work state into the store, since the bus never sees a filesystem write to `docs/QUEUE.md`. Advertising the weaker half as enforced would be exactly the kind of assumed-guarantee this phase exists to remove.
+- **Stable role identity.** Roles become `{id, displayName}` — id immutable, name mutable. The aide role has been renamed twice (curator → liaison → aide), each pass churning 500+ occurrences across skills, ids, and scripts.
+- **Work state as data.** Queue/done/board in the store, with markdown export to git preserved (diffability and David-edits-in-repo are why markdown was chosen — the goal is to stop *parsing* it, not to stop *having* it).
+
+### Out of scope
+
+- Transport changes of any kind (Phase 9).
+- The UI itself — it stays in its own repo and consumes these records.
+- Removing prefix parsing. It stays as the fallback for the whole phase; a flag day is what makes v1/v2 coexistence impossible.
+
+### Design notes
+
+- **Additive or it doesn't ship.** Every field is optional. An untyped v1 message classifies exactly as it does today. This is what lets a live fleet migrate agent-by-agent instead of all at once.
+- **`text` is never removed.** It is the rendering, and the tmux adapter can only deliver text. Typed records *accompany* it; they don't replace it.
+- **Server-set fields stay server-set.** `record` is caller-supplied and therefore untrusted, exactly like `from` — trust decisions (the `SCOPE:` countersignature at `tier.mjs:33`) still resolve the sender against the registry. A peer must not be able to self-declare urgency any more than it can today set `urgent`.
+- **The parse contract is the migration risk.** `injectLine` must stay byte-identical between `hooks/tier.mjs` and `scripts/coord-pusher.mjs`, and harnesses parse it. Adding typed records must not change a single rendered byte for messages that carry no record.
+
+### Tasks
+
+#### Task 1: Typed message envelope
+
+**Priority**: CRITICAL · **Dependencies**: None
+
+- [x] 1.1 Add the `record` type + zod schema to `shared.ts` / `messaging.ts`, all fields optional
+- [x] 1.2 Accept and persist `record` in `send_message`; leave `text` required
+- [x] 1.3 Round-trip it through `read_messages`, `wait_for_message`, and the history digest
+- [x] 1.4 Assert byte-identical `injectLine` output for record-less messages (regression lock)
+
+**Deliverables**: typed envelope on the wire, zero behavior change for v1 senders.
+
+#### Task 2: Single-source tiering
+
+**Priority**: CRITICAL · **Dependencies**: Task 1
+
+- [x] 2.1 `classifyTier` reads `record.type` first, prefix parsing second
+- [x] 2.2 Keep trusted-sender resolution for `scope`/`go` — typed does not mean trusted
+- [x] 2.3 Tests: typed and prefixed forms of each type classify identically
+- [x] 2.4 Test the documented footgun: greeting-first prose downgrades, the typed record does not
+
+**Deliverables**: one tiering decision, two accepted input forms.
+
+#### Task 3: Decision packets & citations
+
+**Priority**: HIGH · **Dependencies**: Task 1
+
+- [x] 3.1 Typed `decision` payload matching the playbook's five fields
+- [x] 3.2 Typed `cites` with `pr`/`file`/`commit` kinds
+- [x] 3.3 Render typed → the current text layout so today's UI parser keeps working unchanged
+- [x] 3.4 A `done` record without a resolvable PR cite is rejected at send time
+
+**Deliverables**: decision cards and DONE-verification from data, old UI unbroken.
+
+#### Task 4: Write scopes (permissions)
+
+**Priority**: HIGH · **Dependencies**: Task 1
+
+- [x] 4.1 Role registry entries gain `{roleId, displayName}`; ids frozen, names free; `isGateRunnerRole` resolves from the id instead of regex-matching prose
+- [x] 4.2 Record authority — which role may emit which `record.type` (`verdict` → gate runners, `go`/`scope` → coordinators). Enforced at the send path, rejecting in the identity-binding error shape
+- [x] 4.3 Declare write scopes per managed document (`scopes.json`, opt-in — absent file means nothing is owned)
+- [x] 4.4 `doctor` check: a document whose last writer disagrees with its declared scope. `warn`, never `fixable` — rewriting someone's file is not a safe automatic repair
+
+**Deliverables**: role identity that survives a rename; record authority enforced; document ownership declared and drift detected.
+
+**Not delivered here — pre-emptive document enforcement.** The bus has no interception point for `docs/QUEUE.md` writes; agents edit those with ordinary file tools. That arrives with Task 5. Code comments must state the guarantee is advisory rather than let a reader assume otherwise. Note also that a role is self-declared at `register`/`join`, so 4.2 is a *consistency* check, not authentication — it must never be relied on as a trust boundary.
+
+#### Task 5: Work state as data
+
+**Priority**: MEDIUM · **Dependencies**: Tasks 1, 4
+
+- [ ] 5.1 Queue/done/board records in the store
+- [ ] 5.2 Markdown export preserving the exact current glyph contract
+- [ ] 5.3 Import path for existing `QUEUE.md`/`DONE.md`/`WORKSTREAMS.md`
+- [ ] 5.4 Round-trip test: import → export is byte-identical on this repo's real files
+
+**Rollback**: export is authoritative until the UI reads records directly; delete the store files and the markdown still stands alone.
+
+#### Task 6: Records travel structurally
+
+**Priority**: HIGH · **Dependencies**: Tasks 1, 3 · **Decision: David, 2026-07-28 — option C**
+
+`injectLine` emits ONE `[tag HH:MM from]` header per message, but a rendered `DAVID_DECISION` packet is 7 lines — so lines 2–7 arrive unattributed and a parser cannot recover who sent them or which room they came from. Pre-existing for hand-typed multi-line messages; Task 3 makes it machine-generated and routine, on the highest-stakes traffic the bus carries.
+
+The rejected alternatives matter as much as the choice. **Prefixing every continuation line** was the cheap fix and was rejected: it changes rendered output for existing record-less multi-line messages, taxing the byte-identical guarantee Tasks 1–4 were built against. **Folding packets to one line** preserves the contract but destroys the layout the UI parses into a decision card.
+
+The reasoning that decided it: the 7-line layout exists *because* the UI had to parse prose. Now that `record` is typed, consumers read the field and the text rendering only has to be legible to a human. **Pane rendering stops being a wire format** — the same realisation behind demoting tmux in Phase 9, which is why this task is the seam between the two phases.
+
+- [ ] 6.1 Pane delivery carries a one-line attributed header plus a digest, never a multi-line body a parser must reassemble
+- [ ] 6.2 Consumers read the full record via `read_messages` rather than from rendered text
+- [ ] 6.3 Record-less messages — including multi-line ones — still render byte-identically
+- [ ] 6.4 The UI's decision card is fed by the typed record, with the prose layout kept only as a human-readable fallback
+
+**Deliverables**: multi-line records deliverable without breaking the single-line parse contract; the text rendering demoted from wire format to human affordance.
+
+**Hold until this lands**: agents should not emit decision packets at volume — the highest-stakes message type is currently unattributable past line 1.
+
+#### Task 7: Retention reads the typed record
+
+**Priority**: CRITICAL · **Dependencies**: Task 1
+
+Retention still asks the LEGACY field. Three sites gate the long decision retention on
+`e.kind === "decision"` and grant a typed `record.type === "decision"` nothing:
+`src/tools/admin.ts:53` (prune), `src/tools/messaging.ts:285` (live compaction),
+`src/tools/messaging.ts:418` (verbatim quoting in overflow digests).
+
+So a v2 agent that correctly sends `record:{type:"decision"}` and omits the legacy `kind` has its
+decision compacted at chatter rate and dropped from digests. Reproduced against real compaction by
+`ai-workflow-worker-1`: two identical decision records, one with `kind`, one without — only the
+kind-tagged one survived a 1102 → 504 compaction.
+
+This is the phase's own thesis failing in the one place nobody looked: the typed field is supposed
+to be the truth and the legacy field a rendering, and for retention the reverse is still true.
+
+- [ ] 7.1 All three sites read `kind === "decision" || record?.type === "decision"`
+- [ ] 7.2 The predicate is defined ONCE and shared — three copies is how they drifted apart
+- [ ] 7.3 Test against real compaction and real prune, not a fixture: a typed decision with no
+      legacy `kind` survives both
+- [ ] 7.4 No migration: existing files keep working unchanged, since the rule only ever GRANTS
+      retention
+
+**Deliverables**: retention that agrees with tiering about what a decision is.
+
+**Design note — monotone, like the tier floor.** `||` never removes retention, only grants it, so
+there is no cutover and no file to migrate. That is the same shape the tier floor took after
+Task 2's fix, and for the same reason: two sources that can each override each other is the
+disagreement this phase deletes; a source that can only raise is not that.
+
+### Success criteria
+
+- A v1 agent that has never heard of `record` participates on the bus with byte-identical behavior — verified by diffing rendered `injectLine` output before and after.
+- A `BLOCKER` sent as a typed record wakes the target even when the text begins with a greeting — the case that silently fails today.
+- Tiering and UI alerting derive from one field; no second parser exists.
+- A `DONE` record's PR cite is resolvable via `gh` without reading the message body.
+- A record type the caller's role may not emit is rejected at the send path, and `doctor` warns when a declared document's last writer isn't its owner. (Pre-emptive rejection of the *document* write itself is Task 5's criterion, not this phase's.)
+- `import → export` on this repo's real `QUEUE.md` / `DONE.md` is byte-identical.
+
+---
+
+## Phase 9 — Pluggable transport  🔭 next
+
+tmux moves out of the core and becomes one adapter behind a small interface (`deliver` · `clear` · `compact` · `alive`), joined by pty/ACP/SDK adapters for sessions the caller spawned, and the existing remote pusher. tmux stays the only answer for *agents you didn't spawn* — a `claude` a human started in a terminal — so this is a demotion, not a removal. `clear`/`compact` belong in the interface because context management is the coordinator's authority (playbook §Context Reset), and each adapter satisfies it differently. Sequenced after Phase 8 so adapters carry typed records rather than re-deriving semantics from rendered text.
+
+---
+
 ## Phase 7+ — Possible follow-ups
 
 Listed here so they don't clutter Phase 5/6, but worth tracking as ideas:

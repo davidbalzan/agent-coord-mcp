@@ -1,5 +1,7 @@
 import { loadLiveTransports, isMarkerLive, isPidAlive } from "./registry.js";
 import { registerTool } from "./registry.js";
+import { roleInputSchema, type RoleArg } from "../roles.js";
+import { attributeWriter, isGitRepo, lastWriterOf, loadScopes, ownsDocument } from "./scopes.js";
 import { sendMessageTool, readMessagesTool } from "./messaging.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, openSync, watch } from "node:fs";
@@ -402,6 +404,24 @@ export async function sendCommandTool(args: {
   };
 }
 
+// Does `pid` actually belong to one of our tmux pushers? A transport marker
+// records a pid, but a marker can outlive its process and pids get recycled —
+// so "pid is alive" is NOT evidence the pid is still the pusher. Anything that
+// SIGTERMs a marker's pid must confirm identity first or it will eventually
+// kill an unrelated process on the user's machine.
+//
+// Pushers are spawned as `<node> <.../hooks/tmux-pusher.mjs>` (see
+// attachAgentTool), so the script path in the process's argv is the signature.
+// Returns false when we cannot confirm — including when `ps` is unavailable.
+// Refusing to kill an unverifiable pid is the safe failure: a wedged pusher
+// that survives is a nuisance, a wrong SIGTERM is not.
+export function isPusherProcess(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+  if (ps.status !== 0) return false; // pid gone, or no usable ps
+  return (ps.stdout ?? "").includes(path.basename(resolvePusherPath()));
+}
+
 // ---------- attach_agent / detach_agent (tmux push transport) ----------
 
 export const attachAgentSchema = {
@@ -615,7 +635,9 @@ const joinAttachOptionsSchema = z.object({
 export const joinSchema = {
   agentId: z.string().min(1),
   project: z.string().optional(),
-  role: z.string().optional(),
+  // Free text, or a declared identity ({roleId, displayName}) — see
+  // roleInputSchema. A frozen roleId cannot be changed by re-joining.
+  role: roleInputSchema.optional(),
   // attach: undefined → auto-attach if $TMUX_PANE is set; true → always try;
   // false → never; object → attach with overrides.
   attach: z.union([z.boolean(), joinAttachOptionsSchema]).optional(),
@@ -625,7 +647,7 @@ export const joinSchema = {
 export async function joinTool(args: {
   agentId: string;
   project?: string;
-  role?: string;
+  role?: RoleArg;
   attach?: boolean | { tmuxTarget?: string; includeRoom?: boolean; allowlist?: string[]; debounceMs?: number };
   readInbox?: boolean;
 }) {
@@ -634,6 +656,9 @@ export async function joinTool(args: {
     project: args.project,
     role: args.role,
   });
+  // A refused role update (frozen roleId) fails the whole join rather than
+  // silently attaching a transport under the wrong identity.
+  if (!reg.ok) return reg;
 
   // Decide attach behavior.
   const wantAttach = args.attach === false
@@ -874,7 +899,7 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
     // Without a tmux binary we can't tell "wedged" from "can't probe" — skip
     // rather than flag every local marker as dead.
     const tmuxAvailable = spawnSync("tmux", ["-V"]).status === 0;
-    const wedged: { agentId: string; pid: number; file: string; target: string }[] = [];
+    const wedged: { agentId: string; pid: number; file: string; target: string; isPusher: boolean }[] = [];
     if (tmuxAvailable) {
       for (const fname of await listTransportFiles()) {
         const file = path.join(TRANSPORT_DIR, fname);
@@ -888,14 +913,32 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
         // the format string has no #{...} needing that target resolved).
         const probe = spawnSync("tmux", ["has-session", "-t", marker.tmuxTarget]);
         if (probe.status === 0) continue; // pane alive
-        wedged.push({ agentId: marker.agentId, pid: marker.pid, file, target: marker.tmuxTarget });
+        // The marker's pid being alive does not make it OUR pid — see
+        // isPusherProcess. Record the verdict now so `fix` only ever signals
+        // a confirmed pusher.
+        wedged.push({
+          agentId: marker.agentId,
+          pid: marker.pid,
+          file,
+          target: marker.tmuxTarget,
+          isPusher: isPusherProcess(marker.pid),
+        });
       }
     }
     if (fix) {
       for (const w of wedged) {
-        try { process.kill(w.pid, "SIGTERM"); } catch { /* already gone */ }
+        // Clearing the marker is always safe — the pane is gone either way, so
+        // nothing can be delivered through it. Signalling is not: an
+        // unverifiable pid is some other process that inherited this number.
+        if (w.isPusher) {
+          try { process.kill(w.pid, "SIGTERM"); } catch { /* already gone */ }
+        }
         await deleteFile(w.file);
-        fixed.push(`reaped wedged pusher for ${w.agentId} (pid ${w.pid}, tmux target '${w.target}' gone)`);
+        fixed.push(
+          w.isPusher
+            ? `reaped wedged pusher for ${w.agentId} (pid ${w.pid}, tmux target '${w.target}' gone)`
+            : `cleared stale transport marker for ${w.agentId} (tmux target '${w.target}' gone; pid ${w.pid} is not a tmux-pusher — not signalled)`,
+        );
       }
     }
     findings.push({
@@ -907,7 +950,12 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
           ? "no wedged local pushers (pid-alive, pane-dead)"
           : "tmux not available — skipped wedged-pusher pane probe",
       fixable: true,
-      items: wedged.length ? wedged.map((w) => `${w.agentId} (pid ${w.pid}, tmux target '${w.target}')`) : undefined,
+      items: wedged.length
+        ? wedged.map(
+            (w) =>
+              `${w.agentId} (pid ${w.pid}, tmux target '${w.target}')${w.isPusher ? "" : " — pid is not a tmux-pusher, marker will be cleared without signalling"}`,
+          )
+        : undefined,
     });
   }
 
@@ -1149,6 +1197,57 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
       detail: orphanFiles.length ? `${orphanFiles.length} channel file(s) with no registry entry` : "channel files and registry agree",
       fixable: true,
       items: orphanFiles.length ? orphanFiles : undefined,
+    });
+  }
+
+  // 9b. Document scope drift (Phase 8 Task 4). For each document declared in
+  //     scopes.json, compare git's last writer against the declared owner.
+  //
+  //     DETECTION ONLY, never fixable — rewriting or reverting someone else's
+  //     file is not a safe automatic repair, and the bus cannot prevent the
+  //     write in the first place (agents edit these with ordinary file tools;
+  //     enforcement waits for Task 5). Skips silently when no scopes.json
+  //     exists (opt-in) or when the declared repo isn't a git checkout, the
+  //     same way the wedged-pusher check skips without tmux — a check that
+  //     can't observe anything must not guess.
+  {
+    const scopes = await loadScopes();
+    const drift: string[] = [];
+    const unattributed: string[] = [];
+    let detail: string;
+    if (!scopes.documents.length) {
+      detail = scopes.configured
+        ? `${path.basename(scopes.file)} declares no documents`
+        : `no ${path.basename(scopes.file)} — document scopes are opt-in and none are declared`;
+    } else if (!isGitRepo(scopes.repo)) {
+      detail = `${scopes.documents.length} document(s) declared but '${scopes.repo}' is not a git checkout — last writer is unknowable, check skipped`;
+    } else {
+      for (const doc of scopes.documents) {
+        const writer = lastWriterOf(scopes.repo, doc.path);
+        if (!writer) continue; // never committed — nothing has written it yet
+        const who = attributeWriter(writer, reg);
+        if (!who) {
+          // Commits are authored by humans/machine accounts, not agent ids, so
+          // an unmappable author is the normal case — reported, never flagged.
+          unattributed.push(`${doc.path}: last written by '${writer.author}' (${writer.commit}), not attributable to a registered agent`);
+          continue;
+        }
+        if (ownsDocument(who.agentId, reg[who.agentId], doc.owner)) continue;
+        drift.push(
+          `${doc.path}: declared owner '${doc.owner}' (${doc.mode}) but last written by '${who.agentId}'` +
+            `${who.roleId ? ` [role ${who.roleId}]` : ""} in ${writer.commit} (${writer.when})`,
+        );
+      }
+      detail = drift.length
+        ? `${drift.length} document(s) last written by someone other than their declared owner — advisory: coordinate ownership, doctor will not rewrite anyone's file`
+        : `${scopes.documents.length} declared document(s) agree with their scope`;
+    }
+    findings.push({
+      check: "document-scope-drift",
+      level: drift.length ? "warn" : "ok",
+      detail,
+      fixable: false,
+      items: drift.length ? drift : unattributed.length ? unattributed : undefined,
     });
   }
 

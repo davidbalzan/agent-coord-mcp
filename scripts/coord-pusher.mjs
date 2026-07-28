@@ -215,15 +215,35 @@ async function flush() {
 
 // The per-message PARSE CONTRACT line — MUST stay byte-identical to
 // hooks/tier.mjs's injectLine (agent harnesses parse from/room/text out of
-// it). Compact form (v0.14.0): `  [<kind> <HH:MM> <from>] <text>`, kind drops
+// it). Compact form (v0.14.0): `  [<tag> <HH:MM> <from>] <text>`, tag drops
 // the leading "room ", timestamp is HH:MM UTC, no "from=" label. This pusher
 // is standalone (may deploy without hooks/), so the helper is duplicated
 // rather than imported; test/tier.test.mjs locks both to the same shape.
 function injectLine(m) {
-  const tag = String(m.kind ?? "").replace(/^room /, "");
+  const tag = String(m.tag ?? "").replace(/^room /, "");
   const d = new Date(m.ts ?? 0);
   const hhmm = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
-  return `  [${tag} ${hhmm} ${m.from}] ${m.text ?? ""}`;
+  let text = m.text ?? "";
+  // Phase 8 Task 6: a TYPED record whose rendering spans lines is delivered as
+  // ONE attributed line — first line, a count of what was withheld, and the
+  // message id as the retrieval handle. Continuation lines used to arrive bare,
+  // with no `[tag HH:MM from]` header, so a parser could not attribute them.
+  //
+  // The handle is the message id, NOT a stashed copy: the full record is
+  // already persisted in rooms/<chan>.jsonl or inbox/<id>.jsonl, and
+  // retrieve_message reads it back by id (falling through to the append-only
+  // archive if compaction moved it). A cache would have had a TTL and lost the
+  // record permanently on expiry.
+  //
+  // Gated on `m.record`: a record-LESS multi-line message is untouched and
+  // still arrives unattributed past line 1, exactly as today. Task 6 does not
+  // fix hand-typed multi-line messages, and must not change their bytes.
+  const nl = text.indexOf("\n");
+  if (nl !== -1 && m.record && typeof m.record.type === "string" && m.id) {
+    const held = text.split("\n").length - 1;
+    text = `${text.slice(0, nl)} [+${held} lines · record:${m.record.type} · retrieve_message id=${m.id}]`;
+  }
+  return `  [${tag} ${hhmm} ${m.from}] ${text}`;
 }
 
 function formatBatch(batch) {
@@ -302,7 +322,9 @@ function startLoop(source, room) {
   if (loops.has(key)) return;
   const state = { cancelled: false };
   loops.set(key, state);
-  const tag = source === "inbox" ? "DM" : `room #${normalizeRoom(room)}`;
+  // Named `label` to match hooks/tmux-pusher.mjs, and to leave `tag` free as
+  // the field name it is assigned to below.
+  const label = source === "inbox" ? "DM" : `room #${normalizeRoom(room)}`;
   (async () => {
     while (!state.cancelled) {
       let r;
@@ -310,14 +332,18 @@ function startLoop(source, room) {
         r = await call("wait_for_message", { agentId: AGENT_ID, source, room, timeoutMs: 60_000 });
       } catch (e) {
         // Transport hiccup — back off briefly so we don't spin against a dead server.
-        process.stderr.write(`[coord-pusher] wait_for_message(${tag}) error: ${e?.message ?? e}\n`);
+        process.stderr.write(`[coord-pusher] wait_for_message(${label}) error: ${e?.message ?? e}\n`);
         await sleep(2_000);
         continue;
       }
       if (state.cancelled) break;
       const msgs = Array.isArray(r?.messages) ? r.messages : [];
       for (const m of msgs) {
-        if (shouldInject(m)) pending.push({ kind: tag, ...m });
+        // The channel tag lives in `tag` — a stored Message's own `kind`
+        // (retention weight) shared the name and overwrote what injectLine
+        // renders. Mirrors hooks/tmux-pusher.mjs; the two must stay
+        // byte-identical.
+        if (shouldInject(m)) pending.push({ ...m, tag: label });
       }
       if (pending.length > 0) scheduleFlush();
     }

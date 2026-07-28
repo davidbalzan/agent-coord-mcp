@@ -51,7 +51,16 @@ import {
 export type AgentEntry = {
   agentId: string;
   project?: string;
+  // DISPLAY NAME — free to change. Stays a plain string on disk so existing
+  // agents.json files, coord-chat's `/whois`, and every v1 reader keep working
+  // untouched.
   role?: string;
+  // FROZEN IDENTITY (Phase 8 Task 4). Optional and additive: when absent the id
+  // is derived from `role` at read time (resolveRole), which is what every
+  // pre-Task-4 entry does. Once DECLARED it is immutable — register rejects an
+  // attempt to change it — so a role can be renamed (curator → liaison → aide)
+  // without every id, skill and script that keys off it having to move.
+  roleId?: string;
   registeredAt: number;
   lastHeartbeat: number;
   capabilities?: string[];
@@ -76,6 +85,82 @@ export type TransportMarker = {
 
 export type AgentRegistry = Record<string, AgentEntry>;
 
+// Where a claim can be independently verified. The point is that a consumer
+// resolves the ref (gh, git, fs) instead of trusting the message body — a
+// `done` record whose PR ref doesn't exist is a false claim, not a typo.
+export type Citation = {
+  kind: "pr" | "file" | "commit" | "url";
+  ref: string;
+};
+
+// The protocol vocabulary the fleet already speaks. Today these live as
+// case-sensitive prefixes at byte 0 of `text` (hooks/tier.mjs), parsed a
+// second time by the UI for alert priority — so a greeting before the prefix
+// silently downgrades a production blocker, and the two parsers can disagree
+// about the same message. As a field there is nothing to mis-parse.
+export type MessageRecordType =
+  | "blocker"   // BLOCKER:        work cannot continue
+  | "decision"  // DAVID_DECISION: the human must decide
+  | "risk"      // RISK:           quality/security/cost/product risk
+  | "done"      // DONE:           completed work, must cite
+  | "fyi"       // FYI:            no action needed
+  | "action"    // AGENT_ACTION:   another agent can handle it
+  | "go"        // GO:             a work order
+  | "scope"     // SCOPE CHANGE:   amends a contract in flight
+  | "verdict";  // (new) a gate PASS/FAIL — has no prefix today
+
+// The five fields of the playbook's decision packet (§Decision Packet Format).
+// Named to match that layout because `renderRecord` reproduces it byte-for-byte
+// — the UI parses the rendering into a clickable decision card.
+export type DecisionPayload = {
+  title: string;
+  context: string;
+  options: string[];
+  recommendation: string;
+  ifNoAction: string;
+};
+
+// A gate verdict. `headRefOid` pins WHICH commit was gated: a PASS that doesn't
+// name the sha it was issued against is unfalsifiable once the branch moves.
+export type VerdictPayload = {
+  result: "pass" | "fail";
+  headRefOid: string;
+  notes?: string;
+};
+
+// Everything else carries prose. One line, because these render as
+// `<PREFIX>: <summary>` and a paragraph in a tmux pane is a wall, not a status.
+export type SummaryPayload = { summary: string };
+
+// Message types whose payload is just a summary.
+export type SummaryRecordType = "blocker" | "risk" | "fyi" | "action" | "go" | "scope";
+
+// Structured counterpart to `text`, NOT a replacement: `text` is the rendering,
+// and a tmux pane can only receive text. A v1 agent that has never heard of
+// `record` omits it entirely and behaves byte-identically.
+//
+// `payload` stays OPTIONAL on every arm — Phase 8 is additive, so no new
+// required field may appear on the wire. What is pinned is the shape *if* a
+// payload is supplied: a `decision` carrying three of its five fields is
+// structurally wrong for the type it claims and is rejected, while a payload
+// with extra unknown keys passes through untouched (a v3 sender must not be
+// broken by a v2 server, and stripping would silently drop data on the way to
+// disk).
+//
+// `cites` is likewise optional here. `done` requires a PR citation, but that is
+// enforced in sendMessageTool as a plain {ok:false,error} rather than a schema
+// rejection — see the identity-binding precedent in src/server.ts.
+//
+// UNTRUSTED, exactly like `from`. A peer can claim any type here, so trust
+// decisions (the SCOPE countersignature, gate-runner routing) must still
+// resolve the sender against the registry — typed is not the same as
+// authenticated, and `record` must never become a path to setting `urgent`.
+export type MessageRecord =
+  | { type: "decision"; payload?: DecisionPayload; cites?: Citation[] }
+  | { type: "verdict"; payload?: VerdictPayload; cites?: Citation[] }
+  | { type: "done"; payload?: SummaryPayload; cites?: Citation[] }
+  | { type: SummaryRecordType; payload?: SummaryPayload; cites?: Citation[] };
+
 export type Message = {
   id: string;
   ts: number;
@@ -96,8 +181,36 @@ export type Message = {
   // Semantic weight of a room post (absent = chatter). Decisions get a longer
   // prune retention (decisionDays), survive live compaction while fresh, and
   // are surfaced verbatim in overflow digests.
+  //
+  // This field is on disk in every JSONL file, so it is the half of the old
+  // name collision that could not move. The pushers' *synthetic* channel tag
+  // ("DM" / "room #general"), read by injectLine and classifyTier, was also
+  // called `kind` until Phase 8 Task 3 renamed it to `tag` — it is
+  // process-local and never persisted, so renaming it cost no migration.
+  // The two no longer collide; see hooks/tmux-pusher.mjs's collectSource.
   kind?: "decision" | "status" | "chatter";
+  // Typed protocol record (Phase 8). Optional and additive; see MessageRecord.
+  record?: MessageRecord;
 };
+
+// THE retention predicate — one definition, three call sites (prune,
+// live compaction, overflow-digest quoting). It lived as three copies of
+// `e.kind === "decision"`, and they drifted: a v2 agent doing exactly what
+// Phase 8 asks — sending `record:{type:"decision"}` and omitting the legacy
+// `kind` — had its decisions compacted at chatter rate and dropped from
+// digests. A protocol whose correct usage loses data.
+//
+// MONOTONE, like the tier floor: `||` can only ever GRANT the long retention,
+// never remove it. So there is no cutover, no migration, and no existing file
+// whose behaviour changes — a legacy `kind:"decision"` keeps exactly the
+// retention it had. Two sources that can each override each other is the
+// disagreement this phase deletes; a source that can only raise is not that.
+//
+// Deliberately structural about `record`: it takes anything with the two
+// fields, so status entries and archive rows can be passed without a cast.
+export function isDecision(e: { kind?: string; record?: { type?: string } } | null | undefined): boolean {
+  return e?.kind === "decision" || e?.record?.type === "decision";
+}
 
 export type StatusEntry = {
   id: string;

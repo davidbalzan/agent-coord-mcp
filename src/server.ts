@@ -38,6 +38,8 @@ import {
   pruneTool,
   readMessagesSchema,
   readMessagesTool,
+  retrieveMessageSchema,
+  retrieveMessageTool,
   retrieveRoomHistorySchema,
   retrieveRoomHistoryTool,
   registerSchema,
@@ -62,6 +64,14 @@ import {
   quitTool,
   waitForMessageSchema,
   waitForMessageTool,
+  listScopesSchema,
+  listScopesTool,
+  importWorkSchema,
+  importWorkTool,
+  listWorkSchema,
+  listWorkTool,
+  exportWorkSchema,
+  exportWorkTool,
 } from "./tools/index.js";
 
 function jsonResult(data: unknown) {
@@ -222,6 +232,13 @@ function buildServer(initialBound?: string): McpServer {
   );
 
   server.tool(
+    "retrieve_message",
+    "Expand a `retrieve_message id=<uuid>` handle from a pane digest into the full message and its typed `record`. A record whose text rendering spans multiple lines (a DAVID_DECISION packet) is delivered to a pane as ONE attributed line plus this handle; call it to get the structured record back. Reads the message by id from the channels you can read (your inbox and rooms you belong to), falling through to the append-only archive if compaction moved it — so unlike retrieve_room_history there is no TTL and nothing to expire. A handle for a message never delivered to you is simply not found.",
+    retrieveMessageSchema,
+    gate("agentId", retrieveMessageTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
     "post_status",
     "Append a status broadcast to the shared status stream.",
     postStatusSchema,
@@ -334,6 +351,34 @@ function buildServer(initialBound?: string): McpServer {
     "Bus-wide health check: inspects the whole state dir and reports drift, leaks, and corruption (orphan transport markers / memberships / inboxes, cursor offsets past EOF, malformed JSONL, stale agents, oversized files, stale locks, channel/registry mismatches, environment). Read-only by default; pass fix=true to apply the safe, reversible repairs (malformed-line rewrites are backed up to .bak first). A clean report (healthy=true) means the bus is internally consistent.",
     doctorSchema,
     gate(null, doctorTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "list_scopes",
+    "Read the declared write scopes for managed documents (~/agent-coord/scopes.json). Call it with 'path' (and your 'agentId') to ask \"may I write this?\" BEFORE editing a shared doc like docs/QUEUE.md; call it bare to list every declared document and its owning role. ADVISORY ONLY: the bus does not mediate file writes, so this answers who owns a document, it does not stop anyone — enforcement arrives when work state moves into the store. Absent scopes.json means nothing is owned and nothing warns (opt-in).",
+    listScopesSchema,
+    gate(null, listScopesTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "import_work",
+    "Read a project's work documents (docs/QUEUE.md + docs/DONE.md, or the legacy docs/BACKLOG.md, plus docs/WORKSTREAMS.md) into typed records: queue items {priority,text,done}, done entries {text,ref,date} and board rows. The markdown stays authoritative — this store is a derived index, and export_work renders it back byte-identically.",
+    importWorkSchema,
+    gate(null, importWorkTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "list_work",
+    "Query a project's work state as records instead of parsing markdown: open queue items (filter by priority), done entries with their ref and date as separate fields, and the board's lane rows. Falls back to reading the documents directly when nothing has been imported, so it works with no store at all.",
+    listWorkSchema,
+    gate(null, listWorkTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "export_work",
+    "Render a project's work documents back out of the store, reproducing the pinned glyph contract exactly (ref after the last ' \u2014 ', date after a trailing ' \u00b7 '). Reports by default; pass write:true to rewrite the files. Refuses to export from an empty store rather than blanking a document. Any declared Task 4 write scope is REPORTED alongside the write, never enforced.",
+    exportWorkSchema,
+    gate(null, exportWorkTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(

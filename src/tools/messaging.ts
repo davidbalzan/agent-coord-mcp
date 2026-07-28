@@ -1,11 +1,13 @@
 import { adjustCursors } from "./admin.js";
-import { ARCHIVE_STATUS_FILE, archiveJsonl, archiveRoomFile } from "../store.js";
+import { RECORD_AUTHORITY, resolveRole, roleMatches } from "../roles.js";
+import { ARCHIVE_STATUS_FILE, archiveJsonl, archiveInboxFile, archiveRoomFile } from "../store.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, openSync, watch } from "node:fs";
 import { promises as fsp } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { renderRecord } from "./render.js";
 import path from "node:path";
 import {
   AGENTS_FILE,
@@ -53,6 +55,7 @@ import {
   type AgentEntry,
   type AgentRegistry,
   type Message,
+  type MessageRecord,
   type StatusEntry,
   type Cursor,
   type Source,
@@ -65,25 +68,149 @@ import {
   STALE_MS,
   EVICT_MS,
   MAX_WAIT_MS,
+  isDecision,
 } from "./shared.js";
 
 // ---------- send_message ----------
+
+// Typed protocol record (Phase 8). Additive: omitting it reproduces v1
+// behavior exactly.
+const citationSchema = z.object({
+  kind: z.enum(["pr", "file", "commit", "url"]),
+  ref: z.string().min(1),
+});
+
+// Payloads are LOOSE objects: a v3 sender's extra keys ride through to disk
+// untouched rather than being silently stripped. That is safe precisely
+// because payload is nested — it is caller data, and nothing in it is ever
+// read as a top-level Message field (which is what keeps a forged `tag` or
+// `urgent` out; see the source-level lock in test/tier.test.mjs).
+const summaryPayload = z.looseObject({ summary: z.string().min(1) });
+
+// All five fields, or none. A `decision` carrying three of them is
+// structurally wrong for the type it claims — and would render as a truncated
+// packet, which is worse than no packet.
+const decisionPayload = z.looseObject({
+  title: z.string().min(1),
+  context: z.string().min(1),
+  options: z.array(z.string().min(1)).min(1),
+  recommendation: z.string().min(1),
+  ifNoAction: z.string().min(1),
+});
+
+const verdictPayload = z.looseObject({
+  result: z.enum(["pass", "fail"]),
+  headRefOid: z.string().min(1),
+  notes: z.string().optional(),
+});
+
+// Discriminated on `type`, so an unknown type is rejected outright while a
+// known type is checked only against its own shape. `payload` is optional on
+// every arm: Phase 8 is additive and may not put a new required field on the
+// wire. `cites` is optional here too — `done` needs a PR citation, but that is
+// enforced in sendMessageTool as a plain {ok:false,error}, mirroring the
+// identity-binding rejection, rather than as a schema throw.
+export const messageRecordSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("decision"), payload: decisionPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("verdict"), payload: verdictPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("done"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("blocker"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("risk"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("fyi"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("action"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("go"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("scope"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+]);
+
+// ---------- record authority (Phase 8 Task 4) ----------
+
+// The table (RECORD_AUTHORITY, ../roles.ts) is a floor on the three types
+// other agents ACT on; everything else is unrestricted.
+//
+// NOT A TRUST BOUNDARY. A role is self-declared at register/join (there is no
+// authority issuing them), so this is a CONSISTENCY check: it stops a worker
+// from accidentally emitting a `verdict` or countersigning its own `scope`,
+// the same way a linter stops a typo. Anything that must actually be
+// authenticated has to resolve identity-bound tokens (see tokens.json), never
+// this table.
+// Rejection shape mirrors the identity-binding rejection in server.ts: the
+// caller gets a plain `{ok: false, error}`, and nothing is written.
+export async function checkRecordAuthority(
+  from: string,
+  record: MessageRecord | undefined,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!record) return { ok: true };
+  const rule = RECORD_AUTHORITY[record.type];
+  if (!rule) return { ok: true };
+
+  const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
+  const entry = reg[from];
+  if (roleMatches(entry, rule.roles)) return { ok: true };
+
+  const held = resolveRole(entry);
+  return {
+    ok: false,
+    error:
+      `record.type '${record.type}' is restricted to ${rule.label} roles ` +
+      `(${[...rule.roles].join(", ")}); sender '${from}' holds ` +
+      `${held ? `role '${held.roleId}'` : entry ? "no role" : "no registry entry"}. ` +
+      `Send it as text, or register with the role that owns this record type.`,
+  };
+}
 
 export const sendMessageSchema = {
   from: z.string().min(1),
   to: z.string().optional(),
   room: z.string().optional(),
-  text: z.string().min(1),
+  // Optional ONLY so a record can fill it (Task 3.3). This relaxes a
+  // constraint rather than adding one, so v1 senders are unaffected; a call
+  // with neither `text` nor a renderable `record` is rejected in the tool.
+  text: z.string().min(1).optional(),
   kind: z.enum(["decision", "status", "chatter"]).optional(),
+  record: messageRecordSchema.optional(),
 };
 
 export async function sendMessageTool(args: {
   from: string;
   to?: string;
   room?: string;
-  text: string;
+  text?: string;
   kind?: "decision" | "status" | "chatter";
+  record?: MessageRecord;
 }) {
+  // Record authority first — a sender who may not emit this type is refused
+  // before any other check runs, so a rejected record writes nothing anywhere.
+  const authority = await checkRecordAuthority(args.from, args.record);
+  if (!authority.ok) return { ok: false as const, error: authority.error };
+
+  // A `done` must cite the work it claims. Presence and shape only — resolving
+  // the ref against gh/git is a consumer's job, and the send path makes no
+  // network calls. Rejected as a value, not a throw, mirroring the
+  // identity-binding rejection in src/server.ts.
+  if (args.record?.type === "done") {
+    const hasPr = (args.record.cites ?? []).some((c) => c.kind === "pr" && c.ref.trim().length > 0);
+    if (!hasPr) {
+      return {
+        ok: false as const,
+        error:
+          "a 'done' record must carry at least one {kind:'pr'} citation — an uncited DONE is an unverifiable claim",
+      };
+    }
+  }
+
+  // `text` is what every consumer reads, so it must exist. The author's
+  // wording ALWAYS wins: a record renders only to fill an absent text, never
+  // to overwrite one.
+  const text = args.text ?? (args.record ? renderRecord(args.record) : null);
+  if (!text) {
+    return {
+      ok: false as const,
+      error: args.record
+        ? `record type '${args.record.type}' has no payload to render — supply 'text', or a payload the type's layout can render`
+        : "'text' is required when no record is supplied",
+    };
+  }
+
   // DM → inbox. Otherwise resolve the channel (default `general`), make sure it
   // exists in the registry, and tag the message with its channel.
   if (args.to) {
@@ -92,7 +219,8 @@ export async function sendMessageTool(args: {
       ts: Date.now(),
       from: args.from,
       to: args.to,
-      text: args.text,
+      text,
+      ...(args.record ? { record: args.record } : {}),
     };
     const target = inboxFile(args.to);
     await appendJsonl(target, msg);
@@ -113,8 +241,9 @@ export async function sendMessageTool(args: {
     ts: Date.now(),
     from: args.from,
     room: chan,
-    text: args.text,
+    text,
     ...(args.kind ? { kind: args.kind } : {}),
+    ...(args.record ? { record: args.record } : {}),
   };
   const target = roomFile(chan);
   await appendJsonl(target, msg);
@@ -154,7 +283,7 @@ async function maybeCompactRoom(chan: string): Promise<void> {
   const r = await archiveJsonl<Message>(
     file,
     archiveRoomFile(chan),
-    (e) => e.ts >= boundaryTs || (e.kind === "decision" && e.ts > decisionCutoff)
+    (e) => e.ts >= boundaryTs || (isDecision(e) && e.ts > decisionCutoff)
   );
   if (r.removed > 0) await adjustCursors({ roomRemovedByChan: { [chan]: r.removed } });
 }
@@ -287,7 +416,7 @@ function digestOverflow(over: (Message | StatusEntry)[], hash: string | undefine
     : `] — read without peek to get an expandable hash`;
   // Decisions are the one thing a digest must not bury — quote them verbatim
   // (capped) below the summary line.
-  const decisions = over.filter((m): m is Message => (m as Message).kind === "decision");
+  const decisions = over.filter((m): m is Message => isDecision(m as Message));
   const quoted = decisions
     .slice(-5)
     .map((d) => `  [decision] ${d.from}: ${d.text.length > 200 ? d.text.slice(0, 200) + "…" : d.text}`);
@@ -295,6 +424,76 @@ function digestOverflow(over: (Message | StatusEntry)[], hash: string | undefine
     ? `\n${quoted.join("\n")}${decisions.length > 5 ? `\n  (+${decisions.length - 5} earlier decisions in hash)` : ""}`
     : "";
   return head + tail + decisionBlock;
+}
+
+// ---------- retrieve_message (Phase 8 Task 6) ----------
+
+export const retrieveMessageSchema = {
+  agentId: z.string().min(1),
+  id: z.string().min(1),
+};
+
+// Expand a digest handle back into the full typed record.
+//
+// NOT a cache. The handle is the message's own `id`, and this reads the source
+// of truth — rooms/<chan>.jsonl or inbox/<agent>.jsonl. That matters for two
+// reasons the CCR history cache could not offer: nothing is duplicated, and
+// nothing expires. A stashed copy would have carried HISTORY_TTL_MS and become
+// permanently unrecoverable after 30 minutes, which is exactly when a handle
+// that outlived a /clear would be expanded.
+//
+// It also sidesteps the cursor: the pusher SHARES the cursor file with
+// read_messages, so anything already delivered to a pane is behind the cursor
+// and re-reading the channel would not return it. A by-id lookup never
+// consults a cursor.
+//
+// AUTHORITY BY CONSTRUCTION: we only ever open files this agent is entitled to
+// read — its own inbox, and the rooms it is a member of. There is no separate
+// permission check that could disagree with the search, and a handle for a
+// message delivered somewhere else simply is not found. That is the same
+// property the history cache spent `forAgent` scoping to get.
+export async function retrieveMessageTool(args: { agentId: string; id: string }) {
+  const rooms = await memberRooms(args.agentId);
+  const scopes = [
+    {
+      source: "inbox" as const,
+      room: undefined as string | undefined,
+      live: inboxFile(args.agentId),
+      archived: archiveInboxFile(args.agentId),
+    },
+    ...rooms.map((r) => ({
+      source: "room" as const,
+      room: r as string | undefined,
+      live: roomFile(r),
+      archived: archiveRoomFile(r),
+    })),
+  ];
+
+  // Live files first. The archive is opened ONLY on a miss, so no normal
+  // retrieval touches it and compaction/prune semantics are unchanged — but a
+  // record that compaction moved is still recoverable, because archive/ is
+  // append-only and complete.
+  for (const pass of ["live", "archived"] as const) {
+    for (const s of scopes) {
+      const entries = await readJsonl<Message>(s[pass]);
+      const msg = entries.find((m) => m.id === args.id);
+      if (msg) {
+        return {
+          ok: true as const,
+          id: msg.id,
+          source: s.source,
+          room: s.room,
+          archived: pass === "archived",
+          message: msg,
+          record: msg.record,
+        };
+      }
+    }
+  }
+  return {
+    ok: false as const,
+    error: `no message '${args.id}' in any channel you can read — it may never have been delivered to you`,
+  };
 }
 
 // ---------- retrieve_room_history ----------
