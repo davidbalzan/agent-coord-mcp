@@ -215,3 +215,75 @@ test("parse-contract line is byte-identical across both pushers", () => {
   };
   assert.equal(extract("../hooks/tier.mjs"), extract("../scripts/coord-pusher.mjs"));
 });
+
+// --- Phase 8 Task 1: typed envelope is additive, and the kind collision ---
+
+test("record-less messages render byte-identically (v1 regression lock)", () => {
+  // The whole additive premise: a v1 sender that has never heard of `record`
+  // must produce the same bytes as before. Locked against the literal strings
+  // so a future change to injectLine can't drift them silently.
+  assert.equal(
+    injectLine({ kind: "DM", ts: TS_0805, from: "peer", text: "hello" }),
+    "  [DM 08:05 peer] hello",
+  );
+  assert.equal(
+    injectLine({ kind: "room #proj", ts: TS_0805, from: "peer", text: "hello" }),
+    "  [#proj 08:05 peer] hello",
+  );
+});
+
+test("an attached record does not change the rendered line", () => {
+  const base = { kind: "DM", ts: TS_0805, from: "peer", text: "BLOCKER: db down" };
+  assert.equal(
+    injectLine({ ...base, record: { type: "blocker", cites: [{ kind: "pr", ref: "o/r#1" }] } }),
+    injectLine(base),
+  );
+});
+
+test("a stored Message.kind must not overwrite the channel tag", () => {
+  // Message.kind ("decision"/"status"/"chatter" — retention weight) collides
+  // by name with the pushers' synthetic channel tag. Spread-last let the
+  // stored value win, so a room post tagged kind:"decision" — what the README
+  // recommends for GOs and verdicts — rendered as `[decision …]` and broke the
+  // parse contract. Both pushers now assign the tag after the spread.
+  const stored = { ts: TS_0805, from: "coord", room: "proj", text: "GO: ship it", kind: "decision" };
+  const tagged = { ...stored, kind: "room #proj" };
+  assert.equal(injectLine(tagged), "  [#proj 08:05 coord] GO: ship it");
+});
+
+test("both pushers tag AFTER the spread (source-level lock)", () => {
+  // Same reasoning as the injectLine source check above: assert the fixed
+  // spread order in both delivery paths so the bug can't reappear in one.
+  // Line-positional, not pattern-matched: the tag value is a template literal
+  // (`room #${c}`) whose own braces defeat any naive object-literal regex —
+  // an earlier version of this check silently matched nothing. On every line
+  // that builds a tagged copy, `...m` must appear before `kind:`.
+  const src = (url) => readFileSync(fileURLToPath(new URL(url, import.meta.url)), "utf8");
+  let checked = 0;
+  for (const f of ["../hooks/tmux-pusher.mjs", "../scripts/coord-pusher.mjs"]) {
+    for (const line of src(f).split("\n")) {
+      if (!line.includes("...m") || !line.includes("kind:")) continue;
+      checked++;
+      assert.ok(
+        line.indexOf("...m") < line.indexOf("kind:"),
+        `${f}: spread before kind lets a stored kind overwrite the channel tag: ${line.trim()}`,
+      );
+    }
+  }
+  assert.equal(checked, 3, "expected 3 tagging sites; a moved/renamed one would silently pass");
+});
+
+test("the pusher stamps scriptMtime on its own marker", () => {
+  // attach_agent stamps scriptMtime, but the pusher rewrites the marker
+  // afterwards — omitting the field clobbered it, and doctor SKIPS markers
+  // without it, so the stale-pusher-script check could never fire in
+  // production. Source-level because the daemon can't be imported (it exits
+  // without its required env).
+  const src = readFileSync(
+    fileURLToPath(new URL("../hooks/tmux-pusher.mjs", import.meta.url)),
+    "utf8",
+  );
+  const body = src.match(/function writeTransportMarker\(\) \{([\s\S]*?)\n\}/);
+  assert.ok(body, "writeTransportMarker not found");
+  assert.match(body[1], /scriptMtime:/, "marker must carry scriptMtime or doctor skips it");
+});

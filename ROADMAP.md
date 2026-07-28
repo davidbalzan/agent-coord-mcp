@@ -245,6 +245,119 @@ A `doctor({ fix?: boolean })` MCP tool (and a `coord-chat /doctor` command + `co
 
 ---
 
+## Phase 8 — Typed protocol  📋 planned
+
+> **The bus v2 core.** Everything below is additive to the wire format — v1 and v2 agents share a bus throughout.
+
+The fleet already runs a rich workflow protocol — escalation priority, decision packets, work contracts, gate verdicts, cited completions, one-writer-per-file ownership. All of it is implemented as **case-sensitive string parsing over chat text and exact-glyph markdown**. That substrate is now the top source of silent failures:
+
+- `hooks/tier.mjs:26-38` decides who wakes up by `text.startsWith("BLOCKER:")`. A greeting before the prefix silently downgrades a production blocker to routine.
+- The UI's alert priority re-derives the same prefixes independently (`notificationPriority.ts`), so server-side tiering and human-facing alerting can disagree about the same message.
+- The `DAVID_DECISION` packet is a five-field record (title/context/options/recommendation/if-no-action) reconstructed from prose by `decisionPacket.ts`.
+- `docs/QUEUE.md` / `docs/DONE.md` require exact `U+2014` and `U+00B7` glyphs; a parser once returned zero items on the real file while passing every synthetic test.
+- `injectLine` (`hooks/tier.mjs:103`) is a documented byte-identical *parse contract* — agent harnesses read `from`/`room`/`text` back out of a rendered string.
+
+Each is the same defect class: **semantics that matter are carried as text and recovered by regex.** Phase 8 promotes them to typed records the server understands, so tiering, alerting, and rendering all read one field instead of three parsers racing each other.
+
+Phase 8 deliberately does **not** touch transport. tmux keeps working exactly as today; see Phase 9.
+
+### Scope
+
+- **Typed message envelope.** Extend `Message` (`src/tools/shared.ts:79`) with an optional structured `record`: `{ type: "blocker"|"decision"|"risk"|"done"|"fyi"|"go"|"scope"|"verdict", payload, cites }`. `send_message` accepts it; `text` stays required as the human-readable rendering.
+- **One tiering source.** `classifyTier` prefers `record.type` when present and falls back to prefix parsing when absent. Delivery tier and UI alert priority derive from the same field.
+- **Typed decision packet** as a first-class payload, so the UI renders a card from data instead of parsing prose.
+- **Verifiable citations.** `cites: [{kind:"pr"|"file"|"commit", ref}]` — a `DONE:` carries its PR ref as a field a claim-verifier can resolve via `gh` without touching the message body.
+- **Permissions model.** Generalize one-writer-per-file into server-enforced write scopes (QUEUE → aide/David/UI; DONE → coordinator, append-only; board → coordinator; facts → verifier). Today the filesystem and convention are the only enforcement.
+- **Stable role identity.** Roles become `{id, displayName}` — id immutable, name mutable. The aide role has been renamed twice (curator → liaison → aide), each pass churning 500+ occurrences across skills, ids, and scripts.
+- **Work state as data.** Queue/done/board in the store, with markdown export to git preserved (diffability and David-edits-in-repo are why markdown was chosen — the goal is to stop *parsing* it, not to stop *having* it).
+
+### Out of scope
+
+- Transport changes of any kind (Phase 9).
+- The UI itself — it stays in its own repo and consumes these records.
+- Removing prefix parsing. It stays as the fallback for the whole phase; a flag day is what makes v1/v2 coexistence impossible.
+
+### Design notes
+
+- **Additive or it doesn't ship.** Every field is optional. An untyped v1 message classifies exactly as it does today. This is what lets a live fleet migrate agent-by-agent instead of all at once.
+- **`text` is never removed.** It is the rendering, and the tmux adapter can only deliver text. Typed records *accompany* it; they don't replace it.
+- **Server-set fields stay server-set.** `record` is caller-supplied and therefore untrusted, exactly like `from` — trust decisions (the `SCOPE:` countersignature at `tier.mjs:33`) still resolve the sender against the registry. A peer must not be able to self-declare urgency any more than it can today set `urgent`.
+- **The parse contract is the migration risk.** `injectLine` must stay byte-identical between `hooks/tier.mjs` and `scripts/coord-pusher.mjs`, and harnesses parse it. Adding typed records must not change a single rendered byte for messages that carry no record.
+
+### Tasks
+
+#### Task 1: Typed message envelope
+
+**Priority**: CRITICAL · **Dependencies**: None
+
+- [ ] 1.1 Add the `record` type + zod schema to `shared.ts` / `messaging.ts`, all fields optional
+- [ ] 1.2 Accept and persist `record` in `send_message`; leave `text` required
+- [ ] 1.3 Round-trip it through `read_messages`, `wait_for_message`, and the history digest
+- [ ] 1.4 Assert byte-identical `injectLine` output for record-less messages (regression lock)
+
+**Deliverables**: typed envelope on the wire, zero behavior change for v1 senders.
+
+#### Task 2: Single-source tiering
+
+**Priority**: CRITICAL · **Dependencies**: Task 1
+
+- [ ] 2.1 `classifyTier` reads `record.type` first, prefix parsing second
+- [ ] 2.2 Keep trusted-sender resolution for `scope`/`go` — typed does not mean trusted
+- [ ] 2.3 Tests: typed and prefixed forms of each type classify identically
+- [ ] 2.4 Test the documented footgun: greeting-first prose downgrades, the typed record does not
+
+**Deliverables**: one tiering decision, two accepted input forms.
+
+#### Task 3: Decision packets & citations
+
+**Priority**: HIGH · **Dependencies**: Task 1
+
+- [ ] 3.1 Typed `decision` payload matching the playbook's five fields
+- [ ] 3.2 Typed `cites` with `pr`/`file`/`commit` kinds
+- [ ] 3.3 Render typed → the current text layout so today's UI parser keeps working unchanged
+- [ ] 3.4 A `done` record without a resolvable PR cite is rejected at send time
+
+**Deliverables**: decision cards and DONE-verification from data, old UI unbroken.
+
+#### Task 4: Write scopes (permissions)
+
+**Priority**: HIGH · **Dependencies**: Task 1
+
+- [ ] 4.1 Role registry entries gain `{id, displayName}`; ids frozen, names free
+- [ ] 4.2 Declare write scopes per managed document
+- [ ] 4.3 Enforce on write; reject with the same shape as the identity-binding error
+- [ ] 4.4 `doctor` check: a document whose on-disk writer disagrees with its declared scope
+
+**Deliverables**: one-writer-per-file enforced by the server, not convention.
+
+#### Task 5: Work state as data
+
+**Priority**: MEDIUM · **Dependencies**: Tasks 1, 4
+
+- [ ] 5.1 Queue/done/board records in the store
+- [ ] 5.2 Markdown export preserving the exact current glyph contract
+- [ ] 5.3 Import path for existing `QUEUE.md`/`DONE.md`/`WORKSTREAMS.md`
+- [ ] 5.4 Round-trip test: import → export is byte-identical on this repo's real files
+
+**Rollback**: export is authoritative until the UI reads records directly; delete the store files and the markdown still stands alone.
+
+### Success criteria
+
+- A v1 agent that has never heard of `record` participates on the bus with byte-identical behavior — verified by diffing rendered `injectLine` output before and after.
+- A `BLOCKER` sent as a typed record wakes the target even when the text begins with a greeting — the case that silently fails today.
+- Tiering and UI alerting derive from one field; no second parser exists.
+- A `DONE` record's PR cite is resolvable via `gh` without reading the message body.
+- A write to a document the caller doesn't own is rejected by the server, and `doctor` reports scope drift.
+- `import → export` on this repo's real `QUEUE.md` / `DONE.md` is byte-identical.
+
+---
+
+## Phase 9 — Pluggable transport  🔭 next
+
+tmux moves out of the core and becomes one adapter behind a small interface (`deliver` · `clear` · `compact` · `alive`), joined by pty/ACP/SDK adapters for sessions the caller spawned, and the existing remote pusher. tmux stays the only answer for *agents you didn't spawn* — a `claude` a human started in a terminal — so this is a demotion, not a removal. `clear`/`compact` belong in the interface because context management is the coordinator's authority (playbook §Context Reset), and each adapter satisfies it differently. Sequenced after Phase 8 so adapters carry typed records rather than re-deriving semantics from rendered text.
+
+---
+
 ## Phase 7+ — Possible follow-ups
 
 Listed here so they don't clutter Phase 5/6, but worth tracking as ideas:

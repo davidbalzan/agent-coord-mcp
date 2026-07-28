@@ -76,6 +76,48 @@ export type TransportMarker = {
 
 export type AgentRegistry = Record<string, AgentEntry>;
 
+// Where a claim can be independently verified. The point is that a consumer
+// resolves the ref (gh, git, fs) instead of trusting the message body — a
+// `done` record whose PR ref doesn't exist is a false claim, not a typo.
+export type Citation = {
+  kind: "pr" | "file" | "commit" | "url";
+  ref: string;
+};
+
+// The protocol vocabulary the fleet already speaks. Today these live as
+// case-sensitive prefixes at byte 0 of `text` (hooks/tier.mjs), parsed a
+// second time by the UI for alert priority — so a greeting before the prefix
+// silently downgrades a production blocker, and the two parsers can disagree
+// about the same message. As a field there is nothing to mis-parse.
+export type MessageRecordType =
+  | "blocker"   // BLOCKER:        work cannot continue
+  | "decision"  // DAVID_DECISION: the human must decide
+  | "risk"      // RISK:           quality/security/cost/product risk
+  | "done"      // DONE:           completed work, must cite
+  | "fyi"       // FYI:            no action needed
+  | "action"    // AGENT_ACTION:   another agent can handle it
+  | "go"        // GO:             a work order
+  | "scope"     // SCOPE CHANGE:   amends a contract in flight
+  | "verdict";  // (new) a gate PASS/FAIL — has no prefix today
+
+// Structured counterpart to `text`, NOT a replacement: `text` stays required
+// because it is the rendering, and a tmux pane can only receive text. Every
+// field is optional so a v1 agent that has never heard of `record` behaves
+// byte-identically.
+//
+// UNTRUSTED, exactly like `from`. A peer can claim any type here, so trust
+// decisions (the SCOPE countersignature, gate-runner routing) must still
+// resolve the sender against the registry — typed is not the same as
+// authenticated, and `record` must never become a path to setting `urgent`.
+export type MessageRecord = {
+  type: MessageRecordType;
+  // Type-specific fields (the decision packet's title/context/options/… ).
+  // Shapes are pinned per type in Phase 8 Task 3; the envelope stays open so
+  // adding one doesn't require a wire change.
+  payload?: Record<string, unknown>;
+  cites?: Citation[];
+};
+
 export type Message = {
   id: string;
   ts: number;
@@ -96,7 +138,15 @@ export type Message = {
   // Semantic weight of a room post (absent = chatter). Decisions get a longer
   // prune retention (decisionDays), survive live compaction while fresh, and
   // are surfaced verbatim in overflow digests.
+  //
+  // NAME COLLISION, load-bearing: the pushers render a *synthetic* `kind` on
+  // their own copy of the message ("DM" / "room #general") which injectLine
+  // and classifyTier read as the channel tag. Never let a stored Message's
+  // kind reach those — see the spread order at tmux-pusher.mjs:237. Phase 8
+  // Task 3 should rename one of the two.
   kind?: "decision" | "status" | "chatter";
+  // Typed protocol record (Phase 8). Optional and additive; see MessageRecord.
+  record?: MessageRecord;
 };
 
 export type StatusEntry = {

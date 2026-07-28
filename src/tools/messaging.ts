@@ -53,6 +53,7 @@ import {
   type AgentEntry,
   type AgentRegistry,
   type Message,
+  type MessageRecord,
   type StatusEntry,
   type Cursor,
   type Source,
@@ -69,12 +70,38 @@ import {
 
 // ---------- send_message ----------
 
+// Typed protocol record (Phase 8). Additive: omitting it reproduces v1
+// behavior exactly, and `text` stays required as the rendering of record.
+export const messageRecordSchema = z.object({
+  type: z.enum([
+    "blocker",
+    "decision",
+    "risk",
+    "done",
+    "fyi",
+    "action",
+    "go",
+    "scope",
+    "verdict",
+  ]),
+  payload: z.record(z.string(), z.unknown()).optional(),
+  cites: z
+    .array(
+      z.object({
+        kind: z.enum(["pr", "file", "commit", "url"]),
+        ref: z.string().min(1),
+      }),
+    )
+    .optional(),
+});
+
 export const sendMessageSchema = {
   from: z.string().min(1),
   to: z.string().optional(),
   room: z.string().optional(),
   text: z.string().min(1),
   kind: z.enum(["decision", "status", "chatter"]).optional(),
+  record: messageRecordSchema.optional(),
 };
 
 export async function sendMessageTool(args: {
@@ -83,6 +110,7 @@ export async function sendMessageTool(args: {
   room?: string;
   text: string;
   kind?: "decision" | "status" | "chatter";
+  record?: MessageRecord;
 }) {
   // DM → inbox. Otherwise resolve the channel (default `general`), make sure it
   // exists in the registry, and tag the message with its channel.
@@ -93,6 +121,7 @@ export async function sendMessageTool(args: {
       from: args.from,
       to: args.to,
       text: args.text,
+      ...(args.record ? { record: args.record } : {}),
     };
     const target = inboxFile(args.to);
     await appendJsonl(target, msg);
@@ -115,6 +144,7 @@ export async function sendMessageTool(args: {
     room: chan,
     text: args.text,
     ...(args.kind ? { kind: args.kind } : {}),
+    ...(args.record ? { record: args.record } : {}),
   };
   const target = roomFile(chan);
   await appendJsonl(target, msg);
