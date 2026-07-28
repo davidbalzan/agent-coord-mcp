@@ -317,7 +317,10 @@ function startLoop(source, room) {
       if (state.cancelled) break;
       const msgs = Array.isArray(r?.messages) ? r.messages : [];
       for (const m of msgs) {
-        if (shouldInject(m)) pending.push({ kind: tag, ...m });
+        // `kind` after the spread — a stored Message's own kind (retention
+        // weight) must not overwrite the channel tag injectLine renders.
+        // Mirrors hooks/tmux-pusher.mjs; the two must stay byte-identical.
+        if (shouldInject(m)) pending.push({ ...m, kind: tag });
       }
       if (pending.length > 0) scheduleFlush();
     }

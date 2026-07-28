@@ -56,7 +56,9 @@ import {
   unlinkSync,
   watch,
 } from "node:fs";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { effectiveTier, isGateRunnerRole, TierQueue, formatBatch } from "./tier.mjs";
@@ -129,6 +131,16 @@ const TRANSPORT_FILE = path.join(ROOT, "transports", `${SAFE_ID}.json`);
 // entering any agent's context. Mirrors RECEIPTS_DIR in src/store.ts.
 const RECEIPTS_FILE = path.join(ROOT, "receipts", `${SAFE_ID}.jsonl`);
 const BUFFER_NAME = `coord-${SAFE_ID}`;
+// mtime of the script this process actually loaded, sampled once at startup —
+// an upgrade to the file on disk afterwards leaves this value behind, which is
+// exactly what doctor's stale-pusher-script check compares against.
+const SCRIPT_MTIME = (() => {
+  try {
+    return statSync(fileURLToPath(import.meta.url)).mtimeMs;
+  } catch {
+    return undefined;
+  }
+})();
 
 mkdirSync(path.dirname(CURSOR_FILE), { recursive: true });
 mkdirSync(path.dirname(TRANSPORT_FILE), { recursive: true });
@@ -234,7 +246,13 @@ function collectSource(label, file, cursorKey, cur, staged) {
   if (fresh.length === 0) return;
   for (const m of fresh) {
     if (shouldInject(m)) {
-      const tagged = { kind: label, ...m };
+      // `kind` AFTER the spread: a stored Message carries its own `kind`
+      // ("decision"/"status"/"chatter" — retention weight), which is a
+      // different field with the same name. Spread-last let it overwrite the
+      // channel tag, so a room post tagged kind:"decision" (what the README
+      // recommends for GOs and verdicts) rendered as `[decision …]` instead of
+      // `[#general …]` and broke injectLine's parse contract.
+      const tagged = { ...m, kind: label };
       // Assigned after the spread so a sender can't smuggle a tier field in.
       tagged.tier = effectiveTier(tagged, tierCtx);
       staged.msgs.push(tagged);
@@ -259,7 +277,7 @@ function collectRoomChannel(chan, cur, staged) {
   if (fresh.length === 0) return;
   for (const m of fresh) {
     if (shouldInject(m)) {
-      const tagged = { kind: `room #${c}`, ...m };
+      const tagged = { ...m, kind: `room #${c}` }; // see spread-order note above
       tagged.tier = effectiveTier(tagged, tierCtx);
       staged.msgs.push(tagged);
     }
@@ -487,6 +505,12 @@ function writeTransportMarker() {
     pid: process.pid,
     tmuxTarget: TMUX_TARGET,
     since: Date.now(),
+    // MUST be included: attach_agent stamps this too, but this write happens
+    // afterwards and would otherwise clobber it — and doctor SKIPS markers
+    // without it (pre-v0.8.2 shape), so dropping it silently disabled the
+    // stale-pusher-script check for every local pusher. Our own mtime is the
+    // more truthful value anyway: it is the script THIS process loaded.
+    scriptMtime: SCRIPT_MTIME,
   };
   const tmp = TRANSPORT_FILE + ".tmp";
   writeFileSync(tmp, JSON.stringify(marker));
