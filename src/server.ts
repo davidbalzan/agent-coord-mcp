@@ -64,6 +64,12 @@ import {
   waitForMessageTool,
   listScopesSchema,
   listScopesTool,
+  importWorkSchema,
+  importWorkTool,
+  listWorkSchema,
+  listWorkTool,
+  exportWorkSchema,
+  exportWorkTool,
 } from "./tools/index.js";
 
 function jsonResult(data: unknown) {
@@ -343,6 +349,27 @@ function buildServer(initialBound?: string): McpServer {
     "Read the declared write scopes for managed documents (~/agent-coord/scopes.json). Call it with 'path' (and your 'agentId') to ask \"may I write this?\" BEFORE editing a shared doc like docs/QUEUE.md; call it bare to list every declared document and its owning role. ADVISORY ONLY: the bus does not mediate file writes, so this answers who owns a document, it does not stop anyone — enforcement arrives when work state moves into the store. Absent scopes.json means nothing is owned and nothing warns (opt-in).",
     listScopesSchema,
     gate(null, listScopesTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "import_work",
+    "Read a project's work documents (docs/QUEUE.md + docs/DONE.md, or the legacy docs/BACKLOG.md, plus docs/WORKSTREAMS.md) into typed records: queue items {priority,text,done}, done entries {text,ref,date} and board rows. The markdown stays authoritative — this store is a derived index, and export_work renders it back byte-identically.",
+    importWorkSchema,
+    gate(null, importWorkTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "list_work",
+    "Query a project's work state as records instead of parsing markdown: open queue items (filter by priority), done entries with their ref and date as separate fields, and the board's lane rows. Falls back to reading the documents directly when nothing has been imported, so it works with no store at all.",
+    listWorkSchema,
+    gate(null, listWorkTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "export_work",
+    "Render a project's work documents back out of the store, reproducing the pinned glyph contract exactly (ref after the last ' \u2014 ', date after a trailing ' \u00b7 '). Reports by default; pass write:true to rewrite the files. Refuses to export from an empty store rather than blanking a document. Any declared Task 4 write scope is REPORTED alongside the write, never enforced.",
+    exportWorkSchema,
+    gate(null, exportWorkTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
