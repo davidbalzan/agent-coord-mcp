@@ -380,9 +380,45 @@ test("a record cannot smuggle the server-only urgent flag", () => {
   assert.equal(classifyTier({ ...room("BLOCKER: x"), record: {} }), "urgent"); // no type → prefix path
 });
 
-test("the record wins over a contradicting prefix, both directions", () => {
+test("the record is a floor: it raises a tier and can never lower one", () => {
+  // Raising is the point of the phase.
   assert.equal(classifyTier({ ...room("FYI: routine-looking"), record: { type: "blocker" } }), "urgent");
-  assert.equal(classifyTier({ ...room("BLOCKER: urgent-looking"), record: { type: "fyi" } }), "routine");
+  // Lowering is the regression this replaced. An earlier version returned
+  // "routine" here: the pane rendered "BLOCKER: …" (text wins for rendering,
+  // contract 3.3) while delivery queued it, and `record` is never rendered so
+  // the reader could not see why. In v1 a byte-0 BLOCKER always woke the pane;
+  // nothing may take that away invisibly.
+  assert.equal(classifyTier({ ...room("BLOCKER: urgent-looking"), record: { type: "fyi" } }), "urgent");
+});
+
+test("relay cannot bury a peer's blocker under the relayer's own record", () => {
+  // The operational trigger, not an adversarial one: an aide or coordinator
+  // forwarding a worker's body verbatim under its own `fyi`.
+  const relayed = {
+    ...room("BLOCKER: prod is down, payments failing"),
+    from: "proj-aide",
+    record: { type: "fyi", payload: { summary: "forwarding worker report" } },
+  };
+  assert.equal(classifyTier(relayed), "urgent");
+});
+
+test("an unknown future record type cannot bury an urgent body", () => {
+  // Forward-compat: a new vocabulary meeting an old pusher hits the routine
+  // default in tierFromRecord. The floor keeps the text's claim alive.
+  assert.equal(classifyTier({ ...room("BLOCKER: x"), record: { type: "emergency" } }), "urgent");
+  // ...and an unknown type over a routine body is still routine.
+  assert.equal(classifyTier({ ...room("chatter"), record: { type: "emergency" } }), "routine");
+});
+
+test("the floor does not grant trust the prefix path withholds", () => {
+  const trustedSenders = new Set(["proj-coordinator"]);
+  // scope from an untrusted sender: routine on BOTH paths, so the floor is routine.
+  assert.equal(
+    classifyTier({ ...room("SCOPE CHANGE: widen slice"), record: { type: "scope" } }, { trustedSenders }),
+    "routine",
+  );
+  // done to a non-gate-runner: same.
+  assert.equal(classifyTier({ ...room("DONE: o/r#1"), record: { type: "done" } }, {}), "routine");
 });
 
 test("record changes tier only — never the rendered line", () => {

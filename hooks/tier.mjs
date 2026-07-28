@@ -18,10 +18,13 @@ import { isGateRunner } from "./roles.mjs";
 //
 // TRUST: `record` is caller-supplied, exactly like `from`. A typed record may
 // therefore assert what a text prefix could already assert, and NOTHING more —
-// `scope` and `go` still resolve the sender against trustedSenders, and `done`
-// still depends on the RECIPIENT being a gate runner. Typed is not
-// authenticated. Anything that would let a peer self-declare urgency belongs
-// in the server-set `urgent` flag, not here.
+// `scope` resolves the sender against trustedSenders and `done` depends on the
+// RECIPIENT being a gate runner, exactly as the prefix path does. `go` is
+// unconditionally urgent here because literal "GO:" is unconditionally urgent
+// in the prefix path too; do NOT "fix" that asymmetry by gating go, and do not
+// ungate scope to match go — each mirrors its v1 prefix, which is the whole
+// invariant. Typed is not authenticated: anything that would let a peer
+// self-declare urgency belongs in the server-set `urgent` flag, not here.
 function tierFromRecord(rec, m, opts) {
   switch (rec.type) {
     case "blocker":
@@ -58,13 +61,31 @@ export function classifyTier(m, opts = {}) {
   // kind:"decision" overwrote the channel tag and rendered as `[decision …]`.
   // The tag is process-local and never persisted, so it was the safe half of
   // the collision to rename; Message.kind is on disk in every JSONL file.
+  // NOTE: this returns before the record is read, so a DM can never be
+  // downgraded by one. The floor rule below makes that moot, but the ordering
+  // is load-bearing if anyone reintroduces a record-first branch.
   if (m.tag === "DM") return "urgent";
-  // Typed record wins outright when present — it is the sender's explicit
-  // declaration, where a prefix is an inference from prose. No max() with the
-  // prefix result: two sources that can each override the other is the
-  // disagreement this phase exists to remove. Task 3 renders text FROM the
-  // record, so the two agree by construction for v2 senders.
-  if (m.record && typeof m.record.type === "string") return tierFromRecord(m.record, m, opts);
+  // The record is a FLOOR, not an override: it can raise the tier, never lower
+  // it. An earlier version let the record win outright, on the argument that
+  // Task 3 renders text from the record so the two agree by construction. That
+  // is false when BOTH are supplied — contract 3.3 makes the author's `text`
+  // win for rendering, so `{text:"BLOCKER: prod down", record:{type:"fyi"}}`
+  // displayed a BLOCKER in the pane and delivered it routine, with the reader
+  // unable to see why (`record` is never rendered). That is a REGRESSION IN A
+  // SAFETY PROPERTY: in v1, "BLOCKER:" at byte 0 always woke the pane. The
+  // trigger is ordinary relay, not malice — an aide forwarding a worker's body
+  // under its own `fyi` would silently bury that worker's blocker.
+  //
+  // max() is not the two-overridable-sources design this phase exists to
+  // delete: it is monotone, so there is nothing to disagree about, only a
+  // higher claim winning. It also fails safe on an UNKNOWN future record type,
+  // which hits the routine default — an old pusher meeting a new vocabulary
+  // must not bury a "BLOCKER:" body. The one legitimate downgrade, quoting a
+  // blocker mid-body, is already handled by the byte-0 rule.
+  // Found by ai-workflow-worker-1 gating 721882a.
+  if (m.record && typeof m.record.type === "string") {
+    if (tierFromRecord(m.record, m, opts) === "urgent") return "urgent";
+  }
   if (typeof m.text !== "string") return "routine";
   const text = m.text.trimStart();
   // Control/slash commands are injected raw and must fire immediately.
