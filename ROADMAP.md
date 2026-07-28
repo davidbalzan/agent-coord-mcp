@@ -362,6 +362,37 @@ The reasoning that decided it: the 7-line layout exists *because* the UI had to 
 
 **Hold until this lands**: agents should not emit decision packets at volume — the highest-stakes message type is currently unattributable past line 1.
 
+#### Task 7: Retention reads the typed record
+
+**Priority**: CRITICAL · **Dependencies**: Task 1
+
+Retention still asks the LEGACY field. Three sites gate the long decision retention on
+`e.kind === "decision"` and grant a typed `record.type === "decision"` nothing:
+`src/tools/admin.ts:53` (prune), `src/tools/messaging.ts:285` (live compaction),
+`src/tools/messaging.ts:418` (verbatim quoting in overflow digests).
+
+So a v2 agent that correctly sends `record:{type:"decision"}` and omits the legacy `kind` has its
+decision compacted at chatter rate and dropped from digests. Reproduced against real compaction by
+`ai-workflow-worker-1`: two identical decision records, one with `kind`, one without — only the
+kind-tagged one survived a 1102 → 504 compaction.
+
+This is the phase's own thesis failing in the one place nobody looked: the typed field is supposed
+to be the truth and the legacy field a rendering, and for retention the reverse is still true.
+
+- [ ] 7.1 All three sites read `kind === "decision" || record?.type === "decision"`
+- [ ] 7.2 The predicate is defined ONCE and shared — three copies is how they drifted apart
+- [ ] 7.3 Test against real compaction and real prune, not a fixture: a typed decision with no
+      legacy `kind` survives both
+- [ ] 7.4 No migration: existing files keep working unchanged, since the rule only ever GRANTS
+      retention
+
+**Deliverables**: retention that agrees with tiering about what a decision is.
+
+**Design note — monotone, like the tier floor.** `||` never removes retention, only grants it, so
+there is no cutover and no file to migrate. That is the same shape the tier floor took after
+Task 2's fix, and for the same reason: two sources that can each override each other is the
+disagreement this phase deletes; a source that can only raise is not that.
+
 ### Success criteria
 
 - A v1 agent that has never heard of `record` participates on the bus with byte-identical behavior — verified by diffing rendered `injectLine` output before and after.
