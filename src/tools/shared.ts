@@ -51,7 +51,16 @@ import {
 export type AgentEntry = {
   agentId: string;
   project?: string;
+  // DISPLAY NAME — free to change. Stays a plain string on disk so existing
+  // agents.json files, coord-chat's `/whois`, and every v1 reader keep working
+  // untouched.
   role?: string;
+  // FROZEN IDENTITY (Phase 8 Task 4). Optional and additive: when absent the id
+  // is derived from `role` at read time (resolveRole), which is what every
+  // pre-Task-4 entry does. Once DECLARED it is immutable — register rejects an
+  // attempt to change it — so a role can be renamed (curator → liaison → aide)
+  // without every id, skill and script that keys off it having to move.
+  roleId?: string;
   registeredAt: number;
   lastHeartbeat: number;
   capabilities?: string[];

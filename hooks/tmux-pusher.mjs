@@ -105,7 +105,9 @@ function refreshTierCtx() {
   try {
     const reg = JSON.parse(readFileSync(path.join(ROOT, "agents.json"), "utf8"));
     for (const [id, entry] of Object.entries(reg ?? {})) {
-      if (isGateRunnerRole(entry?.role)) trusted.add(id);
+      // Pass the whole entry: the frozen roleId lives beside `role`, and
+      // reading only the display string would throw the identity away.
+      if (isGateRunnerRole(entry)) trusted.add(id);
     }
     gateRunner = trusted.has(AGENT_ID);
   } catch {

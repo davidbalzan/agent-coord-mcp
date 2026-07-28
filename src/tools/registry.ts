@@ -48,6 +48,7 @@ import {
   updateJson,
   type RoomRegistry,
 } from "../store.js";
+import { resolveRole, roleInputSchema, type RoleArg } from "../roles.js";
 import {
   type AgentEntry,
   type AgentRegistry,
@@ -71,24 +72,67 @@ import {
 export const registerSchema = {
   agentId: z.string().min(1),
   project: z.string().optional(),
-  role: z.string().optional(),
+  role: roleInputSchema.optional(),
 };
 
-export async function registerTool(args: { agentId: string; project?: string; role?: string }) {
+// Work out what `role`/`roleId` should become, or why the update is refused.
+//
+// Rules (Phase 8 Task 4):
+//  - A DECLARED roleId is immutable. Re-declaring the same id is a no-op;
+//    declaring a different one is rejected.
+//  - displayName is always free to change — that is the whole point.
+//  - A plain string never freezes an id (it only sets the display name), so
+//    v1 agents that re-register under changing free text keep working exactly
+//    as before, and their id stays derived.
+export function resolveRoleUpdate(
+  agentId: string,
+  existing: AgentEntry | undefined,
+  input: RoleArg | undefined,
+): { ok: true; role?: string; roleId?: string } | { ok: false; error: string } {
+  if (input === undefined) return { ok: true, role: existing?.role, roleId: existing?.roleId };
+
+  const resolved = resolveRole(typeof input === "string" ? input : { ...input });
+  if (!resolved) return { ok: true, role: existing?.role, roleId: existing?.roleId };
+
+  const declared = typeof input === "object" && !!input.roleId;
+  if (existing?.roleId && declared && resolved.roleId !== existing.roleId) {
+    return {
+      ok: false,
+      error:
+        `roleId '${existing.roleId}' is frozen for agent '${agentId}'; rejected attempt to change it to '${resolved.roleId}'. ` +
+        `The display name is free to change — pass role.displayName instead.`,
+    };
+  }
+
+  // A bare string against an agent with a frozen id updates the name only.
+  const nextRole =
+    typeof input === "string" ? input : input.displayName ?? existing?.role ?? resolved.displayName;
+  return { ok: true, role: nextRole, roleId: declared ? resolved.roleId : existing?.roleId };
+}
+
+export async function registerTool(args: { agentId: string; project?: string; role?: RoleArg }) {
+  const before = await readJson<AgentRegistry>(AGENTS_FILE, {});
+  const roleUpdate = resolveRoleUpdate(args.agentId, before[args.agentId], args.role);
+  if (!roleUpdate.ok) return { ok: false as const, error: roleUpdate.error };
+
   const reg = await updateJson<AgentRegistry>(AGENTS_FILE, {}, (current) => {
     const now = Date.now();
     const existing = current[args.agentId];
     current[args.agentId] = {
       agentId: args.agentId,
       project: args.project ?? existing?.project,
-      role: args.role ?? existing?.role,
+      role: roleUpdate.role,
+      // Only ever written when the caller declared one — absent stays absent,
+      // so an existing agents.json is never rewritten into a new shape.
+      ...(roleUpdate.roleId ? { roleId: roleUpdate.roleId } : {}),
       registeredAt: existing?.registeredAt ?? now,
       lastHeartbeat: now,
       capabilities: existing?.capabilities,
     };
     return current;
   });
-  return { ok: true, agent: reg[args.agentId] };
+  const entry = reg[args.agentId];
+  return { ok: true as const, agent: entry, resolvedRole: resolveRole(entry) };
 }
 
 // ---------- unregister ----------

@@ -1,6 +1,6 @@
-// Pure delivery-tier logic for the pusher. Dependency-free and
-// side-effect-free so it can be unit-tested directly and adds no I/O to the
-// delivery hot path.
+// Pure delivery-tier logic for the pusher. Side-effect-free, and its only
+// import (./roles.mjs) is equally pure — so it can be unit-tested directly and
+// adds no I/O to the delivery hot path.
 //
 // "urgent" = push now (wakes the target agent's model).
 // "routine" = queue silently; it rides along as a coalesced digest on the
@@ -8,6 +8,8 @@
 //
 // All prefix checks are case-sensitive: the protocol prefixes are uppercase
 // by convention, and a lowercase lookalike is chatter, not a work order.
+
+import { isGateRunner } from "./roles.mjs";
 
 // Typed protocol record → tier (Phase 8). The prefix table below is the same
 // vocabulary parsed out of text; reading the field instead removes the parse
@@ -90,10 +92,16 @@ export function effectiveTier(m, opts = {}) {
 }
 
 // A gate runner is the agent that consumes DONE: reports (QA / coordinator).
-// Resolved from the registry role, with an env override in both directions
-// (AGENT_COORD_GATE_RUNNER=1|0).
+// Resolved from the registry role's frozen `roleId` (Phase 8 Task 4) rather
+// than by regex-matching display prose, so renaming the role does not change
+// who runs the gate. Registry entries with no declared roleId fall back to the
+// legacy word match — see roleMatches in roles.mjs. Env override in both
+// directions (AGENT_COORD_GATE_RUNNER=1|0) is applied by the caller.
+//
+// Accepts a plain string or a whole registry entry ({role, roleId}); pass the
+// entry when you have it, or the id is lost.
 export function isGateRunnerRole(role) {
-  return /\b(qa|quality|coordinator|gate)\b/i.test(role ?? "");
+  return isGateRunner(role);
 }
 
 // In-memory routine queue with the push decision. Ingest classified messages;

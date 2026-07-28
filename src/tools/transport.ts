@@ -1,5 +1,6 @@
 import { loadLiveTransports, isMarkerLive, isPidAlive } from "./registry.js";
 import { registerTool } from "./registry.js";
+import { roleInputSchema, type RoleArg } from "../roles.js";
 import { sendMessageTool, readMessagesTool } from "./messaging.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, openSync, watch } from "node:fs";
@@ -633,7 +634,9 @@ const joinAttachOptionsSchema = z.object({
 export const joinSchema = {
   agentId: z.string().min(1),
   project: z.string().optional(),
-  role: z.string().optional(),
+  // Free text, or a declared identity ({roleId, displayName}) — see
+  // roleInputSchema. A frozen roleId cannot be changed by re-joining.
+  role: roleInputSchema.optional(),
   // attach: undefined → auto-attach if $TMUX_PANE is set; true → always try;
   // false → never; object → attach with overrides.
   attach: z.union([z.boolean(), joinAttachOptionsSchema]).optional(),
@@ -643,7 +646,7 @@ export const joinSchema = {
 export async function joinTool(args: {
   agentId: string;
   project?: string;
-  role?: string;
+  role?: RoleArg;
   attach?: boolean | { tmuxTarget?: string; includeRoom?: boolean; allowlist?: string[]; debounceMs?: number };
   readInbox?: boolean;
 }) {
@@ -652,6 +655,9 @@ export async function joinTool(args: {
     project: args.project,
     role: args.role,
   });
+  // A refused role update (frozen roleId) fails the whole join rather than
+  // silently attaching a transport under the wrong identity.
+  if (!reg.ok) return reg;
 
   // Decide attach behavior.
   const wantAttach = args.attach === false
