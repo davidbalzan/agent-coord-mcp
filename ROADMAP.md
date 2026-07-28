@@ -343,6 +343,25 @@ Phase 8 deliberately does **not** touch transport. tmux keeps working exactly as
 
 **Rollback**: export is authoritative until the UI reads records directly; delete the store files and the markdown still stands alone.
 
+#### Task 6: Records travel structurally
+
+**Priority**: HIGH · **Dependencies**: Tasks 1, 3 · **Decision: David, 2026-07-28 — option C**
+
+`injectLine` emits ONE `[tag HH:MM from]` header per message, but a rendered `DAVID_DECISION` packet is 7 lines — so lines 2–7 arrive unattributed and a parser cannot recover who sent them or which room they came from. Pre-existing for hand-typed multi-line messages; Task 3 makes it machine-generated and routine, on the highest-stakes traffic the bus carries.
+
+The rejected alternatives matter as much as the choice. **Prefixing every continuation line** was the cheap fix and was rejected: it changes rendered output for existing record-less multi-line messages, taxing the byte-identical guarantee Tasks 1–4 were built against. **Folding packets to one line** preserves the contract but destroys the layout the UI parses into a decision card.
+
+The reasoning that decided it: the 7-line layout exists *because* the UI had to parse prose. Now that `record` is typed, consumers read the field and the text rendering only has to be legible to a human. **Pane rendering stops being a wire format** — the same realisation behind demoting tmux in Phase 9, which is why this task is the seam between the two phases.
+
+- [ ] 6.1 Pane delivery carries a one-line attributed header plus a digest, never a multi-line body a parser must reassemble
+- [ ] 6.2 Consumers read the full record via `read_messages` rather than from rendered text
+- [ ] 6.3 Record-less messages — including multi-line ones — still render byte-identically
+- [ ] 6.4 The UI's decision card is fed by the typed record, with the prose layout kept only as a human-readable fallback
+
+**Deliverables**: multi-line records deliverable without breaking the single-line parse contract; the text rendering demoted from wire format to human affordance.
+
+**Hold until this lands**: agents should not emit decision packets at volume — the highest-stakes message type is currently unattributable past line 1.
+
 ### Success criteria
 
 - A v1 agent that has never heard of `record` participates on the bus with byte-identical behavior — verified by diffing rendered `injectLine` output before and after.
