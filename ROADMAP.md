@@ -290,10 +290,10 @@ Phase 8 deliberately does **not** touch transport. tmux keeps working exactly as
 
 **Priority**: CRITICAL · **Dependencies**: None
 
-- [ ] 1.1 Add the `record` type + zod schema to `shared.ts` / `messaging.ts`, all fields optional
-- [ ] 1.2 Accept and persist `record` in `send_message`; leave `text` required
-- [ ] 1.3 Round-trip it through `read_messages`, `wait_for_message`, and the history digest
-- [ ] 1.4 Assert byte-identical `injectLine` output for record-less messages (regression lock)
+- [x] 1.1 Add the `record` type + zod schema to `shared.ts` / `messaging.ts`, all fields optional
+- [x] 1.2 Accept and persist `record` in `send_message`; leave `text` required
+- [x] 1.3 Round-trip it through `read_messages`, `wait_for_message`, and the history digest
+- [x] 1.4 Assert byte-identical `injectLine` output for record-less messages (regression lock)
 
 **Deliverables**: typed envelope on the wire, zero behavior change for v1 senders.
 
@@ -301,10 +301,10 @@ Phase 8 deliberately does **not** touch transport. tmux keeps working exactly as
 
 **Priority**: CRITICAL · **Dependencies**: Task 1
 
-- [ ] 2.1 `classifyTier` reads `record.type` first, prefix parsing second
-- [ ] 2.2 Keep trusted-sender resolution for `scope`/`go` — typed does not mean trusted
-- [ ] 2.3 Tests: typed and prefixed forms of each type classify identically
-- [ ] 2.4 Test the documented footgun: greeting-first prose downgrades, the typed record does not
+- [x] 2.1 `classifyTier` reads `record.type` first, prefix parsing second
+- [x] 2.2 Keep trusted-sender resolution for `scope`/`go` — typed does not mean trusted
+- [x] 2.3 Tests: typed and prefixed forms of each type classify identically
+- [x] 2.4 Test the documented footgun: greeting-first prose downgrades, the typed record does not
 
 **Deliverables**: one tiering decision, two accepted input forms.
 
@@ -312,10 +312,10 @@ Phase 8 deliberately does **not** touch transport. tmux keeps working exactly as
 
 **Priority**: HIGH · **Dependencies**: Task 1
 
-- [ ] 3.1 Typed `decision` payload matching the playbook's five fields
-- [ ] 3.2 Typed `cites` with `pr`/`file`/`commit` kinds
-- [ ] 3.3 Render typed → the current text layout so today's UI parser keeps working unchanged
-- [ ] 3.4 A `done` record without a resolvable PR cite is rejected at send time
+- [x] 3.1 Typed `decision` payload matching the playbook's five fields
+- [x] 3.2 Typed `cites` with `pr`/`file`/`commit` kinds
+- [x] 3.3 Render typed → the current text layout so today's UI parser keeps working unchanged
+- [x] 3.4 A `done` record without a resolvable PR cite is rejected at send time
 
 **Deliverables**: decision cards and DONE-verification from data, old UI unbroken.
 
@@ -323,10 +323,10 @@ Phase 8 deliberately does **not** touch transport. tmux keeps working exactly as
 
 **Priority**: HIGH · **Dependencies**: Task 1
 
-- [ ] 4.1 Role registry entries gain `{roleId, displayName}`; ids frozen, names free; `isGateRunnerRole` resolves from the id instead of regex-matching prose
-- [ ] 4.2 Record authority — which role may emit which `record.type` (`verdict` → gate runners, `go`/`scope` → coordinators). Enforced at the send path, rejecting in the identity-binding error shape
-- [ ] 4.3 Declare write scopes per managed document (`scopes.json`, opt-in — absent file means nothing is owned)
-- [ ] 4.4 `doctor` check: a document whose last writer disagrees with its declared scope. `warn`, never `fixable` — rewriting someone's file is not a safe automatic repair
+- [x] 4.1 Role registry entries gain `{roleId, displayName}`; ids frozen, names free; `isGateRunnerRole` resolves from the id instead of regex-matching prose
+- [x] 4.2 Record authority — which role may emit which `record.type` (`verdict` → gate runners, `go`/`scope` → coordinators). Enforced at the send path, rejecting in the identity-binding error shape
+- [x] 4.3 Declare write scopes per managed document (`scopes.json`, opt-in — absent file means nothing is owned)
+- [x] 4.4 `doctor` check: a document whose last writer disagrees with its declared scope. `warn`, never `fixable` — rewriting someone's file is not a safe automatic repair
 
 **Deliverables**: role identity that survives a rename; record authority enforced; document ownership declared and drift detected.
 
