@@ -69,9 +69,6 @@ function envStr(name, fallback) {
   return v === undefined ? fallback : v;
 }
 
-// How much of the pane bottom counts as "the input area". The command is
-// submitted when it is no longer sitting there waiting.
-const INPUT_TAIL_LINES = 20;
 
 export function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
@@ -83,19 +80,31 @@ function squash(s) {
   return String(s ?? "").replace(/\s+/g, " ").trim();
 }
 
-// Is `payload` still sitting in the pane's input area?
+// Is `payload` still sitting in the pane's INPUT LINE?
 //
-// Deliberately conservative: when the pane cannot be captured we return
-// `null` = UNKNOWN, never `false` = submitted. An unknown result is reported
-// as unverified, because the whole point of this task is that a check which
-// cannot fail loudly is worse than no check.
+// It asks the input line specifically, and nothing else. The first version
+// squashed the last 20 lines of the whole pane and searched that window — but
+// Claude Code ECHOES a submitted command into the transcript directly above
+// the prompt box, inside that window. So a command that ran perfectly still
+// matched, and the verifier reported failure on success (David hit this live:
+// the pane read "Compacting conversation… 28%" while the receipt said the
+// command "did not run").
+//
+// It only ever passed in testing because a freshly spawned disposable session
+// has an empty scrollback — the one condition that hides a scrollback bug. The
+// lesson is narrower than "test on a real TUI": a check that reads scrollback
+// has to be tested against a pane that HAS scrollback.
+//
+// Returns true = still waiting in the input, false = gone (submitted),
+// null = UNKNOWN. Unknown is never upgraded to a confirmation: no pane text,
+// or no line matching AGENT_COORD_PROMPT_PATTERN, means we cannot tell.
 export function stillInInput(paneText, payload) {
   if (paneText === null || paneText === undefined) return null;
   const needle = squash(payload);
   if (!needle) return false;
-  const lines = String(paneText).split("\n");
-  const tail = squash(lines.slice(-INPUT_TAIL_LINES).join(" "));
-  return tail.includes(needle);
+  const { draft } = readPaneState(paneText);
+  if (draft === null) return null; // no recognizable input line — cannot tell
+  return squash(draft).includes(needle);
 }
 
 // Read the pane's input state: is the TUI busy, and is there unsent text?
@@ -213,7 +222,9 @@ export async function pasteAndSubmit(deps, payload, { bracketed = false, verify 
         submitted: false,
         verified: false,
         attempts: attempt,
-        reason: `could not capture pane '${target}' to verify submission — the command was typed but may not have run`,
+        reason:
+          `could not read the input line of pane '${target}' to verify submission — the command was typed but may not have run ` +
+          `(pane capture failed, or no line matched AGENT_COORD_PROMPT_PATTERN for this TUI)`,
       };
     }
     if (attempt > retries) {
@@ -226,25 +237,35 @@ export async function pasteAndSubmit(deps, payload, { bracketed = false, verify 
           `it was typed but did not run (raise AGENT_COORD_ENTER_DELAY_MS if this recurs)`,
       };
     }
-    // Still sitting there: try one more Enter before giving up.
+    // Still sitting there: one more Enter before giving up.
+    //
+    // Every retry re-verifies FIRST (the loop head above), so an Enter is only
+    // ever sent after we have just looked at the input line and seen the
+    // command still in it. That ordering is the whole safety argument: these
+    // are keystrokes into a live session someone else may be typing in, and an
+    // Enter sent on a stale reading would submit whatever they had drafted
+    // since. Under the old tail-window check this fired on EVERY successful
+    // submit — three Enters into a pane that had already run the command.
     await sleep(ENTER_GAP_MS());
     run(["send-keys", "-t", target, "Enter"]);
   }
 }
 
-// Poll capture-pane until the payload leaves the input area, the budget runs
-// out, or capture fails. true = still there, false = gone, null = unknown.
+// Poll capture-pane until the payload leaves the input line, the budget runs
+// out, or we run out of ways to tell. true = still there, false = gone,
+// null = unknown (capture failed, or no input line we can read).
 async function pollUntilGone(deps, payload) {
   const { run, target } = deps;
   const deadline = Date.now() + VERIFY_TIMEOUT_MS();
-  let sawPane = false;
+  let readInput = false;
   for (;;) {
     const cap = run(["capture-pane", "-p", "-t", target]);
     if (cap.status === 0) {
-      sawPane = true;
-      if (stillInInput(String(cap.stdout ?? ""), payload) === false) return false;
+      const verdict = stillInInput(String(cap.stdout ?? ""), payload);
+      if (verdict === false) return false;
+      if (verdict === true) readInput = true; // we could read the input line
     }
-    if (Date.now() >= deadline) return sawPane ? true : null;
+    if (Date.now() >= deadline) return readInput ? true : null;
     await sleep(VERIFY_POLL_MS());
   }
 }

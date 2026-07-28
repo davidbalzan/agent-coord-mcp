@@ -9,13 +9,20 @@
 //
 // So the count is an assertion, not a statistic. A short run fails loudly.
 //
+// It compares PASS, not `# tests`. The first version compared `# tests`, and
+// the sighting that followed showed why that was the wrong number: the runner
+// reported `# tests 186 / # pass 182 / # fail 0` — its own totals not adding
+// up, four results landing in no bucket at all. `# tests` read the full 186, so
+// the guard would have passed a run in which four results were lost. The
+// anomaly is a reporter gap, not a short run, and only the pass count sees it.
+//
 // When you add or remove tests, update EXPECTED_TESTS in the same commit —
 // that is the point, not an inconvenience. `AGENT_COORD_EXPECTED_TESTS=n`
 // overrides for a one-off (bisecting, a partial run); `=0` disables the check.
 
 import { spawn } from "node:child_process";
 
-const EXPECTED_TESTS = 196;
+const EXPECTED_TESTS = 199;
 
 const expected = Number(process.env.AGENT_COORD_EXPECTED_TESTS ?? EXPECTED_TESTS);
 // Same glob the suite always used — `--test test/` would recurse differently
@@ -40,6 +47,7 @@ child.on("exit", (code, signal) => {
     return m ? Number(m[1]) : null;
   };
   const tests = num("tests");
+  const pass = num("pass");
   const fail = num("fail");
 
   if (code !== 0 || (fail ?? 0) > 0) process.exit(code || 1);
@@ -48,19 +56,28 @@ child.on("exit", (code, signal) => {
     console.log(`[check-test-count] count assertion disabled (ran ${tests ?? "?"} tests)`);
     process.exit(0);
   }
-  if (tests === null) {
-    console.error("[check-test-count] FAIL — no '# tests' summary line in the runner output");
+  if (pass === null) {
+    console.error("[check-test-count] FAIL — no '# pass' summary line in the runner output");
     process.exit(1);
   }
-  if (tests !== expected) {
+  // The runner's own totals disagreeing is its own finding — report it as such
+  // rather than as a count mismatch, so nobody chases a missing test file.
+  if (tests !== null && tests !== pass + (fail ?? 0)) {
     console.error(
-      `\n[check-test-count] FAIL — ran ${tests} tests, expected ${expected}.\n` +
-        (tests < expected
-          ? `  ${expected - tests} test(s) did not run. Zero failures does NOT mean green here: a file that fails to load reports nothing.\n` +
-            `  Re-run; if the count is stable, a test file is missing or erroring at import.\n`
-          : `  ${tests - expected} test(s) were added. Update EXPECTED_TESTS in scripts/check-test-count.mjs in the same commit.\n`),
+      `\n[check-test-count] FAIL — the runner's totals do not add up: ${tests} tests, ${pass} pass, ${fail ?? 0} fail.\n` +
+        `  ${tests - pass - (fail ?? 0)} result(s) landed in no bucket. This is a reporter gap, not a missing test file.\n`,
     );
     process.exit(1);
   }
-  console.log(`[check-test-count] ${tests} tests ran, as expected.`);
+  if (pass !== expected) {
+    console.error(
+      `\n[check-test-count] FAIL — ${pass} tests passed, expected ${expected}.\n` +
+        (pass < expected
+          ? `  ${expected - pass} result(s) missing. Zero failures does NOT mean green here: a file that fails to load reports nothing.\n` +
+            `  Re-run; if the count is stable, a test file is missing or erroring at import.\n`
+          : `  ${pass - expected} test(s) were added. Update EXPECTED_TESTS in scripts/check-test-count.mjs in the same commit.\n`),
+    );
+    process.exit(1);
+  }
+  console.log(`[check-test-count] ${pass} tests passed, as expected.`);
 });

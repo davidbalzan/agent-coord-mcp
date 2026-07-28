@@ -21,6 +21,7 @@ const tmp = mkdtempSync(path.join(tmpdir(), "coord-submit-"));
 process.env.AGENT_COORD_DIR = path.join(tmp, "coord");
 
 const submit = await import("../hooks/submit.mjs");
+const stillInInputOf = (pane, payload) => submit.stillInInput(pane, payload);
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -53,6 +54,22 @@ function fakeTmux({ panes = [], captureFails = false } = {}) {
 const IDLE = "some history\n────────\n❯ \n────────\n  ⏸ plan mode on · PR #17";
 const BUSY = "some history\n❯ \n  ⏸ plan mode on · esc to interrupt · ← for agents";
 const HOLDING = (cmd) => `history\n────────\n❯ ${cmd}\n────────\n  ⏸ plan mode on`;
+// What a real pane looks like AFTER a successful submit: the TUI echoes the
+// command into the transcript, directly above an empty prompt box. Taken from
+// a live capture of `/compact` mid-run (P1b).
+const ECHOED = (cmd) =>
+  [
+    "  ⏺ earlier turn",
+    "",
+    `❯ ${cmd}`,
+    "",
+    "· Compacting conversation…",
+    "  ▱▱▱▱▱▱▱▱▱▱ 0%",
+    "────────",
+    "❯ ",
+    "────────",
+    "  ⏸ plan mode on",
+  ].join("\n");
 
 const fastEnv = () => {
   process.env.AGENT_COORD_ENTER_DELAY_MS = "1";
@@ -102,11 +119,45 @@ test("a command still sitting in the input reports NOT submitted, with a reason"
   assert.ok(r.attempts > 1, `expected retries, got ${r.attempts}`);
 });
 
+// ---------- P1b: the echo in the transcript is not the input ----------
+
+test("a command echoed into the transcript above an EMPTY input counts as submitted", async () => {
+  // The P1b defect: the first verifier squashed the last 20 lines of the whole
+  // pane, so the TUI's own echo of a SUCCESSFUL command matched and it reported
+  // failure. Live: the pane read "Compacting conversation… 28%" while the
+  // receipt said the command "did not run".
+  assert.equal(stillInInputOf(ECHOED("/compact"), "/compact"), false);
+
+  const { deps, calls } = fakeTmux({ panes: [IDLE, ECHOED("/compact")] });
+  const r = await submit.submitControl(deps, "/compact");
+  assert.deepEqual({ submitted: r.submitted, verified: r.verified }, { submitted: true, verified: true });
+  // …and it must not have pressed Enter again after the command already ran:
+  // those are keystrokes into a live session someone else may be typing in.
+  assert.equal(calls.filter((c) => c.includes("send-keys")).length, 2, "exactly the two submitting Enters");
+  assert.equal(r.attempts, 1);
+});
+
+test("the same command STILL in the input line is not confused with its echo", async () => {
+  // Both lines present: the command echoed in the transcript AND sitting in the
+  // input. That is a genuine non-submit and must still report as one.
+  const pane = ECHOED("/compact").replace("❯ \n", "❯ /compact\n");
+  assert.equal(stillInInputOf(pane, "/compact"), true);
+});
+
+test("a pane with no readable input line is UNKNOWN, not a confirmation", async () => {
+  assert.equal(stillInInputOf("some TUI we do not know how to read\nno prompt here", "/clear"), null);
+  const { deps } = fakeTmux({ panes: [IDLE, "no prompt line at all"] });
+  const r = await submit.submitControl(deps, "/clear");
+  assert.equal(r.submitted, false);
+  assert.match(r.reason, /could not read the input line/);
+  assert.match(r.reason, /AGENT_COORD_PROMPT_PATTERN/);
+});
+
 test("an unreadable pane is UNKNOWN, never a confirmation", async () => {
   const { deps } = fakeTmux({ captureFails: true });
   const r = await submit.submitControl(deps, "/clear");
   assert.equal(r.submitted, false);
-  assert.match(r.reason, /could not capture pane/);
+  assert.match(r.reason, /could not read the input line/);
   assert.equal(submit.stillInInput(null, "/clear"), null, "unknown is null, not false");
 });
 
