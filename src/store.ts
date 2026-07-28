@@ -63,6 +63,15 @@ export const ARCHIVE_STATUS_FILE = path.join(ARCHIVE_DIR, "status.jsonl");
 // startup warning). Should be mode 600; operator-managed.
 export const TOKENS_FILE = path.join(ROOT, "tokens.json");
 
+// Declared write scopes for managed documents (v0.18.0, Phase 8 Task 4).
+// Opt-in and operator-managed: absent → nothing is owned and nothing warns.
+// ADVISORY. The bus does not mediate writes to docs/QUEUE.md & friends —
+// agents edit them with ordinary file tools, so there is no interception
+// point. This file lets an agent ASK who owns a document (list_scopes) and
+// lets `doctor` DETECT drift after the fact. Pre-emptive enforcement waits
+// for Phase 8 Task 5, when work state moves into the store.
+export const SCOPES_FILE = path.join(ROOT, "scopes.json");
+
 export function ensureDirs(): void {
   for (const d of [ROOT, INBOX_DIR, CURSOR_DIR, TRANSPORT_DIR, PID_DIR, LOG_DIR, ROOMS_DIR, RECEIPTS_DIR, HISTORY_DIR]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });

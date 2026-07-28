@@ -62,6 +62,8 @@ import {
   quitTool,
   waitForMessageSchema,
   waitForMessageTool,
+  listScopesSchema,
+  listScopesTool,
 } from "./tools/index.js";
 
 function jsonResult(data: unknown) {
@@ -334,6 +336,13 @@ function buildServer(initialBound?: string): McpServer {
     "Bus-wide health check: inspects the whole state dir and reports drift, leaks, and corruption (orphan transport markers / memberships / inboxes, cursor offsets past EOF, malformed JSONL, stale agents, oversized files, stale locks, channel/registry mismatches, environment). Read-only by default; pass fix=true to apply the safe, reversible repairs (malformed-line rewrites are backed up to .bak first). A clean report (healthy=true) means the bus is internally consistent.",
     doctorSchema,
     gate(null, doctorTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "list_scopes",
+    "Read the declared write scopes for managed documents (~/agent-coord/scopes.json). Call it with 'path' (and your 'agentId') to ask \"may I write this?\" BEFORE editing a shared doc like docs/QUEUE.md; call it bare to list every declared document and its owning role. ADVISORY ONLY: the bus does not mediate file writes, so this answers who owns a document, it does not stop anyone — enforcement arrives when work state moves into the store. Absent scopes.json means nothing is owned and nothing warns (opt-in).",
+    listScopesSchema,
+    gate(null, listScopesTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(

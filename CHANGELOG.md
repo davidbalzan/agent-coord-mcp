@@ -4,6 +4,12 @@ All notable changes to this project will be documented here.
 
 ## [0.17.0] — Unreleased
 
+### Added (Phase 8 Task 4 — role identity & write scopes)
+- **Roles have a frozen identity.** Registry entries gain an optional, immutable `roleId` beside the free-text `role` (now the display name); `register`/`join` accept `role: {roleId, displayName}` as well as a plain string. `isGateRunnerRole` resolves from the id instead of regex-matching prose, so renaming a role (curator → liaison → aide — twice already, 500+ occurrences each time) no longer moves who runs the merge gate. Fully additive: an existing `agents.json` loads unmodified and keeps the legacy word match, and a declared `roleId` cannot later be changed (rejected; the display name stays free).
+- **Record authority at the send path.** `verdict` is restricted to gate-runner roles and `go`/`scope` to coordinators; every other `record.type` is unrestricted. `send_message` rejects violations in the identity-binding error shape before anything is written. This is a *consistency* check, not authentication — roles are self-declared at register/join — and must never be relied on as a trust boundary.
+- **`list_scopes` + `~/agent-coord/scopes.json`.** Opt-in declaration of which role owns which managed document (`docs/QUEUE.md` → `aide`, …), and a tool to ask "may I write this?" before editing one. **Advisory:** the bus has no interception point for ordinary file writes, so nothing is prevented here — pre-emptive enforcement arrives with Task 5, when work state moves into the store.
+- **`doctor` check `document-scope-drift`.** Warns when a declared document's last git writer isn't its declared owner. Never `fixable` (rewriting someone's file is not a safe automatic repair), and skips cleanly with no `scopes.json`, outside a git checkout, or when the author maps to no registered agent.
+
 ### Changed
 - **DMs are always push-now; routine max-age default cut 5min → 15s.** The tiers exist to absorb broadcast noise, but they were also queueing point-to-point DMs — the liaison relaying a David question sat in the digest queue for the full max-age (David had to nudge the coordinator manually). `classifyTier` now returns urgent for any DM regardless of prefix; only channel traffic queues, so the `AGENT_COORD_MAX_QUEUE_MS` default drops to 15000 (15s) — routine room chatter still coalesces into digests, it just never lags far behind. Side effect: `DONE:` DM'd to a non-gate agent now delivers immediately (the gate-runner rule still governs room `DONE:`).
 

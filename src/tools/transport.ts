@@ -1,6 +1,7 @@
 import { loadLiveTransports, isMarkerLive, isPidAlive } from "./registry.js";
 import { registerTool } from "./registry.js";
 import { roleInputSchema, type RoleArg } from "../roles.js";
+import { attributeWriter, isGitRepo, lastWriterOf, loadScopes, ownsDocument } from "./scopes.js";
 import { sendMessageTool, readMessagesTool } from "./messaging.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, openSync, watch } from "node:fs";
@@ -1196,6 +1197,57 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
       detail: orphanFiles.length ? `${orphanFiles.length} channel file(s) with no registry entry` : "channel files and registry agree",
       fixable: true,
       items: orphanFiles.length ? orphanFiles : undefined,
+    });
+  }
+
+  // 9b. Document scope drift (Phase 8 Task 4). For each document declared in
+  //     scopes.json, compare git's last writer against the declared owner.
+  //
+  //     DETECTION ONLY, never fixable — rewriting or reverting someone else's
+  //     file is not a safe automatic repair, and the bus cannot prevent the
+  //     write in the first place (agents edit these with ordinary file tools;
+  //     enforcement waits for Task 5). Skips silently when no scopes.json
+  //     exists (opt-in) or when the declared repo isn't a git checkout, the
+  //     same way the wedged-pusher check skips without tmux — a check that
+  //     can't observe anything must not guess.
+  {
+    const scopes = await loadScopes();
+    const drift: string[] = [];
+    const unattributed: string[] = [];
+    let detail: string;
+    if (!scopes.documents.length) {
+      detail = scopes.configured
+        ? `${path.basename(scopes.file)} declares no documents`
+        : `no ${path.basename(scopes.file)} — document scopes are opt-in and none are declared`;
+    } else if (!isGitRepo(scopes.repo)) {
+      detail = `${scopes.documents.length} document(s) declared but '${scopes.repo}' is not a git checkout — last writer is unknowable, check skipped`;
+    } else {
+      for (const doc of scopes.documents) {
+        const writer = lastWriterOf(scopes.repo, doc.path);
+        if (!writer) continue; // never committed — nothing has written it yet
+        const who = attributeWriter(writer, reg);
+        if (!who) {
+          // Commits are authored by humans/machine accounts, not agent ids, so
+          // an unmappable author is the normal case — reported, never flagged.
+          unattributed.push(`${doc.path}: last written by '${writer.author}' (${writer.commit}), not attributable to a registered agent`);
+          continue;
+        }
+        if (ownsDocument(who.agentId, reg[who.agentId], doc.owner)) continue;
+        drift.push(
+          `${doc.path}: declared owner '${doc.owner}' (${doc.mode}) but last written by '${who.agentId}'` +
+            `${who.roleId ? ` [role ${who.roleId}]` : ""} in ${writer.commit} (${writer.when})`,
+        );
+      }
+      detail = drift.length
+        ? `${drift.length} document(s) last written by someone other than their declared owner — advisory: coordinate ownership, doctor will not rewrite anyone's file`
+        : `${scopes.documents.length} declared document(s) agree with their scope`;
+    }
+    findings.push({
+      check: "document-scope-drift",
+      level: drift.length ? "warn" : "ok",
+      detail,
+      fixable: false,
+      items: drift.length ? drift : unattributed.length ? unattributed : undefined,
     });
   }
 
