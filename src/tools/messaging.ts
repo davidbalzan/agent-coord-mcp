@@ -1,4 +1,10 @@
 import { adjustCursors } from "./admin.js";
+import {
+  COORDINATOR_ROLE_IDS,
+  GATE_RUNNER_ROLE_IDS,
+  resolveRole,
+  roleMatches,
+} from "../roles.js";
 import { ARCHIVE_STATUS_FILE, archiveJsonl, archiveRoomFile } from "../store.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, openSync, watch } from "node:fs";
@@ -120,6 +126,49 @@ export const messageRecordSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("scope"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
 ]);
 
+// ---------- record authority (Phase 8 Task 4) ----------
+
+// Which roles may emit which record types. Everything not listed here is
+// unrestricted — the table is a floor on the three types other agents ACT on,
+// not a permission system.
+//
+// NOT A TRUST BOUNDARY. A role is self-declared at register/join (there is no
+// authority issuing them), so this is a CONSISTENCY check: it stops a worker
+// from accidentally emitting a `verdict` or countersigning its own `scope`,
+// the same way a linter stops a typo. Anything that must actually be
+// authenticated has to resolve identity-bound tokens (see tokens.json), never
+// this table.
+const RECORD_AUTHORITY: Record<string, { roles: Set<string>; label: string }> = {
+  verdict: { roles: GATE_RUNNER_ROLE_IDS, label: "gate-runner" },
+  go: { roles: COORDINATOR_ROLE_IDS, label: "coordinator" },
+  scope: { roles: COORDINATOR_ROLE_IDS, label: "coordinator" },
+};
+
+// Rejection shape mirrors the identity-binding rejection in server.ts: the
+// caller gets a plain `{ok: false, error}`, and nothing is written.
+export async function checkRecordAuthority(
+  from: string,
+  record: MessageRecord | undefined,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!record) return { ok: true };
+  const rule = RECORD_AUTHORITY[record.type];
+  if (!rule) return { ok: true };
+
+  const reg = await readJson<AgentRegistry>(AGENTS_FILE, {});
+  const entry = reg[from];
+  if (roleMatches(entry, rule.roles)) return { ok: true };
+
+  const held = resolveRole(entry);
+  return {
+    ok: false,
+    error:
+      `record.type '${record.type}' is restricted to ${rule.label} roles ` +
+      `(${[...rule.roles].join(", ")}); sender '${from}' holds ` +
+      `${held ? `role '${held.roleId}'` : entry ? "no role" : "no registry entry"}. ` +
+      `Send it as text, or register with the role that owns this record type.`,
+  };
+}
+
 export const sendMessageSchema = {
   from: z.string().min(1),
   to: z.string().optional(),
@@ -140,6 +189,11 @@ export async function sendMessageTool(args: {
   kind?: "decision" | "status" | "chatter";
   record?: MessageRecord;
 }) {
+  // Record authority first — a sender who may not emit this type is refused
+  // before any other check runs, so a rejected record writes nothing anywhere.
+  const authority = await checkRecordAuthority(args.from, args.record);
+  if (!authority.ok) return { ok: false as const, error: authority.error };
+
   // A `done` must cite the work it claims. Presence and shape only — resolving
   // the ref against gh/git is a consumer's job, and the send path makes no
   // network calls. Rejected as a value, not a throw, mirroring the
