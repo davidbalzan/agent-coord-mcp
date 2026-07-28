@@ -30,6 +30,7 @@ import {
   type Cursor,
   type Message,
   type StatusEntry,
+  isDecision,
 } from "./shared.js";
 
 // ---------- prune ----------
@@ -47,10 +48,15 @@ export const pruneSchema = {
   dryRun: z.boolean().optional(),
 };
 
-// Retention predicate: kind="decision" messages live by the (longer)
-// decision cutoff; everything else by the standard cutoff.
-function keepEntry(e: { ts: number; kind?: string }, cutoff: number, decisionCutoff: number): boolean {
-  return e.kind === "decision" ? e.ts > decisionCutoff : e.ts > cutoff;
+// Retention: decisions live by the (longer) decision cutoff; everything else
+// by the standard cutoff. What counts as a decision is `isDecision` — the
+// shared predicate, not a fourth copy of the comparison.
+function keepEntry(
+  e: { ts: number; kind?: string; record?: { type?: string } },
+  cutoff: number,
+  decisionCutoff: number,
+): boolean {
+  return isDecision(e) ? e.ts > decisionCutoff : e.ts > cutoff;
 }
 
 // Shift every agent's cursor offsets down by the number of entries removed

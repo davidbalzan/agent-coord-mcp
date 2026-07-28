@@ -193,6 +193,25 @@ export type Message = {
   record?: MessageRecord;
 };
 
+// THE retention predicate — one definition, three call sites (prune,
+// live compaction, overflow-digest quoting). It lived as three copies of
+// `e.kind === "decision"`, and they drifted: a v2 agent doing exactly what
+// Phase 8 asks — sending `record:{type:"decision"}` and omitting the legacy
+// `kind` — had its decisions compacted at chatter rate and dropped from
+// digests. A protocol whose correct usage loses data.
+//
+// MONOTONE, like the tier floor: `||` can only ever GRANT the long retention,
+// never remove it. So there is no cutover, no migration, and no existing file
+// whose behaviour changes — a legacy `kind:"decision"` keeps exactly the
+// retention it had. Two sources that can each override each other is the
+// disagreement this phase deletes; a source that can only raise is not that.
+//
+// Deliberately structural about `record`: it takes anything with the two
+// fields, so status entries and archive rows can be passed without a cast.
+export function isDecision(e: { kind?: string; record?: { type?: string } } | null | undefined): boolean {
+  return e?.kind === "decision" || e?.record?.type === "decision";
+}
+
 export type StatusEntry = {
   id: string;
   ts: number;

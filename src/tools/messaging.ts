@@ -68,6 +68,7 @@ import {
   STALE_MS,
   EVICT_MS,
   MAX_WAIT_MS,
+  isDecision,
 } from "./shared.js";
 
 // ---------- send_message ----------
@@ -282,7 +283,7 @@ async function maybeCompactRoom(chan: string): Promise<void> {
   const r = await archiveJsonl<Message>(
     file,
     archiveRoomFile(chan),
-    (e) => e.ts >= boundaryTs || (e.kind === "decision" && e.ts > decisionCutoff)
+    (e) => e.ts >= boundaryTs || (isDecision(e) && e.ts > decisionCutoff)
   );
   if (r.removed > 0) await adjustCursors({ roomRemovedByChan: { [chan]: r.removed } });
 }
@@ -415,7 +416,7 @@ function digestOverflow(over: (Message | StatusEntry)[], hash: string | undefine
     : `] — read without peek to get an expandable hash`;
   // Decisions are the one thing a digest must not bury — quote them verbatim
   // (capped) below the summary line.
-  const decisions = over.filter((m): m is Message => (m as Message).kind === "decision");
+  const decisions = over.filter((m): m is Message => isDecision(m as Message));
   const quoted = decisions
     .slice(-5)
     .map((d) => `  [decision] ${d.from}: ${d.text.length > 200 ? d.text.slice(0, 200) + "…" : d.text}`);
