@@ -218,7 +218,10 @@ test("send_command confirms delivery when a receipt appears (out-of-band)", asyn
 
   // Simulate the receiving pusher: once the control msg lands in the inbox,
   // stamp a receipt for its id — exactly what tmux-pusher.writeReceipts does
-  // after it types the command into the pane.
+  // after it types the command into the pane AND verifies it was submitted.
+  // `submitted: true` is load-bearing: a receipt without it proves only that
+  // the command was typed, which is no longer reported as confirmed (see
+  // test/control-submit.test.mjs).
   const fakePusher = (async () => {
     for (let i = 0; i < 100; i++) {
       const inbox = await store.readJsonl(store.inboxFile("rcpt-worker"));
@@ -229,6 +232,8 @@ test("send_command confirms delivery when a receipt appears (out-of-band)", asyn
           agentId: "rcpt-worker",
           ts: Date.now(),
           control: true,
+          submitted: true,
+          verified: true,
         });
         return;
       }

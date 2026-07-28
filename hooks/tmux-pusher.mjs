@@ -62,6 +62,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { effectiveTier, isGateRunnerRole, TierQueue, formatBatch } from "./tier.mjs";
+import { pasteAndSubmit as sharedPasteAndSubmit, submitControl as sharedSubmitControl } from "./submit.mjs";
 
 const AGENT_ID = process.env.AGENT_COORD_ID;
 const TMUX_TARGET = process.env.AGENT_COORD_TMUX_TARGET;
@@ -400,8 +401,11 @@ async function injectViaTmux(batch) {
   for (const m of batch) {
     if (isControl(m)) {
       await flushRun();
-      await pasteAndSubmit(m.text.trim(), false); // validated control: raw slash command
-      writeReceipts([m]);
+      // Control commands are VERIFIED: capture-pane confirms the command
+      // actually left the input. A receipt that says "typed" was being read
+      // as "ran" — see writeReceipts.
+      const outcome = await submitControlCommand(m.text.trim());
+      writeReceipts([m], outcome);
     } else {
       run.push(m);
     }
@@ -413,7 +417,12 @@ async function injectViaTmux(batch) {
 // pane. Receipts are out-of-band proof for the sender (it polls this file),
 // never injected into any agent's context — so verification costs zero tokens.
 // Best-effort: a failed receipt write must not break delivery, so we swallow.
-function writeReceipts(msgs) {
+// `outcome` (control commands only) carries what verification actually saw.
+// WITHOUT it a receipt proved the pusher TYPED the command, and send_command
+// reported that as delivery:"confirmed" — proof of typing sold as proof of
+// execution. `submitted` is the honest field: false means it is still sitting
+// in the input, and the sender is told so instead of being reassured.
+function writeReceipts(msgs, outcome) {
   const lines = [];
   for (const m of msgs) {
     if (!m || !m.id) continue;
@@ -424,6 +433,13 @@ function writeReceipts(msgs) {
         ts: Date.now(),
         from: m.from,
         control: m.control === true,
+        ...(outcome
+          ? {
+              submitted: outcome.submitted === true,
+              verified: outcome.verified === true,
+              ...(outcome.reason ? { reason: outcome.reason } : {}),
+            }
+          : {}),
       }),
     );
   }
@@ -439,45 +455,29 @@ function writeReceipts(msgs) {
 // a compliant TUI treats the payload as inert data — embedded newlines can't
 // submit lines or smuggle a "/command". Control commands (/clear, /compact) must
 // paste RAW (bracketed=false) so the TUI still runs them as slash commands.
+//
+// The pipeline itself lives in ./submit.mjs, shared with scripts/coord-pusher.mjs
+// so the two cannot drift again. This wrapper only supplies tmux.
+const tmuxDeps = {
+  target: TMUX_TARGET,
+  buffer: BUFFER_NAME,
+  run: (args) => spawnSync("tmux", args, { encoding: "utf8" }),
+  runStdin: (args, payload) =>
+    new Promise((resolve, reject) => {
+      const load = spawn("tmux", args);
+      load.on("error", reject);
+      load.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`tmux ${args[0]} exit ${code}`))));
+      load.stdin.end(payload);
+    }),
+};
+
 function pasteAndSubmit(payload, bracketed = false) {
-  return new Promise((resolve, reject) => {
-    const load = spawn("tmux", ["load-buffer", "-b", BUFFER_NAME, "-"]);
-    load.on("error", reject);
-    load.on("exit", (code) => {
-      if (code !== 0) return reject(new Error(`tmux load-buffer exit ${code}`));
-      const paste = spawnSync("tmux", [
-        "paste-buffer",
-        ...(bracketed ? ["-p"] : []),
-        "-b",
-        BUFFER_NAME,
-        "-t",
-        TMUX_TARGET,
-        "-d",
-      ]);
-      if (paste.status !== 0) {
-        return reject(new Error(`tmux paste-buffer: ${(paste.stderr ?? "").toString().trim()}`));
-      }
-      // Multi-line paste + Enter is racy: long buffers can still be flushing
-      // to the target app's input when Enter arrives, and many TUIs (Claude
-      // Code in particular) treat that first Enter as "still drafting,
-      // add newline" rather than "submit." Wait briefly so paste settles,
-      // then send Enter. Some apps additionally need a second Enter to
-      // exit paste-mode + submit; sending two Enters with a small gap is
-      // safe (worst case: harmless empty submit ignored by the app). For a
-      // slash command this also dismisses the autocomplete menu and submits.
-      setTimeout(() => {
-        const e1 = spawnSync("tmux", ["send-keys", "-t", TMUX_TARGET, "Enter"]);
-        if (e1.status !== 0) {
-          return reject(new Error(`tmux send-keys: ${(e1.stderr ?? "").toString().trim()}`));
-        }
-        setTimeout(() => {
-          spawnSync("tmux", ["send-keys", "-t", TMUX_TARGET, "Enter"]);
-          resolve();
-        }, 50);
-      }, 100);
-    });
-    load.stdin.end(payload);
-  });
+  return sharedPasteAndSubmit(tmuxDeps, payload, { bracketed });
+}
+
+// Control commands go through the preflight + verify path, never the plain one.
+function submitControlCommand(payload) {
+  return sharedSubmitControl(tmuxDeps, payload);
 }
 
 // Publish transport marker so list_agents can show this agent is push-capable.

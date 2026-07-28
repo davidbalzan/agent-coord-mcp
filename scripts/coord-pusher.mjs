@@ -37,6 +37,7 @@
 
 import { hostname } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
+import { pasteAndSubmit as sharedPasteAndSubmit, submitControl as sharedSubmitControl } from "../hooks/submit.mjs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -278,7 +279,14 @@ async function injectViaTmux(batch) {
   for (const m of batch) {
     if (isControl(m)) {
       await flushRun();
-      await pasteAndSubmit(m.text.trim(), false); // validated control: raw slash command
+      // Verified like the local path: the extra Enters and the capture-pane
+      // check are what make a control command actually run. This pusher writes
+      // no receipts (it has no access to the server's state dir), so the
+      // outcome is logged rather than reported — see the note in submit.mjs.
+      const outcome = await submitControlCommand(m.text.trim());
+      if (!outcome.submitted) {
+        process.stderr.write(`[coord-pusher] control command NOT submitted: ${outcome.reason}\n`);
+      }
     } else {
       run.push(m);
     }
@@ -290,20 +298,31 @@ async function injectViaTmux(batch) {
 // a compliant TUI treats the payload as inert data — embedded newlines can't
 // submit lines or smuggle a "/command". Control commands (/clear, /compact) must
 // paste RAW (bracketed=false) so the TUI still runs them as slash commands.
+//
+// Paste + submit. The pipeline is ./hooks/submit.mjs, shared with the local
+// pusher — this file used to carry its own copy, which had already drifted to a
+// SINGLE Enter with no settle delay at all, so a remote agent's control command
+// was even less likely to run than a local one. Only tmux is supplied here.
+const tmuxDeps = {
+  target: TMUX_TARGET,
+  buffer: BUFFER_NAME,
+  run: (args) => spawnSync("tmux", args, { encoding: "utf8" }),
+  runStdin: (args, payload) =>
+    new Promise((resolve, reject) => {
+      const load = spawn("tmux", args);
+      load.on("error", reject);
+      load.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`tmux ${args[0]} exit ${code}`))));
+      load.stdin.end(payload);
+    }),
+};
+
 function pasteAndSubmit(payload, bracketed = false) {
-  return new Promise((resolve, reject) => {
-    const load = spawn("tmux", ["load-buffer", "-b", BUFFER_NAME, "-"]);
-    load.on("error", reject);
-    load.on("exit", (code) => {
-      if (code !== 0) return reject(new Error(`tmux load-buffer exit ${code}`));
-      const paste = spawnSync("tmux", ["paste-buffer", ...(bracketed ? ["-p"] : []), "-b", BUFFER_NAME, "-t", TMUX_TARGET, "-d"]);
-      if (paste.status !== 0) return reject(new Error(`tmux paste-buffer: ${(paste.stderr ?? "").toString().trim()}`));
-      const enter = spawnSync("tmux", ["send-keys", "-t", TMUX_TARGET, "Enter"]);
-      if (enter.status !== 0) return reject(new Error(`tmux send-keys: ${(enter.stderr ?? "").toString().trim()}`));
-      resolve();
-    });
-    load.stdin.end(payload);
-  });
+  return sharedPasteAndSubmit(tmuxDeps, payload, { bracketed });
+}
+
+// Control commands go through the preflight + verify path, never the plain one.
+function submitControlCommand(payload) {
+  return sharedSubmitControl(tmuxDeps, payload);
 }
 
 // ---------- per-source wait loops + subscription refresh ----------
