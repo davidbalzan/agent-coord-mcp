@@ -14,7 +14,8 @@
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
     "pretest": "node scripts/check-self-dependency.mjs && tsc",
-    "test": "node --test \"test/*.test.mjs\""
+    "test": "node scripts/check-test-count.mjs",
+    "test:raw": "node --test \"test/*.test.mjs\""
   },
   "files": [
     "dist",
