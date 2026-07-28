@@ -1,10 +1,5 @@
 import { adjustCursors } from "./admin.js";
-import {
-  COORDINATOR_ROLE_IDS,
-  GATE_RUNNER_ROLE_IDS,
-  resolveRole,
-  roleMatches,
-} from "../roles.js";
+import { RECORD_AUTHORITY, resolveRole, roleMatches } from "../roles.js";
 import { ARCHIVE_STATUS_FILE, archiveJsonl, archiveRoomFile } from "../store.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, openSync, watch } from "node:fs";
@@ -128,9 +123,8 @@ export const messageRecordSchema = z.discriminatedUnion("type", [
 
 // ---------- record authority (Phase 8 Task 4) ----------
 
-// Which roles may emit which record types. Everything not listed here is
-// unrestricted — the table is a floor on the three types other agents ACT on,
-// not a permission system.
+// The table (RECORD_AUTHORITY, ../roles.ts) is a floor on the three types
+// other agents ACT on; everything else is unrestricted.
 //
 // NOT A TRUST BOUNDARY. A role is self-declared at register/join (there is no
 // authority issuing them), so this is a CONSISTENCY check: it stops a worker
@@ -138,12 +132,6 @@ export const messageRecordSchema = z.discriminatedUnion("type", [
 // the same way a linter stops a typo. Anything that must actually be
 // authenticated has to resolve identity-bound tokens (see tokens.json), never
 // this table.
-const RECORD_AUTHORITY: Record<string, { roles: Set<string>; label: string }> = {
-  verdict: { roles: GATE_RUNNER_ROLE_IDS, label: "gate-runner" },
-  go: { roles: COORDINATOR_ROLE_IDS, label: "coordinator" },
-  scope: { roles: COORDINATOR_ROLE_IDS, label: "coordinator" },
-};
-
 // Rejection shape mirrors the identity-binding rejection in server.ts: the
 // caller gets a plain `{ok: false, error}`, and nothing is written.
 export async function checkRecordAuthority(

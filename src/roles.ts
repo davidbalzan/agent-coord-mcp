@@ -70,6 +70,29 @@ export function isCoordinator(role: RoleInput): boolean {
   return roleMatches(role, COORDINATOR_ROLE_IDS);
 }
 
+// Which roles may emit which record.type at the send path. Enforcement lives
+// in messaging.ts (checkRecordAuthority); the table lives here so register/join
+// can ECHO the consequence back at onboarding — a role that cannot emit `go`
+// should learn it when it registers, not when it sends its first work order.
+//
+// NOT A TRUST BOUNDARY — roles are self-declared. See checkRecordAuthority.
+export const RECORD_AUTHORITY: Record<string, { roles: Set<string>; label: string }> = {
+  verdict: { roles: GATE_RUNNER_ROLE_IDS, label: "gate-runner" },
+  go: { roles: COORDINATOR_ROLE_IDS, label: "coordinator" },
+  scope: { roles: COORDINATOR_ROLE_IDS, label: "coordinator" },
+};
+
+// Split the restricted record types into what this role may and may not emit.
+// Unrestricted types are omitted from both lists — they are nobody's business.
+export function recordAuthorityFor(role: RoleInput): { mayEmit: string[]; mayNotEmit: string[] } {
+  const mayEmit: string[] = [];
+  const mayNotEmit: string[] = [];
+  for (const [type, rule] of Object.entries(RECORD_AUTHORITY)) {
+    (roleMatches(role, rule.roles) ? mayEmit : mayNotEmit).push(type);
+  }
+  return { mayEmit, mayNotEmit };
+}
+
 // Wire shape for `role` on register/join. Either free text (v1: `role: "qa
 // lead"`) or a declared identity (`{roleId: "qa", displayName: "QA gate"}`).
 // Both are supported forever — the string form is not deprecated, it just

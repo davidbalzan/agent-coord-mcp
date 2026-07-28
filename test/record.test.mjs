@@ -13,7 +13,13 @@ process.env.AGENT_COORD_DIR = path.join(tmp, "coord");
 const store = await import("../dist/store.js");
 const { messageRecordSchema, sendMessageTool } = await import("../dist/tools/messaging.js");
 const { renderRecord } = await import("../dist/tools/render.js");
+const { registerTool } = await import("../dist/tools/registry.js");
 store.ensureDirs();
+
+// Sender 'a' is a coordinator: `go`/`scope` are coordinator-only at the send
+// path (Task 4 record authority), and this file is about citations and
+// rendering, not about who may emit what.
+await registerTool({ agentId: "a", role: { roleId: "coordinator" } });
 
 after(() => rmSync(tmp, { recursive: true, force: true }));
 

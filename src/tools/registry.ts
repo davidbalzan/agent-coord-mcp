@@ -48,7 +48,7 @@ import {
   updateJson,
   type RoomRegistry,
 } from "../store.js";
-import { resolveRole, roleInputSchema, type RoleArg } from "../roles.js";
+import { recordAuthorityFor, resolveRole, roleInputSchema, type RoleArg } from "../roles.js";
 import {
   type AgentEntry,
   type AgentRegistry,
@@ -132,7 +132,22 @@ export async function registerTool(args: { agentId: string; project?: string; ro
     return current;
   });
   const entry = reg[args.agentId];
-  return { ok: true as const, agent: entry, resolvedRole: resolveRole(entry) };
+  // Echo the record types this role may and may not emit. Record authority is
+  // otherwise invisible until the first typed send is refused mid-work — this
+  // is how an agent whose role owns `go`/`scope`/`verdict` finds out at
+  // onboarding that it has to declare that role.
+  const authority = recordAuthorityFor(entry);
+  return {
+    ok: true as const,
+    agent: entry,
+    resolvedRole: resolveRole(entry),
+    recordAuthority: {
+      ...authority,
+      ...(authority.mayNotEmit.length
+        ? { note: `this role may not emit ${authority.mayNotEmit.map((t) => `'${t}'`).join("/")} as a typed record — register with the owning role (e.g. role:{roleId:"coordinator"}) if it should. Text prefixes are unrestricted.` }
+        : {}),
+    },
+  };
 }
 
 // ---------- unregister ----------

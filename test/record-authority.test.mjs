@@ -72,10 +72,18 @@ test("a sender with no role (or no registry entry) is refused a restricted type"
 });
 
 test("every other record type is unrestricted, and untyped sends are untouched", async () => {
-  for (const type of ["blocker", "decision", "risk", "done", "fyi", "action"]) {
+  for (const type of ["blocker", "decision", "risk", "fyi", "action"]) {
     const res = await t.sendMessageTool({ from: "worker", room: "authz", text: `${type}!`, record: { type } });
     assert.equal(res.ok, true, `${type} must stay unrestricted`);
   }
+  // `done` is unrestricted by role too — it just has to cite (Task 3).
+  const done = await t.sendMessageTool({
+    from: "worker",
+    room: "authz",
+    text: "DONE: x",
+    record: { type: "done", cites: [{ kind: "pr", ref: "owner/repo#7" }] },
+  });
+  assert.equal(done.ok, true, "done must stay unrestricted");
   const plain = await t.sendMessageTool({ from: "worker", room: "authz", text: "just chatter" });
   assert.equal(plain.ok, true);
 });
@@ -101,4 +109,22 @@ test("authority follows the frozen id, not the display name", async () => {
   await t.registerTool({ agentId: "worker", role: { displayName: "qa coordinator gate" } });
   const nope = await t.sendMessageTool({ from: "worker", room: "authz", text: "PASS", record: { type: "verdict" } });
   assert.equal(nope.ok, false);
+});
+
+test("register echoes what this role may and may not emit", async () => {
+  // The onboarding signal: authority is otherwise invisible until a typed send
+  // is refused mid-work.
+  const worker = await t.registerTool({ agentId: "fresh-worker", role: "dev session" });
+  assert.deepEqual(worker.recordAuthority.mayEmit, []);
+  assert.deepEqual(worker.recordAuthority.mayNotEmit.sort(), ["go", "scope", "verdict"]);
+  assert.match(worker.recordAuthority.note, /register with the owning role/);
+
+  const coord = await t.registerTool({ agentId: "fresh-coord", role: { roleId: "coordinator" } });
+  assert.deepEqual(coord.recordAuthority.mayEmit.sort(), ["go", "scope", "verdict"]);
+  assert.deepEqual(coord.recordAuthority.mayNotEmit, []);
+  assert.equal(coord.recordAuthority.note, undefined);
+
+  // join carries the same echo through (it delegates to register).
+  const joined = await t.joinTool({ agentId: "fresh-gate", role: { roleId: "qa" }, attach: false, readInbox: false });
+  assert.deepEqual(joined.registered.roleId, "qa");
 });
