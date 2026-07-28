@@ -9,6 +9,36 @@
 // All prefix checks are case-sensitive: the protocol prefixes are uppercase
 // by convention, and a lowercase lookalike is chatter, not a work order.
 
+// Typed protocol record → tier (Phase 8). The prefix table below is the same
+// vocabulary parsed out of text; reading the field instead removes the parse
+// entirely, so a body that leads with a greeting no longer downgrades a
+// blocker to routine.
+//
+// TRUST: `record` is caller-supplied, exactly like `from`. A typed record may
+// therefore assert what a text prefix could already assert, and NOTHING more —
+// `scope` and `go` still resolve the sender against trustedSenders, and `done`
+// still depends on the RECIPIENT being a gate runner. Typed is not
+// authenticated. Anything that would let a peer self-declare urgency belongs
+// in the server-set `urgent` flag, not here.
+function tierFromRecord(rec, m, opts) {
+  switch (rec.type) {
+    case "blocker":
+    case "decision":
+      return "urgent";
+    case "go":
+      return "urgent";
+    case "scope":
+      return opts.trustedSenders?.has?.(m.from) ? "urgent" : "routine";
+    case "done":
+      return opts.gateRunner ? "urgent" : "routine";
+    // risk / fyi / action / verdict: real semantics, but not a reason to
+    // interrupt someone else's turn. A risk that genuinely needs an immediate
+    // turn is a blocker — that judgement stays with the sender.
+    default:
+      return "routine";
+  }
+}
+
 export function classifyTier(m, opts = {}) {
   if (!m) return "routine";
   // Server-set push-now override (post-/clear reminder). send_message builds
@@ -19,6 +49,12 @@ export function classifyTier(m, opts = {}) {
   // tiers exist to absorb broadcast noise, not point-to-point asks (the
   // liaison relaying a David question must not sit in a digest queue).
   if (m.kind === "DM") return "urgent";
+  // Typed record wins outright when present — it is the sender's explicit
+  // declaration, where a prefix is an inference from prose. No max() with the
+  // prefix result: two sources that can each override the other is the
+  // disagreement this phase exists to remove. Task 3 renders text FROM the
+  // record, so the two agree by construction for v2 senders.
+  if (m.record && typeof m.record.type === "string") return tierFromRecord(m.record, m, opts);
   if (typeof m.text !== "string") return "routine";
   const text = m.text.trimStart();
   // Control/slash commands are injected raw and must fire immediately.

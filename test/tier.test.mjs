@@ -287,3 +287,70 @@ test("the pusher stamps scriptMtime on its own marker", () => {
   assert.ok(body, "writeTransportMarker not found");
   assert.match(body[1], /scriptMtime:/, "marker must carry scriptMtime or doctor skips it");
 });
+
+// --- Phase 8 Task 2: typed records drive the tier ---
+
+const rec = (type, extra = {}) => ({ ...room("body text is irrelevant"), record: { type }, ...extra });
+
+test("typed record and matching prefix classify identically", () => {
+  const cases = [
+    ["blocker", "BLOCKER: lane stuck", {}],
+    ["decision", "DAVID_DECISION: rollback?", {}],
+    ["go", "GO: take the slice", {}],
+    ["risk", "RISK: flaky test", {}],
+    ["fyi", "FYI: docs updated", {}],
+    ["action", "AGENT_ACTION: rebasing", {}],
+    ["done", "DONE: owner/repo#7", { gateRunner: true }],
+    ["done", "DONE: owner/repo#7", {}],
+  ];
+  for (const [type, text, opts] of cases) {
+    assert.equal(
+      classifyTier(rec(type), opts),
+      classifyTier(room(text), opts),
+      `${type} must tier the same typed as prefixed`,
+    );
+  }
+});
+
+test("a typed blocker wakes through a greeting-first body", () => {
+  // The documented footgun: prefix parsing requires byte 0, so a greeting
+  // silently downgrades a production blocker to routine. This is the case the
+  // whole phase exists to fix.
+  const prose = room("Hey — BLOCKER: prod is down");
+  assert.equal(classifyTier(prose), "routine");
+  assert.equal(classifyTier({ ...prose, record: { type: "blocker" } }), "urgent");
+});
+
+test("typed records confer no trust the prefix wouldn't", () => {
+  const trustedSenders = new Set(["proj-coordinator"]);
+  // scope: still gated on the SENDER, not on the record being present.
+  assert.equal(classifyTier(rec("scope"), { trustedSenders }), "routine");
+  assert.equal(
+    classifyTier({ ...rec("scope"), from: "proj-coordinator" }, { trustedSenders }),
+    "urgent",
+  );
+  // done: still gated on the RECIPIENT being a gate runner.
+  assert.equal(classifyTier(rec("done"), {}), "routine");
+  assert.equal(classifyTier(rec("done"), { gateRunner: true }), "urgent");
+  // verdict is new and has no prefix; it must not be a self-declared wake.
+  assert.equal(classifyTier(rec("verdict"), {}), "routine");
+});
+
+test("a record cannot smuggle the server-only urgent flag", () => {
+  // `urgent` is set by the server on its own Messages; a peer putting it
+  // inside `record` must have no effect (record.urgent is not read at all).
+  assert.equal(classifyTier({ ...room("FYI: nope"), record: { type: "fyi", urgent: true } }), "routine");
+  // An unknown/garbage type degrades to routine rather than throwing.
+  assert.equal(classifyTier({ ...room("x"), record: { type: "not-a-type" } }), "routine");
+  assert.equal(classifyTier({ ...room("BLOCKER: x"), record: {} }), "urgent"); // no type → prefix path
+});
+
+test("the record wins over a contradicting prefix, both directions", () => {
+  assert.equal(classifyTier({ ...room("FYI: routine-looking"), record: { type: "blocker" } }), "urgent");
+  assert.equal(classifyTier({ ...room("BLOCKER: urgent-looking"), record: { type: "fyi" } }), "routine");
+});
+
+test("record changes tier only — never the rendered line", () => {
+  const base = { kind: "room #proj", ts: TS_0805, from: "peer", text: "BLOCKER: db down" };
+  assert.equal(injectLine({ ...base, record: { type: "blocker" } }), injectLine(base));
+});
