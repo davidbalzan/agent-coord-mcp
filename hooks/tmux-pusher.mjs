@@ -499,11 +499,30 @@ const cleanupMarker = () => {
     // already gone
   }
 };
+// Log BEFORE cleaning up. A silent exit that also removes its own marker is
+// indistinguishable from "never attached" — on 2026-07-28 all four pushers on
+// the bus vanished at once and the cause could not be determined afterwards,
+// because every other exit path logs and this one did not. Ruled out at the
+// time: dead-pane self-exit (logs), die() (logs), SIGKILL/OOM (the marker
+// would have survived), a normal exit (the poll intervals are not unref'd),
+// doctor's reaper (has-session returned 0 for every live pane), tests (all
+// isolate AGENT_COORD_DIR), coord-chat (not running), stop-agent.sh (would
+// have killed the session too) and a parent process-group signal (the pusher
+// has its own PGID and SID). That left a signal from outside the repo, with
+// nothing recorded to identify it.
+function logSignal(sig) {
+  process.stderr.write(
+    `[tmux-pusher] received ${sig} — cleaning up marker for '${AGENT_ID}' (pane ${TMUX_TARGET}, pid ${process.pid}) and exiting\n`,
+  );
+}
+
 process.on("SIGINT", () => {
+  logSignal("SIGINT");
   cleanupMarker();
   process.exit(0);
 });
 process.on("SIGTERM", () => {
+  logSignal("SIGTERM");
   cleanupMarker();
   process.exit(0);
 });
