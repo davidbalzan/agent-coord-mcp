@@ -6,6 +6,7 @@ import { promises as fsp } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { renderRecord } from "./render.js";
 import path from "node:path";
 import {
   AGENTS_FILE,
@@ -71,35 +72,62 @@ import {
 // ---------- send_message ----------
 
 // Typed protocol record (Phase 8). Additive: omitting it reproduces v1
-// behavior exactly, and `text` stays required as the rendering of record.
-export const messageRecordSchema = z.object({
-  type: z.enum([
-    "blocker",
-    "decision",
-    "risk",
-    "done",
-    "fyi",
-    "action",
-    "go",
-    "scope",
-    "verdict",
-  ]),
-  payload: z.record(z.string(), z.unknown()).optional(),
-  cites: z
-    .array(
-      z.object({
-        kind: z.enum(["pr", "file", "commit", "url"]),
-        ref: z.string().min(1),
-      }),
-    )
-    .optional(),
+// behavior exactly.
+const citationSchema = z.object({
+  kind: z.enum(["pr", "file", "commit", "url"]),
+  ref: z.string().min(1),
 });
+
+// Payloads are LOOSE objects: a v3 sender's extra keys ride through to disk
+// untouched rather than being silently stripped. That is safe precisely
+// because payload is nested — it is caller data, and nothing in it is ever
+// read as a top-level Message field (which is what keeps a forged `tag` or
+// `urgent` out; see the source-level lock in test/tier.test.mjs).
+const summaryPayload = z.looseObject({ summary: z.string().min(1) });
+
+// All five fields, or none. A `decision` carrying three of them is
+// structurally wrong for the type it claims — and would render as a truncated
+// packet, which is worse than no packet.
+const decisionPayload = z.looseObject({
+  title: z.string().min(1),
+  context: z.string().min(1),
+  options: z.array(z.string().min(1)).min(1),
+  recommendation: z.string().min(1),
+  ifNoAction: z.string().min(1),
+});
+
+const verdictPayload = z.looseObject({
+  result: z.enum(["pass", "fail"]),
+  headRefOid: z.string().min(1),
+  notes: z.string().optional(),
+});
+
+// Discriminated on `type`, so an unknown type is rejected outright while a
+// known type is checked only against its own shape. `payload` is optional on
+// every arm: Phase 8 is additive and may not put a new required field on the
+// wire. `cites` is optional here too — `done` needs a PR citation, but that is
+// enforced in sendMessageTool as a plain {ok:false,error}, mirroring the
+// identity-binding rejection, rather than as a schema throw.
+export const messageRecordSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("decision"), payload: decisionPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("verdict"), payload: verdictPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("done"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("blocker"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("risk"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("fyi"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("action"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("go"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+  z.object({ type: z.literal("scope"), payload: summaryPayload.optional(), cites: z.array(citationSchema).optional() }),
+]);
 
 export const sendMessageSchema = {
   from: z.string().min(1),
   to: z.string().optional(),
   room: z.string().optional(),
-  text: z.string().min(1),
+  // Optional ONLY so a record can fill it (Task 3.3). This relaxes a
+  // constraint rather than adding one, so v1 senders are unaffected; a call
+  // with neither `text` nor a renderable `record` is rejected in the tool.
+  text: z.string().min(1).optional(),
   kind: z.enum(["decision", "status", "chatter"]).optional(),
   record: messageRecordSchema.optional(),
 };
@@ -108,10 +136,38 @@ export async function sendMessageTool(args: {
   from: string;
   to?: string;
   room?: string;
-  text: string;
+  text?: string;
   kind?: "decision" | "status" | "chatter";
   record?: MessageRecord;
 }) {
+  // A `done` must cite the work it claims. Presence and shape only — resolving
+  // the ref against gh/git is a consumer's job, and the send path makes no
+  // network calls. Rejected as a value, not a throw, mirroring the
+  // identity-binding rejection in src/server.ts.
+  if (args.record?.type === "done") {
+    const hasPr = (args.record.cites ?? []).some((c) => c.kind === "pr" && c.ref.trim().length > 0);
+    if (!hasPr) {
+      return {
+        ok: false as const,
+        error:
+          "a 'done' record must carry at least one {kind:'pr'} citation — an uncited DONE is an unverifiable claim",
+      };
+    }
+  }
+
+  // `text` is what every consumer reads, so it must exist. The author's
+  // wording ALWAYS wins: a record renders only to fill an absent text, never
+  // to overwrite one.
+  const text = args.text ?? (args.record ? renderRecord(args.record) : null);
+  if (!text) {
+    return {
+      ok: false as const,
+      error: args.record
+        ? `record type '${args.record.type}' has no payload to render — supply 'text', or a payload the type's layout can render`
+        : "'text' is required when no record is supplied",
+    };
+  }
+
   // DM → inbox. Otherwise resolve the channel (default `general`), make sure it
   // exists in the registry, and tag the message with its channel.
   if (args.to) {
@@ -120,7 +176,7 @@ export async function sendMessageTool(args: {
       ts: Date.now(),
       from: args.from,
       to: args.to,
-      text: args.text,
+      text,
       ...(args.record ? { record: args.record } : {}),
     };
     const target = inboxFile(args.to);
@@ -142,7 +198,7 @@ export async function sendMessageTool(args: {
     ts: Date.now(),
     from: args.from,
     room: chan,
-    text: args.text,
+    text,
     ...(args.kind ? { kind: args.kind } : {}),
     ...(args.record ? { record: args.record } : {}),
   };

@@ -285,6 +285,14 @@ test("both pushers tag AFTER the spread (source-level lock)", () => {
   // message would forge the channel a line appears to come from (a DM
   // rendering as `[#general …]`). Assigning after the spread makes the
   // pusher's own value win regardless.
+  //
+  // This is the LAST barrier, not the only one: a forged tag must first reach
+  // a stored Message, and send_message builds Messages from fixed named fields
+  // and never spreads caller args, while zod strips unknown keys at the tool
+  // boundary. Getting one in needs direct JSONL write access. Phase 8's
+  // `record.payload` does not change that — it is caller data that may be
+  // persisted nested under `record`, but nothing in it reaches a top-level
+  // Message field.
   const src = (url) => readFileSync(fileURLToPath(new URL(url, import.meta.url)), "utf8");
   let checked = 0;
   for (const f of ["../hooks/tmux-pusher.mjs", "../scripts/coord-pusher.mjs"]) {

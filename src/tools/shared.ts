@@ -100,23 +100,57 @@ export type MessageRecordType =
   | "scope"     // SCOPE CHANGE:   amends a contract in flight
   | "verdict";  // (new) a gate PASS/FAIL — has no prefix today
 
-// Structured counterpart to `text`, NOT a replacement: `text` stays required
-// because it is the rendering, and a tmux pane can only receive text. Every
-// field is optional so a v1 agent that has never heard of `record` behaves
-// byte-identically.
+// The five fields of the playbook's decision packet (§Decision Packet Format).
+// Named to match that layout because `renderRecord` reproduces it byte-for-byte
+// — the UI parses the rendering into a clickable decision card.
+export type DecisionPayload = {
+  title: string;
+  context: string;
+  options: string[];
+  recommendation: string;
+  ifNoAction: string;
+};
+
+// A gate verdict. `headRefOid` pins WHICH commit was gated: a PASS that doesn't
+// name the sha it was issued against is unfalsifiable once the branch moves.
+export type VerdictPayload = {
+  result: "pass" | "fail";
+  headRefOid: string;
+  notes?: string;
+};
+
+// Everything else carries prose. One line, because these render as
+// `<PREFIX>: <summary>` and a paragraph in a tmux pane is a wall, not a status.
+export type SummaryPayload = { summary: string };
+
+// Message types whose payload is just a summary.
+export type SummaryRecordType = "blocker" | "risk" | "fyi" | "action" | "go" | "scope";
+
+// Structured counterpart to `text`, NOT a replacement: `text` is the rendering,
+// and a tmux pane can only receive text. A v1 agent that has never heard of
+// `record` omits it entirely and behaves byte-identically.
+//
+// `payload` stays OPTIONAL on every arm — Phase 8 is additive, so no new
+// required field may appear on the wire. What is pinned is the shape *if* a
+// payload is supplied: a `decision` carrying three of its five fields is
+// structurally wrong for the type it claims and is rejected, while a payload
+// with extra unknown keys passes through untouched (a v3 sender must not be
+// broken by a v2 server, and stripping would silently drop data on the way to
+// disk).
+//
+// `cites` is likewise optional here. `done` requires a PR citation, but that is
+// enforced in sendMessageTool as a plain {ok:false,error} rather than a schema
+// rejection — see the identity-binding precedent in src/server.ts.
 //
 // UNTRUSTED, exactly like `from`. A peer can claim any type here, so trust
 // decisions (the SCOPE countersignature, gate-runner routing) must still
 // resolve the sender against the registry — typed is not the same as
 // authenticated, and `record` must never become a path to setting `urgent`.
-export type MessageRecord = {
-  type: MessageRecordType;
-  // Type-specific fields (the decision packet's title/context/options/… ).
-  // Shapes are pinned per type in Phase 8 Task 3; the envelope stays open so
-  // adding one doesn't require a wire change.
-  payload?: Record<string, unknown>;
-  cites?: Citation[];
-};
+export type MessageRecord =
+  | { type: "decision"; payload?: DecisionPayload; cites?: Citation[] }
+  | { type: "verdict"; payload?: VerdictPayload; cites?: Citation[] }
+  | { type: "done"; payload?: SummaryPayload; cites?: Citation[] }
+  | { type: SummaryRecordType; payload?: SummaryPayload; cites?: Citation[] };
 
 export type Message = {
   id: string;
