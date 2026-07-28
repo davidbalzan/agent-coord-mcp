@@ -1,6 +1,6 @@
 import { adjustCursors } from "./admin.js";
 import { RECORD_AUTHORITY, resolveRole, roleMatches } from "../roles.js";
-import { ARCHIVE_STATUS_FILE, archiveJsonl, archiveRoomFile } from "../store.js";
+import { ARCHIVE_STATUS_FILE, archiveJsonl, archiveInboxFile, archiveRoomFile } from "../store.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, openSync, watch } from "node:fs";
 import { promises as fsp } from "node:fs";
@@ -424,6 +424,76 @@ function digestOverflow(over: (Message | StatusEntry)[], hash: string | undefine
     ? `\n${quoted.join("\n")}${decisions.length > 5 ? `\n  (+${decisions.length - 5} earlier decisions in hash)` : ""}`
     : "";
   return head + tail + decisionBlock;
+}
+
+// ---------- retrieve_message (Phase 8 Task 6) ----------
+
+export const retrieveMessageSchema = {
+  agentId: z.string().min(1),
+  id: z.string().min(1),
+};
+
+// Expand a digest handle back into the full typed record.
+//
+// NOT a cache. The handle is the message's own `id`, and this reads the source
+// of truth — rooms/<chan>.jsonl or inbox/<agent>.jsonl. That matters for two
+// reasons the CCR history cache could not offer: nothing is duplicated, and
+// nothing expires. A stashed copy would have carried HISTORY_TTL_MS and become
+// permanently unrecoverable after 30 minutes, which is exactly when a handle
+// that outlived a /clear would be expanded.
+//
+// It also sidesteps the cursor: the pusher SHARES the cursor file with
+// read_messages, so anything already delivered to a pane is behind the cursor
+// and re-reading the channel would not return it. A by-id lookup never
+// consults a cursor.
+//
+// AUTHORITY BY CONSTRUCTION: we only ever open files this agent is entitled to
+// read — its own inbox, and the rooms it is a member of. There is no separate
+// permission check that could disagree with the search, and a handle for a
+// message delivered somewhere else simply is not found. That is the same
+// property the history cache spent `forAgent` scoping to get.
+export async function retrieveMessageTool(args: { agentId: string; id: string }) {
+  const rooms = await memberRooms(args.agentId);
+  const scopes = [
+    {
+      source: "inbox" as const,
+      room: undefined as string | undefined,
+      live: inboxFile(args.agentId),
+      archived: archiveInboxFile(args.agentId),
+    },
+    ...rooms.map((r) => ({
+      source: "room" as const,
+      room: r as string | undefined,
+      live: roomFile(r),
+      archived: archiveRoomFile(r),
+    })),
+  ];
+
+  // Live files first. The archive is opened ONLY on a miss, so no normal
+  // retrieval touches it and compaction/prune semantics are unchanged — but a
+  // record that compaction moved is still recoverable, because archive/ is
+  // append-only and complete.
+  for (const pass of ["live", "archived"] as const) {
+    for (const s of scopes) {
+      const entries = await readJsonl<Message>(s[pass]);
+      const msg = entries.find((m) => m.id === args.id);
+      if (msg) {
+        return {
+          ok: true as const,
+          id: msg.id,
+          source: s.source,
+          room: s.room,
+          archived: pass === "archived",
+          message: msg,
+          record: msg.record,
+        };
+      }
+    }
+  }
+  return {
+    ok: false as const,
+    error: `no message '${args.id}' in any channel you can read — it may never have been delivered to you`,
+  };
 }
 
 // ---------- retrieve_room_history ----------
