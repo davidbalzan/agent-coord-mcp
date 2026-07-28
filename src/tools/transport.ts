@@ -402,6 +402,24 @@ export async function sendCommandTool(args: {
   };
 }
 
+// Does `pid` actually belong to one of our tmux pushers? A transport marker
+// records a pid, but a marker can outlive its process and pids get recycled —
+// so "pid is alive" is NOT evidence the pid is still the pusher. Anything that
+// SIGTERMs a marker's pid must confirm identity first or it will eventually
+// kill an unrelated process on the user's machine.
+//
+// Pushers are spawned as `<node> <.../hooks/tmux-pusher.mjs>` (see
+// attachAgentTool), so the script path in the process's argv is the signature.
+// Returns false when we cannot confirm — including when `ps` is unavailable.
+// Refusing to kill an unverifiable pid is the safe failure: a wedged pusher
+// that survives is a nuisance, a wrong SIGTERM is not.
+export function isPusherProcess(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+  if (ps.status !== 0) return false; // pid gone, or no usable ps
+  return (ps.stdout ?? "").includes(path.basename(resolvePusherPath()));
+}
+
 // ---------- attach_agent / detach_agent (tmux push transport) ----------
 
 export const attachAgentSchema = {
@@ -874,7 +892,7 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
     // Without a tmux binary we can't tell "wedged" from "can't probe" — skip
     // rather than flag every local marker as dead.
     const tmuxAvailable = spawnSync("tmux", ["-V"]).status === 0;
-    const wedged: { agentId: string; pid: number; file: string; target: string }[] = [];
+    const wedged: { agentId: string; pid: number; file: string; target: string; isPusher: boolean }[] = [];
     if (tmuxAvailable) {
       for (const fname of await listTransportFiles()) {
         const file = path.join(TRANSPORT_DIR, fname);
@@ -888,14 +906,32 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
         // the format string has no #{...} needing that target resolved).
         const probe = spawnSync("tmux", ["has-session", "-t", marker.tmuxTarget]);
         if (probe.status === 0) continue; // pane alive
-        wedged.push({ agentId: marker.agentId, pid: marker.pid, file, target: marker.tmuxTarget });
+        // The marker's pid being alive does not make it OUR pid — see
+        // isPusherProcess. Record the verdict now so `fix` only ever signals
+        // a confirmed pusher.
+        wedged.push({
+          agentId: marker.agentId,
+          pid: marker.pid,
+          file,
+          target: marker.tmuxTarget,
+          isPusher: isPusherProcess(marker.pid),
+        });
       }
     }
     if (fix) {
       for (const w of wedged) {
-        try { process.kill(w.pid, "SIGTERM"); } catch { /* already gone */ }
+        // Clearing the marker is always safe — the pane is gone either way, so
+        // nothing can be delivered through it. Signalling is not: an
+        // unverifiable pid is some other process that inherited this number.
+        if (w.isPusher) {
+          try { process.kill(w.pid, "SIGTERM"); } catch { /* already gone */ }
+        }
         await deleteFile(w.file);
-        fixed.push(`reaped wedged pusher for ${w.agentId} (pid ${w.pid}, tmux target '${w.target}' gone)`);
+        fixed.push(
+          w.isPusher
+            ? `reaped wedged pusher for ${w.agentId} (pid ${w.pid}, tmux target '${w.target}' gone)`
+            : `cleared stale transport marker for ${w.agentId} (tmux target '${w.target}' gone; pid ${w.pid} is not a tmux-pusher — not signalled)`,
+        );
       }
     }
     findings.push({
@@ -907,7 +943,12 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
           ? "no wedged local pushers (pid-alive, pane-dead)"
           : "tmux not available — skipped wedged-pusher pane probe",
       fixable: true,
-      items: wedged.length ? wedged.map((w) => `${w.agentId} (pid ${w.pid}, tmux target '${w.target}')`) : undefined,
+      items: wedged.length
+        ? wedged.map(
+            (w) =>
+              `${w.agentId} (pid ${w.pid}, tmux target '${w.target}')${w.isPusher ? "" : " — pid is not a tmux-pusher, marker will be cleared without signalling"}`,
+          )
+        : undefined,
     });
   }
 

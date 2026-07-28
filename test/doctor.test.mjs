@@ -117,12 +117,19 @@ test("doctor flags a stale local pusher (loaded mtime < on-disk mtime)", async (
     }),
   );
 
-  const r = await t.doctorTool({});
-  const f = r.findings.find((x) => x.check === "stale-pusher-script");
-  assert.ok(f, "stale-pusher-script finding present");
-  assert.equal(f.level, "warn");
-  assert.ok(f.items.some((i) => i.includes("staleagent")));
-  assert.ok(f.detail.includes("control commands"));
+  try {
+    const r = await t.doctorTool({});
+    const f = r.findings.find((x) => x.check === "stale-pusher-script");
+    assert.ok(f, "stale-pusher-script finding present");
+    assert.equal(f.level, "warn");
+    assert.ok(f.items.some((i) => i.includes("staleagent")));
+    assert.ok(f.detail.includes("control commands"));
+  } finally {
+    // MUST NOT leak: this marker pairs our own pid with a tmux target we don't
+    // own, which is exactly the shape the wedged-pusher reaper SIGTERMs. Left
+    // behind, a later doctor({fix:true}) in this file kills the test runner.
+    await store.deleteFile(store.transportFile("staleagent"));
+  }
 });
 
 // Real tmux state, not fixtures — a "wedged" pusher (pid alive, pane dead) is
@@ -139,9 +146,13 @@ const tmuxOnMachine = spawnSync("tmux", ["-V"]).status === 0;
       .trim();
     assert.ok(paneId, "failed to create a real tmux pane for the test");
 
-    // A real, disposable process for the wedged marker's pid — doctor's
-    // fix SIGTERMs it, which must NOT be this test's own pid.
-    const dummy = spawn("sleep", ["300"]);
+    // A real, disposable process for the wedged marker's pid — doctor's fix
+    // SIGTERMs it, which must NOT be this test's own pid. It has to *look*
+    // like a pusher to `ps`, since the reaper refuses to signal a pid it can't
+    // identify as one: node idles on the timer and ignores the trailing
+    // argument, which exists purely to put the pusher path in argv.
+    const pusherPath = path.resolve("hooks/tmux-pusher.mjs");
+    const dummy = spawn(process.execPath, ["-e", "setTimeout(() => {}, 300000)", pusherPath]);
     await new Promise((resolve) => dummy.once("spawn", resolve));
 
     try {
@@ -176,7 +187,9 @@ const tmuxOnMachine = spawnSync("tmux", ["-V"]).status === 0;
       assert.ok(await store.readJson(store.transportFile("wedgedagent"), null));
 
       const fixed = await t.doctorTool({ fix: true });
-      assert.ok(fixed.fixed.some((f) => f.includes("wedgedagent")));
+      assert.ok(fixed.fixed.some((f) => f.includes("wedgedagent") && f.includes("reaped")));
+      await new Promise((resolve) => dummy.once("exit", resolve));
+      assert.equal(dummy.signalCode, "SIGTERM", "an identified pusher is signalled");
       assert.equal(await store.readJson(store.transportFile("wedgedagent"), null), null, "marker cleared");
       assert.ok(await store.readJson(store.transportFile("liveagent"), null), "live pusher's marker untouched");
 
@@ -186,6 +199,42 @@ const tmuxOnMachine = spawnSync("tmux", ["-V"]).status === 0;
     } finally {
       spawnSync("tmux", ["kill-session", "-t", session]);
       try { dummy.kill("SIGKILL"); } catch { /* already reaped by doctor's fix */ }
+    }
+  },
+);
+
+// A marker's pid outliving its pusher (or being recycled onto an unrelated
+// process) must never turn doctor({fix:true}) into a killer of other people's
+// processes. The marker still gets cleared — the pane is gone regardless — but
+// no signal is sent unless the pid is verifiably a tmux-pusher.
+(tmuxOnMachine ? test : test.skip)(
+  "doctor clears a pane-dead marker without signalling when the pid isn't a pusher",
+  async () => {
+    const bystander = spawn("sleep", ["300"]);
+    await new Promise((resolve) => bystander.once("spawn", resolve));
+
+    try {
+      await t.registerTool({ agentId: "impostor" });
+      await store.updateJson(store.transportFile("impostor"), {}, () => ({
+        agentId: "impostor",
+        transport: "tmux-push",
+        pid: bystander.pid, // alive, but a `sleep`, not tmux-pusher.mjs
+        tmuxTarget: "%999998",
+        since: Date.now(),
+      }));
+
+      const dry = await t.doctorTool({});
+      const finding = dry.findings.find((x) => x.check === "wedged-local-pushers");
+      assert.ok(finding.items.some((i) => i.includes("impostor") && i.includes("not a tmux-pusher")));
+
+      const fixed = await t.doctorTool({ fix: true });
+      assert.ok(fixed.fixed.some((f) => f.includes("impostor") && f.includes("not signalled")));
+      assert.equal(await store.readJson(store.transportFile("impostor"), null), null, "marker cleared");
+      // The bystander is untouched: still alive, no exit code recorded.
+      assert.equal(bystander.exitCode, null, "an unrelated process must not be signalled");
+      assert.equal(bystander.signalCode, null);
+    } finally {
+      try { bystander.kill("SIGKILL"); } catch { /* nothing to clean up */ }
     }
   },
 );
