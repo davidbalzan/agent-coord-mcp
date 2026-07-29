@@ -17,10 +17,14 @@
 
 ## Lanes
 
-| Lane | Owner | Pane | State | Current slice | Next GO |
-|---|---|---|---|---|---|
-| repo | `ai-workflow-worker-1` | `%4` | idle | — | next P1 by priority |
-| repo | `david-worker-2` | `%5` | working | remote receipt build identity — carry the reporting pusher's build id on a receipt; `deliveryOutcome` annotates a confirmed receipt from an outdated pusher | — |
+> **Five columns, fixed.** `BoardRow` in `src/work.ts` is a 5-tuple and `export_work` renders exactly
+> those; a sixth column is dropped on write-back. #38 added a `Pane` column here and broke the
+> round-trip for two commits — pane ids live in the Owner cell instead.
+
+| Lane | Owner | State | Current slice | Next GO |
+|---|---|---|---|---|
+| repo | `ai-workflow-worker-1` (pane `%209`) | working | P2 guard first-use identity binding against claiming a live agent id | next P1/P2 by priority |
+| repo | `david-worker-2` (pane `%210`) | gate pending | remote receipt build identity (#40): both pushers stamp a module-graph build id on every receipt; `deliveryOutcome` annotates a confirmed verdict from a stale or unstamped reporter without downgrading it | next GO after gate |
 
 ## Release
 
