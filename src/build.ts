@@ -65,6 +65,18 @@ export function onDiskBuildMtime(): number | undefined {
   return newestMtimeUnder(dir, BUILD_EXTS);
 }
 
+// The uncompiled side of the dist-behind-source comparison: newest mtime
+// across src/**/*.ts, resolved as BUILD_DIR's sibling. undefined on a
+// packaged install with no src/ (callers report "nothing to compare", never
+// warn). Under tsx dev-mode BUILD_DIR *is* src/, so the comparison degrades
+// to src-vs-src and reads ok — dev-mode has no build to fall behind.
+// AGENT_COORD_SRC_DIR is the same test seam as AGENT_COORD_DIST_DIR:
+// it redirects measurement only.
+export function onDiskSourceMtime(): number | undefined {
+  const dir = process.env.AGENT_COORD_SRC_DIR ?? path.resolve(BUILD_DIR, "..", "src");
+  return newestMtimeUnder(dir, [".ts"]);
+}
+
 // Best-effort checkout identity, report-only: lets doctor NAME the build
 // (`branch@sha` would be nicer, but HEAD's sha alone already makes
 // mutable-checkout drift visible, which is all this claims). undefined when

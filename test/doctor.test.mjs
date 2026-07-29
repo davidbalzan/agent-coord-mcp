@@ -277,6 +277,63 @@ test("server-build-drift is ok when the loaded build is current", async () => {
   }
 });
 
+test("dist-behind-source goes red on a deliberately un-rebuilt dist", async () => {
+  // The state the fleet actually hit post-#28: checkout updated (src newer),
+  // dist never rebuilt. Staged via both measurement seams — a src file
+  // touched NOW against a dist whose newest file predates it. No restart can
+  // fix this one; the check must say so affirmatively, not infer it.
+  const fakeSrc = mkdtempSync(path.join(tmpdir(), "coord-src-"));
+  const fakeDist = mkdtempSync(path.join(tmpdir(), "coord-dist-"));
+  writeFileSync(path.join(fakeSrc, "updated.ts"), "// stands in for a pulled change\n");
+  writeFileSync(path.join(fakeDist, "stale.js"), "// stands in for the old build\n");
+  const now = new Date();
+  const before = new Date(Date.now() - 60_000);
+  utimesSync(path.join(fakeSrc, "updated.ts"), now, now);
+  utimesSync(path.join(fakeDist, "stale.js"), before, before);
+  process.env.AGENT_COORD_SRC_DIR = fakeSrc;
+  process.env.AGENT_COORD_DIST_DIR = fakeDist;
+  try {
+    const r = await t.doctorTool({});
+    const f = r.findings.find((x) => x.check === "dist-behind-source");
+    assert.equal(f.level, "warn", "an un-rebuilt dist must be visible");
+    assert.ok(f.detail.includes("npm run build"), "the remedy must be named");
+  } finally {
+    delete process.env.AGENT_COORD_SRC_DIR;
+    delete process.env.AGENT_COORD_DIST_DIR;
+    rmSync(fakeSrc, { recursive: true, force: true });
+    rmSync(fakeDist, { recursive: true, force: true });
+  }
+});
+
+test("dist-behind-source is ok on a current build and skips a packaged install", async () => {
+  // Current build: dist at least as new as src.
+  const fakeSrc = mkdtempSync(path.join(tmpdir(), "coord-src-"));
+  const fakeDist = mkdtempSync(path.join(tmpdir(), "coord-dist-"));
+  writeFileSync(path.join(fakeSrc, "a.ts"), "");
+  writeFileSync(path.join(fakeDist, "a.js"), "");
+  const stamp = new Date(Date.now() - 60_000);
+  utimesSync(path.join(fakeSrc, "a.ts"), stamp, stamp);
+  utimesSync(path.join(fakeDist, "a.js"), stamp, stamp);
+  process.env.AGENT_COORD_SRC_DIR = fakeSrc;
+  process.env.AGENT_COORD_DIST_DIR = fakeDist;
+  try {
+    const r1 = await t.doctorTool({});
+    const f1 = r1.findings.find((x) => x.check === "dist-behind-source");
+    assert.equal(f1.level, "ok", JSON.stringify(f1));
+    // Packaged install: no src/ at all → "nothing to compare", never a warn.
+    process.env.AGENT_COORD_SRC_DIR = path.join(fakeSrc, "does-not-exist");
+    const r2 = await t.doctorTool({});
+    const f2 = r2.findings.find((x) => x.check === "dist-behind-source");
+    assert.equal(f2.level, "ok", JSON.stringify(f2));
+    assert.ok(f2.detail.includes("packaged"), "absence must read as unknown, not fresh");
+  } finally {
+    delete process.env.AGENT_COORD_SRC_DIR;
+    delete process.env.AGENT_COORD_DIST_DIR;
+    rmSync(fakeSrc, { recursive: true, force: true });
+    rmSync(fakeDist, { recursive: true, force: true });
+  }
+});
+
 test("a marker stamped by an outdated server build is flagged for restart + re-attach", async () => {
   // A live, perfectly healthy pusher whose marker was stamped by a server
   // that predates the current dist: the stamps were computed with replaced
