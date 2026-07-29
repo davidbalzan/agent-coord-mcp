@@ -55,7 +55,7 @@ absolute path). After #36, a restarted session will name every marker that a sta
 
 ## Board
 
-`docs/QUEUE.md`: **3 P1 · 6 P2 · 4 P3.**
+`docs/QUEUE.md`: **1 P1 · 5 P2 · 4 P3.** The single P1 is Phase 8 (partially landed). 0.19.0 closed both other P1s and one P2.
 
 ## Notes
 
