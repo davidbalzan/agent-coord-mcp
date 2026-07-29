@@ -14,6 +14,7 @@ import {
   formatBatch,
   injectLine,
 } from "../hooks/tier.mjs";
+import { mergeTransportMarker } from "../hooks/marker.mjs";
 
 // `tag` is the pushers' synthetic channel tag. It was called `kind` until the
 // Phase 8 rename, which collided with the stored Message.kind (retention
@@ -340,6 +341,34 @@ test("SCRIPT_MTIME covers the pusher's sibling modules, not just the entry file"
     /readdirSync/,
     "stamp must scan the hooks dir (the loaded module graph), not stat one file",
   );
+});
+
+test("a marker rewrite preserves fields it does not own", () => {
+  // The marker has two writers: attach_agent creates it (and stamps
+  // provenance like serverBuildMtime that only the server can know); the
+  // pusher rewrites it at startup and owns just its pid/target/scriptMtime.
+  // A rewrite that drops an unowned field switches off whichever check reads
+  // it — scriptMtime was lost exactly this way once, silently disabling
+  // stale-pusher-script. The contract generalises to fields that don't exist
+  // yet, hence the deliberately unknown `futureField`.
+  const merged = mergeTransportMarker(
+    { agentId: "a", scriptMtime: 5, serverBuildMtime: 111, futureField: "keep" },
+    { agentId: "a", pid: 42, scriptMtime: 9 },
+  );
+  assert.equal(merged.serverBuildMtime, 111, "attach_agent's stamp must survive");
+  assert.equal(merged.futureField, "keep", "unknown future fields must survive");
+  assert.equal(merged.scriptMtime, 9, "the rewriter's own fields must win");
+  assert.equal(merged.pid, 42);
+  // And the pusher actually routes its rewrite through the contract — a
+  // from-scratch object literal would pass the pure test above while
+  // production still clobbers. Source-level, same reason as the tests above.
+  const src = readFileSync(
+    fileURLToPath(new URL("../hooks/tmux-pusher.mjs", import.meta.url)),
+    "utf8",
+  );
+  const body = src.match(/function writeTransportMarker\(\) \{([\s\S]*?)\n\}/);
+  assert.ok(body, "writeTransportMarker not found");
+  assert.match(body[1], /mergeTransportMarker\(/, "the rewrite must merge, not rebuild");
 });
 
 // --- Phase 8 Task 2: typed records drive the tier ---
