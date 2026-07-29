@@ -243,15 +243,22 @@ export function readPaneState(paneText) {
 // delivery:"confirmed". Waiting briefly and then declining is slower and
 // louder — deliberately, because a control command that silently becomes a
 // chat message is worse than one that says it did not run.
+// The ONE place a pane is captured for guard/verify decisions. `-e` is
+// load-bearing: it keeps the style layer, the only channel that distinguishes
+// a real draft from the TUI's ghost suggestion (see GHOST_TEXT_SGR). Without
+// it every ghost reads as a draft again — and the SUITE CANNOT NOTICE,
+// because the parser tests inject styled text below this call. That is the
+// scriptMtime family of failure: the subject of a check silently disabling
+// it. A source lock in control-submit.test.mjs pins the flag here and counts
+// capture sites, so a new capture call added without `-e` trips it too.
+function captureStyled(run, target) {
+  const cap = run(["capture-pane", "-e", "-p", "-t", target]);
+  return cap.status === 0 ? String(cap.stdout ?? "") : null;
+}
+
 export async function submitControl(deps, payload) {
   const { run, target } = deps;
-  const capture = () => {
-    // -e keeps the style layer — the only channel that distinguishes a real
-    // draft from the TUI's ghost suggestion (see GHOST_TEXT_SGR). A plain
-    // capture flattens both to identical text and the guard refuses on chrome.
-    const cap = run(["capture-pane", "-e", "-p", "-t", target]);
-    return cap.status === 0 ? String(cap.stdout ?? "") : null;
-  };
+  const capture = () => captureStyled(run, target);
 
   const idleBudget = CONTROL_IDLE_WAIT_MS();
   const deadline = Date.now() + idleBudget;
@@ -374,9 +381,9 @@ async function pollUntilGone(deps, payload) {
     // (e.g. the TUI suggesting "/compact" right after it ran) would otherwise
     // read as "still in the input" — a false non-submit whose retry path
     // sends extra Enters into a live pane on the strength of chrome.
-    const cap = run(["capture-pane", "-e", "-p", "-t", target]);
-    if (cap.status === 0) {
-      const verdict = stillInInput(String(cap.stdout ?? ""), payload);
+    const pane = captureStyled(run, target);
+    if (pane !== null) {
+      const verdict = stillInInput(pane, payload);
       if (verdict === false) return false;
       if (verdict === true) readInput = true; // we could read the input line
     }

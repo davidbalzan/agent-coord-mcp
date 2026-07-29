@@ -330,6 +330,33 @@ test("send_command reports confirmed ONLY for a verified submission", async () =
   assert.ok(t.sendCommandTool, "send_command still exists with its existing signature");
 });
 
+// ---------- the -e lock: the capture must keep the style layer ----------
+
+test("every pane capture in submit.mjs carries -e — the flag the ghost fix depends on", () => {
+  // Stripping -e from either capture site left the suite GREEN when the gate
+  // tried it: the parser tests inject styled text below the capture, so the
+  // one flag the whole fix rides on had no witness. That is the scriptMtime
+  // family of failure — the subject of a check silently disabling it. Source
+  // lock, same idiom as the pusher drift-locks: count the sites AND assert
+  // the flag per site, so a new capture call added without -e trips it too.
+  const src = readFileSync(path.join(REPO, "hooks/submit.mjs"), "utf8");
+  const sites = src.match(/run\(\[\s*"capture-pane"[^\]]*\]/g) ?? [];
+  assert.equal(
+    sites.length,
+    1,
+    "expected exactly ONE capture call site (captureStyled) — a moved or added site must be re-counted here and carry -e",
+  );
+  for (const s of sites) {
+    assert.ok(s.includes('"-e"'), `capture site discards the style layer the ghost fix depends on: ${s}`);
+  }
+  // …and both consumers (the guard and the verifier) route through it:
+  assert.equal(
+    (src.match(/captureStyled\(/g) ?? []).length,
+    3,
+    "definition + two call sites (submitControl guard, pollUntilGone verifier)",
+  );
+});
+
 // ---------- 4. both pushers, one implementation ----------
 
 test("both pushers import the shared pipeline and define no copy of their own", () => {
