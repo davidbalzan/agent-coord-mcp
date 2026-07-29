@@ -16,6 +16,9 @@ those glyphs; an ASCII hyphen/period renders the panel empty.
 
 ## Done
 
+- [x] A receipt names the pusher build that confirmed it, so a confirmed verdict from a stale or unstamped reporter is annotated without being downgraded — davidbalzan/agent-coord-mcp#40 · 2026-07-29
+- [x] First-claim identity guard: a live agent id cannot be TOFU-claimed without its token, force, or its own pane, and unreadable evidence refuses rather than reading as verified-absent — davidbalzan/agent-coord-mcp#42 · 2026-07-29
+- [x] `doctor` reaps wedged local pushers (pid alive, tmux pane gone) under fix, verified against real tmux rather than fixtures — davidbalzan/agent-coord-mcp@af2ca41 · 2026-07-29
 - [x] Absence is not exemption: an unstamped marker is unverifiable, never ok, flipped for both freshness fields in one commit (it is also what made the provenance rescue work at all: pre-#30 servers never wrote the stamp, so the drift comparison had nothing to compare and all three stale markers were caught by the absence path) — davidbalzan/agent-coord-mcp#36 · 2026-07-29
 - [x] `dist-behind-source`: the affirmative catch for merged-but-never-rebuilt, the disk behind itself rather than a process behind its dist — davidbalzan/agent-coord-mcp#32 · 2026-07-29
 - [x] Server build identity sampled at load, stamped on markers as provenance, checked by doctor; marker rewrites merge instead of rebuild — davidbalzan/agent-coord-mcp#30 · 2026-07-29
