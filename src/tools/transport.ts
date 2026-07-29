@@ -534,7 +534,12 @@ export async function attachAgentTool(args: {
   // server is often launched via an absolute path (nvm/Homebrew/bundled
   // runtime) that isn't on the spawned child's PATH, which would silently fail
   // the pusher launch ("attached but nothing arrives").
-  const child = spawn(process.execPath, [pusher], {
+  // `--agent <id>` is inert to the pusher (env stays authoritative) but puts
+  // the agentId in argv, so a pattern kill can be scoped to ONE pusher
+  // (`pkill -f "tmux-pusher.mjs --agent <id>"`). Without it the only matchable
+  // pattern was the script path, and a `pkill -f tmux-pusher.mjs` during one
+  // agent's cleanup silently detached every live agent on the bus (2026-07-28).
+  const child = spawn(process.execPath, [pusher, "--agent", args.agentId], {
     detached: true,
     stdio: ["ignore", logFd, logFd],
     env: {

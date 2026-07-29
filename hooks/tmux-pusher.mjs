@@ -51,6 +51,12 @@
  *     verifies via capture-pane that the command left the input. An unverified
  *     submission reports delivery:"pending" with a reason, never "confirmed".
  *     See hooks/submit.mjs, shared with scripts/coord-pusher.mjs.
+ *   - CLEANUP: never `pkill -f tmux-pusher.mjs` — the pattern matches EVERY
+ *     pusher on the bus, and one agent's test-rig cleanup doing exactly that
+ *     silently detached all four live agents (2026-07-28). attach_agent puts
+ *     `--agent <id>` in argv so a pattern kill can be scoped to one agent
+ *     (`pkill -f "tmux-pusher.mjs --agent <id>"`); better still, use
+ *     detach_agent or the pid file — both target the exact pid.
  */
 
 import {
