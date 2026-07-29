@@ -75,6 +75,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { effectiveTier, isGateRunnerRole, TierQueue, formatBatch } from "./tier.mjs";
+import { mergeTransportMarker } from "./marker.mjs";
 import { pasteAndSubmit as sharedPasteAndSubmit, submitControl as sharedSubmitControl } from "./submit.mjs";
 
 const AGENT_ID = process.env.AGENT_COORD_ID;
@@ -549,7 +550,18 @@ process.on("SIGTERM", () => {
 process.on("exit", cleanupMarker);
 
 function writeTransportMarker() {
-  const marker = {
+  // Merge over the existing marker, never rebuild from scratch: attach_agent
+  // wrote it first and owns fields only the server can know (its
+  // serverBuildMtime provenance stamp, and whatever comes next). A
+  // from-scratch rewrite here once dropped scriptMtime and silently disabled
+  // doctor's stale-pusher-script check — see hooks/marker.mjs.
+  let existing;
+  try {
+    existing = JSON.parse(readFileSync(TRANSPORT_FILE, "utf8"));
+  } catch {
+    existing = undefined; // first writer, or unreadable — our own fields stand alone
+  }
+  const marker = mergeTransportMarker(existing, {
     agentId: AGENT_ID,
     transport: "tmux-push",
     pid: process.pid,
@@ -561,7 +573,7 @@ function writeTransportMarker() {
     // stale-pusher-script check for every local pusher. Our own stamp is the
     // more truthful value anyway: it reflects the code THIS process loaded.
     scriptMtime: SCRIPT_MTIME,
-  };
+  });
   const tmp = TRANSPORT_FILE + ".tmp";
   writeFileSync(tmp, JSON.stringify(marker));
   renameSync(tmp, TRANSPORT_FILE);
