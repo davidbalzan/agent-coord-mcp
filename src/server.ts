@@ -46,6 +46,8 @@ import {
   registerTool,
   renameAgentSchema,
   renameAgentTool,
+  reportReceiptSchema,
+  reportReceiptTool,
   reportTransportSchema,
   reportTransportTool,
   sendCommandSchema,
@@ -344,6 +346,13 @@ function buildServer(initialBound?: string): McpServer {
     "Idempotent delete of an agent's transport marker. The wire-callable counterpart to detach_agent for remote pushers: it only removes the marker — there's no local process to kill.",
     clearTransportSchema,
     gate("agentId", clearTransportTool as (a: Record<string, unknown>) => Promise<unknown>),
+  );
+
+  server.tool(
+    "report_receipt",
+    "Append a delivery receipt for a message this agent's pusher just typed into its pane — the wire-callable counterpart to the local pusher's receipts/<id>.jsonl stamp, for remote pushers (scripts/coord-pusher.mjs) that cannot write this host's filesystem. This is what lets send_command to a tmux-push-remote agent return delivery:'confirmed'. For control commands pass exactly what submit verification observed (submitted/verified/reason); omitting 'submitted' means 'typed but unverified' and is reported as delivery:'pending', never 'confirmed'. 'agentId' (the receiving agent) is enforced against the session's bound identity, so a pusher can only stamp its own agent's receipt file.",
+    reportReceiptSchema,
+    gate("agentId", reportReceiptTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
   server.tool(
