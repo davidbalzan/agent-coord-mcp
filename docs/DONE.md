@@ -16,6 +16,7 @@ those glyphs; an ASCII hyphen/period renders the panel empty.
 
 ## Done
 
+- [x] The remote pusher reports delivery receipts over the wire (report_receipt; remote control commands are confirmable for the first time) — davidbalzan/agent-coord-mcp#27 · 2026-07-29
 - [x] Pusher freshness covers the loaded module graph; pattern kills scoped per agent — davidbalzan/agent-coord-mcp#28 · 2026-07-29
 - [x] The submit verifier reads the input line, not a tail window (P1b false negative; verified live, an idle pane with populated scrollback confirms twice, including with `/compact` already echoed into the transcript) — davidbalzan/agent-coord-mcp#25 · 2026-07-29
 - [x] Control commands are verified as submitted rather than assumed (P1; verified live, busy pane declines with nothing pasted, draft pane refuses with the draft intact) — davidbalzan/agent-coord-mcp#21 · 2026-07-29
