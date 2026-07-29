@@ -274,24 +274,69 @@ async function injectViaTmux(batch) {
   const flushRun = async () => {
     if (run.length === 0) return;
     await pasteAndSubmit(formatBatch(run), true); // peer content: inert bracketed paste
+    await reportReceipts(run); // stamp only AFTER the paste+submit resolves
     run = [];
   };
   for (const m of batch) {
     if (isControl(m)) {
       await flushRun();
       // Verified like the local path: the extra Enters and the capture-pane
-      // check are what make a control command actually run. This pusher writes
-      // no receipts (it has no access to the server's state dir), so the
-      // outcome is logged rather than reported — see the note in submit.mjs.
+      // check are what make a control command actually run. The outcome is
+      // reported back over MCP (report_receipt) so send_command can return
+      // delivery:"confirmed" for a remote agent — before that wire tool
+      // existed this pusher could only log, and a remote control command was
+      // never confirmable no matter how well it went.
       const outcome = await submitControlCommand(m.text.trim());
       if (!outcome.submitted) {
         process.stderr.write(`[coord-pusher] control command NOT submitted: ${outcome.reason}\n`);
       }
+      await reportReceipts([m], outcome);
     } else {
       run.push(m);
     }
   }
   await flushRun();
+}
+
+// Wire counterpart to tmux-pusher's writeReceipts: this pusher cannot append
+// to receipts/<id>.jsonl on the server's filesystem, so it reports each
+// delivery over MCP and the server writes the same receipt line the local
+// path does. `outcome` (control commands only) carries what submit
+// verification actually observed — submitted/verified/reason are forwarded
+// verbatim and OMITTED entirely for ordinary peer batches, because an absent
+// `submitted` means "typed but unverified" and must never be upgraded to a
+// claim of execution this pusher did not make.
+//
+// Best-effort by design: a failed report must not break delivery or crash the
+// inject loop (the message IS in the pane by the time we get here). The
+// sender just times out to delivery:"pending" — the same honest answer an
+// unreported submission always produced. This also covers servers predating
+// the report_receipt tool: the unknown-tool error lands here and is logged.
+async function reportReceipts(msgs, outcome) {
+  for (const m of msgs) {
+    if (!m || !m.id) continue;
+    try {
+      await call(
+        "report_receipt",
+        {
+          agentId: AGENT_ID,
+          id: m.id,
+          ...(m.from !== undefined ? { from: m.from } : {}),
+          control: m.control === true,
+          ...(outcome
+            ? {
+                submitted: outcome.submitted === true,
+                verified: outcome.verified === true,
+                ...(outcome.reason ? { reason: outcome.reason } : {}),
+              }
+            : {}),
+        },
+        { strict: true },
+      );
+    } catch (e) {
+      process.stderr.write(`[coord-pusher] report_receipt for ${m.id} failed: ${e?.message ?? e}\n`);
+    }
+  }
 }
 
 // bracketed=true wraps the paste in bracketed-paste markers (paste-buffer -p) so

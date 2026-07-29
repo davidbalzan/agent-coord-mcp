@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented here.
 
+## [Unreleased]
+
+### Added (P2 — remote pushers get delivery receipts)
+- **`report_receipt` wire tool.** The remote pusher (`scripts/coord-pusher.mjs`) types into a pane on another machine and cannot append to this host's `receipts/<id>.jsonl`, so a control command to a `tmux-push-remote` agent was **never confirmable** — `send_command` waited out `deliveryTimeoutMs` and reported `delivery:"pending"` even when the command demonstrably ran. The pusher now reports each delivery over MCP and the server appends the exact receipt line the local pusher writes, so `waitForReceipt`/`deliveryOutcome` need no remote-specific branch and `send_command` to a remote agent can return `delivery:"confirmed"`.
+- **No assume-success anywhere in the new path.** The receipt forwards what submit verification actually observed (`submitted`/`verified`/`reason` verbatim); ordinary peer-batch receipts omit `submitted` entirely, and the server records the field only when reported — absence stays "typed but unverified", which is still `pending`. Reporting is best-effort by design: a failed wire call (including a server predating the tool) is logged and the sender just times out to the same honest `pending` as before. Identity-gated like `report_transport`: a pusher can only stamp its own agent's receipt file.
+
 ## [0.18.0] — 2026-07-28
 
 Phase 8 — the workflow protocol stops being parsed out of prose. Escalation priority, decision packets, citations, gate verdicts and retention were all carried as case-sensitive prefixes at byte 0 of a message body, re-parsed independently by the UI. Every field below is optional and `text` stays required, so a v1 agent that has never heard of `record` behaves byte-identically — which is what let v1 and v2 agents share a live bus throughout, instead of needing a flag day.

@@ -820,6 +820,54 @@ export async function clearTransportTool(args: { agentId: string }) {
   return { ok: true, removed };
 }
 
+export const reportReceiptSchema = {
+  agentId: z.string().min(1),
+  id: z.string().min(1),
+  from: z.string().optional(),
+  control: z.boolean().optional(),
+  submitted: z.boolean().optional(),
+  verified: z.boolean().optional(),
+  reason: z.string().optional(),
+};
+
+// Wire-callable counterpart to the local pusher's receipt stamp (writeReceipts
+// in hooks/tmux-pusher.mjs). A remote pusher types into a pane on ANOTHER
+// machine and cannot append to this host's receipts/<id>.jsonl, so before this
+// existed a control command to a tmux-push-remote agent was never confirmable:
+// send_command waited out deliveryTimeoutMs and reported delivery:"pending"
+// even when the command demonstrably ran.
+//
+// The receipt is appended in the exact shape the local pusher writes, so
+// waitForReceipt/deliveryOutcome need no remote-specific branch. `submitted`
+// is recorded only when the caller reports it — absence means "typed but
+// unverified", which deliveryOutcome refuses to call confirmed. The server
+// cannot see the remote pane, so it stores what the pusher observed and
+// nothing more; defaulting the field here would recreate assume-success one
+// layer up. Trust matches report_transport: the identity gate binds agentId
+// to the session, so a pusher can only stamp its own agent's receipt file.
+export async function reportReceiptTool(args: {
+  agentId: string;
+  id: string;
+  from?: string;
+  control?: boolean;
+  submitted?: boolean;
+  verified?: boolean;
+  reason?: string;
+}) {
+  const receipt: Receipt & { agentId: string; from?: string } = {
+    id: args.id,
+    agentId: args.agentId,
+    ts: Date.now(),
+    ...(args.from !== undefined ? { from: args.from } : {}),
+    control: args.control === true,
+    ...(args.submitted !== undefined ? { submitted: args.submitted } : {}),
+    ...(args.verified !== undefined ? { verified: args.verified } : {}),
+    ...(args.reason !== undefined ? { reason: args.reason } : {}),
+  };
+  await appendJsonl(receiptFile(args.agentId), receipt);
+  return { ok: true, receipt };
+}
+
 // ---------- doctor (bus-wide health check) ----------
 
 type DoctorLevel = "ok" | "warn" | "error";
