@@ -29,4 +29,4 @@ those glyphs; an ASCII hyphen/period renders the panel empty.
 - [x] Delivery tiers + digest batching in the pusher (v0.12.0) — davidbalzan/agent-coord-mcp#4 · 2026-07-03
 - [x] Liveness ping/ack — server-side, zero model tokens (v0.11.0) — davidbalzan/agent-coord-mcp#3 · 2026-07-03
 - [x] Status-stream recency window (v0.10.1) — davidbalzan/agent-coord-mcp#2 · 2026-07-03
-- [x] Self-dependency removed from package.json (direct to main) — davidbalzan/agent-coord-mcp@3bce3ce · 2026-06-12
+- [x] Self-dependency removed from package.json (direct to main; the queue item calling it "recurring" was closed 2026-07-29 as stale: `git log -S` finds exactly two commits touching that line ever, introduced by an `npm audit fix` whose message claimed lockfile-only, and 83 commits later it has not returned; the residual risk is filed as the manifest-diff class, not this line) — davidbalzan/agent-coord-mcp@3bce3ce · 2026-06-12
