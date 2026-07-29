@@ -63,7 +63,7 @@ import {
   unlinkSync,
   watch,
 } from "node:fs";
-import { statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -141,12 +141,26 @@ const TRANSPORT_FILE = path.join(ROOT, "transports", `${SAFE_ID}.json`);
 // entering any agent's context. Mirrors RECEIPTS_DIR in src/store.ts.
 const RECEIPTS_FILE = path.join(ROOT, "receipts", `${SAFE_ID}.jsonl`);
 const BUFFER_NAME = `coord-${SAFE_ID}`;
-// mtime of the script this process actually loaded, sampled once at startup —
-// an upgrade to the file on disk afterwards leaves this value behind, which is
-// exactly what doctor's stale-pusher-script check compares against.
+// Newest mtime across this script AND its sibling hooks modules, sampled once
+// at startup — an upgrade to any of them afterwards leaves this value behind,
+// which is exactly what doctor's stale-pusher-script check compares against.
+// The entry file alone is not enough: control submission lives in submit.mjs
+// and tiering in tier.mjs/roles.mjs, so a fix touching only an import would
+// leave a single-file stamp unchanged and a still-running pusher on the old
+// code would read as fresh. Scanning the whole dir over-covers (a hooks file
+// we never import can flag us stale) — that is the safe direction: a spurious
+// re-attach is loud and cheap, a false green silently invalidates the rollout
+// verification of every pusher-side fix.
 const SCRIPT_MTIME = (() => {
   try {
-    return statSync(fileURLToPath(import.meta.url)).mtimeMs;
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    let newest;
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith(".mjs")) continue;
+      const m = statSync(path.join(dir, f)).mtimeMs;
+      if (newest === undefined || m > newest) newest = m;
+    }
+    return newest;
   } catch {
     return undefined;
   }
@@ -538,8 +552,8 @@ function writeTransportMarker() {
     // MUST be included: attach_agent stamps this too, but this write happens
     // afterwards and would otherwise clobber it — and doctor SKIPS markers
     // without it (pre-v0.8.2 shape), so dropping it silently disabled the
-    // stale-pusher-script check for every local pusher. Our own mtime is the
-    // more truthful value anyway: it is the script THIS process loaded.
+    // stale-pusher-script check for every local pusher. Our own stamp is the
+    // more truthful value anyway: it reflects the code THIS process loaded.
     scriptMtime: SCRIPT_MTIME,
   };
   const tmp = TRANSPORT_FILE + ".tmp";

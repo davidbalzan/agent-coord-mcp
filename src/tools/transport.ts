@@ -554,11 +554,10 @@ export async function attachAgentTool(args: {
 
   // Write pid file (for scripts) and transport marker (for list_agents).
   await fsp.writeFile(pidFile(args.agentId, "pusher"), String(pid), "utf8");
-  // Stamp the script's mtime so doctor() can flag a stale daemon if it
-  // outlives a later upgrade of the on-disk script (see v0.8.1 → v0.8.2 bug
+  // Stamp the pusher source's freshness so doctor() can flag a stale daemon if
+  // it outlives a later upgrade of the on-disk code (see v0.8.1 → v0.8.2 bug
   // report: control commands silently dropped by pre-v0.8 in-memory code).
-  let scriptMtime: number | undefined;
-  try { scriptMtime = (await fsp.stat(pusher)).mtimeMs; } catch { /* non-fatal */ }
+  const scriptMtime = await newestPusherSourceMtime();
   const marker: TransportMarker = {
     agentId: args.agentId,
     transport: "tmux-push",
@@ -640,6 +639,28 @@ function resolvePusherPath(): string {
   // transport.js (compiled) lives in dist/tools/; pusher lives in hooks/ at repo root.
   const here = path.dirname(fileURLToPath(import.meta.url));
   return path.resolve(here, "..", "..", "hooks", "tmux-pusher.mjs");
+}
+
+// Freshness basis for the stale-pusher-script mechanism: the newest mtime
+// across the pusher's source dir (hooks/*.mjs), NOT just the entry file. The
+// pusher imports submit.mjs / tier.mjs / roles.mjs, so a fix touching only an
+// import (the #21/#25 control-submit fixes did) leaves tmux-pusher.mjs's own
+// mtime unchanged — a single-file stamp/compare reports ok on a pusher running
+// exactly the code the fix replaced. Used by both the attach-time stamp and
+// doctor's on-disk comparison so the two sides can never drift apart.
+async function newestPusherSourceMtime(): Promise<number | undefined> {
+  try {
+    const dir = path.dirname(resolvePusherPath());
+    let newest: number | undefined;
+    for (const f of await fsp.readdir(dir)) {
+      if (!f.endsWith(".mjs")) continue;
+      const m = (await fsp.stat(path.join(dir, f))).mtimeMs;
+      if (newest === undefined || m > newest) newest = m;
+    }
+    return newest;
+  } catch {
+    return undefined; // not packaged? non-fatal — callers skip the check
+  }
 }
 
 // ---------- status / whoami ----------
@@ -901,12 +922,14 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
   //     Pre-v0.8.2 pushers had no `control:true` awareness and silently
   //     dropped /clear /compact at the slash-guard — ack:true with no
   //     keystrokes ever reaching the pane. Comparing the marker's stamped
-  //     scriptMtime against the on-disk script's current mtime catches it.
+  //     scriptMtime against the newest on-disk mtime across hooks/*.mjs
+  //     catches it — the whole module graph, not just the entry file, because
+  //     the control-submit logic lives in submit.mjs and a fix landing there
+  //     alone leaves tmux-pusher.mjs's mtime (and a single-file stamp) intact.
   //     Local tmux-push only — for tmux-push-remote the script lives on a
   //     different host so we can't stat it from here.
   {
-    let localPusherMtime: number | undefined;
-    try { localPusherMtime = (await fsp.stat(resolvePusherPath())).mtimeMs; } catch { /* not packaged? skip */ }
+    const localPusherMtime = await newestPusherSourceMtime();
     const stale: string[] = [];
     for (const fname of await listTransportFiles()) {
       const file = path.join(TRANSPORT_DIR, fname);
