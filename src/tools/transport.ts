@@ -983,12 +983,22 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
   {
     const localPusherMtime = newestPusherSourceMtime();
     const stale: string[] = [];
+    const unverifiable: string[] = [];
     for (const fname of await listTransportFiles()) {
       const file = path.join(TRANSPORT_DIR, fname);
       const marker = await readJson<TransportMarker | null>(file, null);
       if (!marker || !isMarkerLive(marker, reg, now)) continue;
-      if (marker.transport !== "tmux-push") continue; // remote = can't verify
-      if (marker.scriptMtime === undefined) continue; // pre-v0.8.2 marker, no info
+      if (marker.transport !== "tmux-push") continue; // remote = can't verify (documented limit: can't stat another host)
+      if (marker.scriptMtime === undefined) {
+        // ABSENCE IS NOT EXEMPTION. The field's own writer once dropped it,
+        // and the silent skip here meant the check was disabled by the very
+        // thing it monitors — a live pusher we cannot verify is a warn, not
+        // an ok (credit agent-coordination-david-dev). Same flip, same
+        // commit, as serverBuildMtime below: the two checks must never
+        // disagree about what absence means.
+        unverifiable.push(`${marker.agentId} (pid ${marker.pid}, no scriptMtime stamp — cannot verify; detach_agent + attach_agent to re-stamp)`);
+        continue;
+      }
       if (localPusherMtime === undefined) continue;
       if (marker.scriptMtime < localPusherMtime - 1) { // -1ms slack for fs mtime rounding
         const loaded = new Date(marker.scriptMtime).toISOString();
@@ -996,14 +1006,15 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
         stale.push(`${marker.agentId} (pid ${marker.pid}, loaded ${loaded}, on-disk now ${ondisk})`);
       }
     }
+    const bad = [...stale, ...unverifiable];
     findings.push({
       check: "stale-pusher-script",
-      level: stale.length ? "warn" : "ok",
-      detail: stale.length
-        ? `${stale.length} attached pusher(s) running pre-upgrade code — control commands (/clear, /compact) may be silently dropped. Run detach_agent + attach_agent for each, or have the agent relaunch.`
+      level: bad.length ? "warn" : "ok",
+      detail: bad.length
+        ? `${stale.length} attached pusher(s) running pre-upgrade code and ${unverifiable.length} whose freshness cannot be verified (no stamp) — control commands (/clear, /compact) may be silently dropped. Run detach_agent + attach_agent for each, or have the agent relaunch.`
         : "all attached pushers are running the current on-disk script",
       fixable: false,
-      items: stale.length ? stale : undefined,
+      items: bad.length ? bad : undefined,
     });
   }
 
@@ -1062,17 +1073,26 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
   {
     const onDisk = onDiskBuildMtime();
     const outdated: string[] = [];
+    const unverifiable: string[] = [];
     for (const fname of await listTransportFiles()) {
       const file = path.join(TRANSPORT_DIR, fname);
       const marker = await readJson<TransportMarker | null>(file, null);
       if (!marker || !isMarkerLive(marker, reg, now)) continue;
-      if (marker.transport !== "tmux-push") continue; // remote = can't verify
-      // Absent field = pre-upgrade marker: SKIP, deliberately mirroring the
-      // scriptMtime semantics in 1b. Two checks holding different opinions
-      // about the same absence would be harder to see than either behaviour
-      // alone — the queued P2 ("missing scriptMtime is a skip, not a warn")
-      // flips BOTH together. Do not "fix" one half here.
-      if (marker.serverBuildMtime === undefined) continue;
+      if (marker.transport !== "tmux-push") continue; // remote = can't verify (documented limit: can't stat another host)
+      if (marker.serverBuildMtime === undefined) {
+        // ABSENCE IS NOT EXEMPTION — flipped in the same commit as the
+        // scriptMtime absence above, so the two checks can never disagree
+        // about what a missing stamp means. An unstamped marker was written
+        // by a pre-provenance server (or by hand): precisely the population
+        // this check exists to police, and the one it must not exempt.
+        // Transition is deliberately correct-and-loud: after the upgrade,
+        // every pre-existing marker warns at once, each cleared by a session
+        // restart + re-attach — the burst is also the only external view of
+        // which sessions still run pre-provenance servers, since a stale
+        // server cannot self-report (see 1b²).
+        unverifiable.push(`${marker.agentId} (no serverBuildMtime stamp — stamped by a pre-provenance server; restart that session, then detach_agent + attach_agent)`);
+        continue;
+      }
       if (onDisk === undefined) continue;
       if (marker.serverBuildMtime < onDisk - 1) {
         const stamped = new Date(marker.serverBuildMtime).toISOString();
@@ -1080,14 +1100,15 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
         outdated.push(`${marker.agentId} (stamped by server build ${stamped}, on-disk build ${current})`);
       }
     }
+    const bad = [...outdated, ...unverifiable];
     findings.push({
       check: "marker-server-provenance",
-      level: outdated.length ? "warn" : "ok",
-      detail: outdated.length
-        ? `${outdated.length} transport marker(s) stamped by a server build older than dist/ — the stamping/spawn logic (freshness basis, pusher argv) predates the current code. Restart that agent's session, then detach_agent + attach_agent.`
+      level: bad.length ? "warn" : "ok",
+      detail: bad.length
+        ? `${outdated.length} transport marker(s) stamped by a server build older than dist/ and ${unverifiable.length} with no provenance stamp at all — the stamping/spawn logic (freshness basis, pusher argv) predates or cannot be tied to the current code. Restart that agent's session, then detach_agent + attach_agent.`
         : "all local transport markers were stamped by the current server build",
       fixable: false,
-      items: outdated.length ? outdated : undefined,
+      items: bad.length ? bad : undefined,
     });
   }
 
