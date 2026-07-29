@@ -16,6 +16,7 @@ those glyphs; an ASCII hyphen/period renders the panel empty.
 
 ## Done
 
+- [x] The doctor suite cancelled itself on a missed exit event (the 25% gate flake; no signal involved, an event-loop drain) — davidbalzan/agent-coord-mcp#31 · 2026-07-29
 - [x] The remote pusher reports delivery receipts over the wire (report_receipt; remote control commands are confirmable for the first time) — davidbalzan/agent-coord-mcp#27 · 2026-07-29
 - [x] Pusher freshness covers the loaded module graph; pattern kills scoped per agent — davidbalzan/agent-coord-mcp#28 · 2026-07-29
 - [x] The submit verifier reads the input line, not a tail window (P1b false negative; verified live, an idle pane with populated scrollback confirms twice, including with `/compact` already echoed into the transcript) — davidbalzan/agent-coord-mcp#25 · 2026-07-29
