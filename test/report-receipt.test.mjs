@@ -156,13 +156,21 @@ const PUSHER_SRC = readFileSync(
 
 // Same extraction pattern as coord-pusher-strict-call.test.mjs: the module
 // registers against a real MCP server on import, so the function under test
-// is evaluated against a fake `call` instead.
-function makeReportReceipts(call) {
+// is evaluated against a fake `call` instead. `scriptMtime` is the pusher's
+// module-level build-identity stamp — injected here because the extracted
+// function closes over it in production.
+function makeReportReceipts(call, scriptMtime) {
   const re = /^async function reportReceipts\([^]*?^}/m;
   const m = PUSHER_SRC.match(re);
   assert.ok(m, "could not find reportReceipts in coord-pusher.mjs");
-  const factory = new Function("call", "AGENT_ID", "process", `${m[0]}\nreturn reportReceipts;`);
-  return factory(call, "wire-agent", process);
+  const factory = new Function(
+    "call",
+    "AGENT_ID",
+    "process",
+    "scriptMtime",
+    `${m[0]}\nreturn reportReceipts;`,
+  );
+  return factory(call, "wire-agent", process, scriptMtime);
 }
 
 test("coord-pusher forwards the control outcome and omits it for peer batches", async () => {
@@ -198,6 +206,29 @@ test("coord-pusher forwards the control outcome and omits it for peer batches", 
   }
 });
 
+test("coord-pusher forwards its build identity on every receipt — and omits it when unknown", async () => {
+  // An absent stamp must go over the wire as ABSENCE, not null/0 — the server
+  // records only what was reported, and deliveryOutcome reads the absence as
+  // "unknown provenance", never as fresh.
+  const calls = [];
+  const withStamp = makeReportReceipts(async (name, args) => {
+    calls.push(args);
+    return { ok: true };
+  }, 777);
+  await withStamp([{ id: "s1", from: "lead", control: true, text: "/clear" }], {
+    submitted: true,
+    verified: true,
+  });
+  assert.equal(calls[0].scriptMtime, 777);
+
+  const noStamp = makeReportReceipts(async (name, args) => {
+    calls.push(args);
+    return { ok: true };
+  }, undefined);
+  await noStamp([{ id: "s2", from: "peer", text: "hi" }]);
+  assert.ok(!("scriptMtime" in calls[1]), "unknown build identity must be omitted, never defaulted");
+});
+
 test("a failed report_receipt is logged, never thrown — the message is already in the pane", async () => {
   const reportReceipts = makeReportReceipts(async () => {
     throw new Error("Unknown tool: report_receipt"); // server predating the tool
@@ -208,6 +239,220 @@ test("a failed report_receipt is logged, never thrown — the message is already
     submitted: true,
     verified: true,
   });
+});
+
+// ---------- 4. receipt build identity (provenance — honesty, not security) ----------
+//
+// A receipt now carries the reporting pusher's build identity: the same
+// module-graph mtime stamp the transport marker holds. A lying pusher defeats
+// it, exactly like report_transport — the value is that a "confirmed" can be
+// tied to the code that did the confirming, and a confirm issued by
+// pre-upgrade verification logic says so instead of reading identically to a
+// current one.
+
+test("report_receipt stores the reporter's scriptMtime and never invents one", async () => {
+  await t.reportReceiptTool({ agentId: "rr-agent", id: "bi-1", control: true, submitted: true, scriptMtime: 12345 });
+  await t.reportReceiptTool({ agentId: "rr-agent", id: "bi-2", control: true, submitted: true });
+  const receipts = await store.readJsonl(store.receiptFile("rr-agent"));
+  assert.equal(receipts.find((x) => x.id === "bi-1").scriptMtime, 12345);
+  assert.ok(
+    !("scriptMtime" in receipts.find((x) => x.id === "bi-2")),
+    "an unreported stamp stays absent — defaulting it would be assume-fresh, the twin of assume-success",
+  );
+});
+
+test("a confirmed receipt from an outdated pusher stays confirmed — with a note naming the stale code", async () => {
+  const { deliveryOutcome } = await import("../dist/tools/transport.js");
+  const at = Date.now();
+  const basis = at; // stands in for newestPusherSourceMtime()
+
+  const stale = deliveryOutcome(
+    "a",
+    { id: "1", ts: at, control: true, submitted: true, scriptMtime: basis - 60_000 },
+    8000,
+    basis,
+  );
+  assert.equal(stale.delivery, "confirmed", "provenance must never downgrade the verdict — the command ran");
+  assert.equal(stale.reason, undefined);
+  assert.match(stale.note, /loaded its code at .* on-disk pusher source is newer/);
+  assert.match(stale.note, /re-attach/, "tell the operator how to fix it");
+
+  const fresh = deliveryOutcome(
+    "a",
+    { id: "1", ts: at, control: true, submitted: true, scriptMtime: basis },
+    8000,
+    basis,
+  );
+  assert.equal(fresh.delivery, "confirmed");
+  assert.equal(fresh.note, undefined, "a current pusher earns an unannotated confirm");
+
+  // Same -1ms slack as doctor's stale-pusher-script: fs mtime rounding must
+  // not manufacture staleness.
+  const slack = deliveryOutcome(
+    "a",
+    { id: "1", ts: at, control: true, submitted: true, scriptMtime: basis - 1 },
+    8000,
+    basis,
+  );
+  assert.equal(slack.note, undefined);
+});
+
+test("an absent build-identity stamp reads as UNKNOWN, never as fresh", async () => {
+  // Same ruling as doctor's absence-is-not-exemption flip: the population
+  // without a stamp is precisely the one the check exists to see.
+  const { deliveryOutcome } = await import("../dist/tools/transport.js");
+  const at = Date.now();
+
+  const noStamp = deliveryOutcome("a", { id: "1", ts: at, control: true, submitted: true }, 8000, at);
+  assert.equal(noStamp.delivery, "confirmed");
+  assert.match(noStamp.note, /no build-identity stamp/);
+  assert.match(noStamp.note, /re-attach/);
+
+  // The absence note must not depend on an on-disk basis being available — an
+  // unstattable hooks dir silencing it would be the check disabled by its own
+  // precondition, the recurring defect shape this repo keeps hitting.
+  const noBasis = deliveryOutcome("a", { id: "1", ts: at, control: true, submitted: true }, 8000, undefined);
+  assert.match(noBasis.note, /no build-identity stamp/);
+
+  // A stamped receipt with no basis to compare against: nothing truthful to
+  // say, so nothing is said (mirrors doctor skipping when it cannot stat).
+  const stampedNoBasis = deliveryOutcome(
+    "a",
+    { id: "1", ts: at, control: true, submitted: true, scriptMtime: 1 },
+    8000,
+    undefined,
+  );
+  assert.equal(stampedNoBasis.note, undefined);
+
+  // Pending verdicts are provenance-free: `reason` semantics are untouched.
+  const pending = deliveryOutcome(
+    "a",
+    { id: "1", ts: at, control: true, submitted: false, reason: "still busy", scriptMtime: 1 },
+    8000,
+    at,
+  );
+  assert.equal(pending.delivery, "pending");
+  assert.equal(pending.reason, "still busy");
+  assert.equal(pending.note, undefined);
+});
+
+test("send_command surfaces a stale-reporter confirm as confirmed WITH a warning", async () => {
+  await t.registerTool({ agentId: "bi-lead" });
+  await t.registerTool({ agentId: "bi-agent" });
+  await t.reportTransportTool({ agentId: "bi-agent", transport: "tmux-push-remote", host: "test" });
+
+  // The real newestPusherSourceMtime() basis is the repo's hooks/*.mjs —
+  // checked-out files whose mtimes are in the past, so a 1970 stamp is
+  // deterministically stale and a now+60s stamp deterministically fresh.
+  const runOnce = async (cmd, scriptMtime) => {
+    const fake = (async () => {
+      for (let i = 0; i < 100; i++) {
+        const inbox = await store.readJsonl(store.inboxFile("bi-agent"));
+        const ctrl = inbox.find((m) => m.text === cmd && m.control);
+        if (ctrl) {
+          await t.reportReceiptTool({
+            agentId: "bi-agent",
+            id: ctrl.id,
+            control: true,
+            submitted: true,
+            verified: true,
+            scriptMtime,
+          });
+          return;
+        }
+        await new Promise((res) => setTimeout(res, 20));
+      }
+    })();
+    const r = await t.sendCommandTool({
+      from: "bi-lead",
+      to: "bi-agent",
+      command: cmd,
+      reminderMs: 0,
+      deliveryTimeoutMs: 4000,
+    });
+    await fake;
+    return r;
+  };
+
+  const stale = await runOnce("/clear", 1000);
+  assert.equal(stale.delivery, "confirmed");
+  assert.equal(stale.confirmed, true, "the warning must ride WITH the confirm, not replace it");
+  assert.match(stale.warning, /on-disk pusher source is newer/);
+
+  const fresh = await runOnce("/compact", Date.now() + 60_000);
+  assert.equal(fresh.delivery, "confirmed");
+  assert.equal(fresh.confirmed, true);
+  assert.equal(fresh.warning, undefined, "a current reporter earns an unannotated confirm");
+});
+
+// ---------- 5. both pusher ends actually stamp ----------
+
+const LOCAL_PUSHER_SRC = readFileSync(
+  fileURLToPath(new URL("../hooks/tmux-pusher.mjs", import.meta.url)),
+  "utf8",
+);
+
+test("tmux-pusher's writeReceipts stamps SCRIPT_MTIME — and omits it when unknown", () => {
+  // Extract-and-evaluate, same pattern as makeReportReceipts: the receipt
+  // line's shape is behavior, not just source text.
+  const m = LOCAL_PUSHER_SRC.match(/^function writeReceipts\([^]*?^}/m);
+  assert.ok(m, "could not find writeReceipts in tmux-pusher.mjs");
+  const written = [];
+  const factory = new Function(
+    "appendFileSync",
+    "RECEIPTS_FILE",
+    "AGENT_ID",
+    "SCRIPT_MTIME",
+    "process",
+    `${m[0]}\nreturn writeReceipts;`,
+  );
+
+  const withStamp = factory((_f, data) => written.push(data), "rcpt", "local-agent", 4242, process);
+  withStamp([{ id: "w1", from: "lead", control: true }], { submitted: true, verified: true });
+  const rec = JSON.parse(written[0].trim());
+  assert.equal(rec.scriptMtime, 4242, "the module-graph stamp must ride on every local receipt");
+  assert.equal(rec.submitted, true);
+
+  const noStamp = factory((_f, data) => written.push(data), "rcpt", "local-agent", undefined, process);
+  noStamp([{ id: "w2", from: "peer" }]);
+  assert.ok(
+    !("scriptMtime" in JSON.parse(written[1].trim())),
+    "an unknown stamp must be omitted — absence reads as UNKNOWN downstream, never fresh",
+  );
+});
+
+test("coord-pusher's stamp covers its module graph, not just the entry file", () => {
+  // Source-level, same reasoning as the SCRIPT_MTIME lock in tier.test.mjs:
+  // the paste/submit pipeline is imported from ../hooks/submit.mjs, so an
+  // entry-only stat reads "fresh" on a pusher whose imports were replaced
+  // after it spawned — the false green #28 removed locally, recreated across
+  // the wire. This initializer feeds BOTH report_transport and every receipt.
+  const body = PUSHER_SRC.match(/const scriptMtime = await \(async \(\) => \{([\s\S]*?)\n\}\)\(\);/);
+  assert.ok(body, "scriptMtime initializer not found in coord-pusher.mjs");
+  assert.match(body[1], /import\.meta\.url/, "must measure the code actually running");
+  assert.match(
+    body[1],
+    /"hooks"/,
+    "must reach into the hooks dir the pipeline is imported from",
+  );
+  // Must match the CALL on the hooks dir, not merely the import of
+  // readdirSync — a mutation that kept the import but dropped the scan loop
+  // slipped past the looser /readdirSync/ form of this lock.
+  assert.match(
+    body[1],
+    /readdirSync\(hooksDir\)/,
+    "stamp must scan the hooks dir (the loaded module graph), not stat one file",
+  );
+  // And the marker side must keep riding the same stamp: report_transport
+  // and report_receipt sharing one value is what makes "the pusher that
+  // attached" and "the pusher that confirmed" the same identity.
+  // Anchored on the adjacent `since:` line: a lazy any-gap match would skip
+  // ahead to reportReceipts' own spread and pass with the marker stamp gone.
+  assert.match(
+    PUSHER_SRC,
+    /"report_transport",[^]*?since: Date\.now\(\),\s*\.\.\.\(scriptMtime !== undefined \? \{ scriptMtime \} : \{\}\)/,
+    "report_transport must carry the same build-identity stamp",
+  );
 });
 
 test("injectViaTmux reports a receipt on both the control and the peer-batch path", () => {
