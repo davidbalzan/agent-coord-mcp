@@ -198,7 +198,108 @@ test("placeholder hints are not drafts", () => {
   assert.equal(submit.readPaneState("❯ Press up to edit queued messages\n  ⏸ plan").draft, "");
   assert.equal(submit.readPaneState("❯ \n  ⏸ plan").draft, "");
   assert.equal(submit.readPaneState("❯ real text\n  ⏸ plan").draft, "real text");
-  assert.deepEqual(submit.readPaneState(null), { busy: null, draft: null }, "unknown stays unknown");
+  assert.deepEqual(
+    submit.readPaneState(null),
+    { busy: null, draft: null, ghost: null, styledInputLine: null },
+    "unknown stays unknown",
+  );
+});
+
+// ---------- ghost text: chrome in the input box is not a draft ----------
+//
+// Byte-exact input lines from live captures (capture-pane -e, pane %4,
+// 2026-07-29 — the investigation that found this guard refusing on chrome):
+//
+//   GHOST_LINE — an IDLE Claude Code session. The phrase is the TUI's
+//   session-derived SUGGESTED next prompt, rendered dim (SGR 2) inside the
+//   input box. Nobody typed it; the first keystroke replaces it; it never
+//   reaches scrollback. Three live refusals quoted exactly this phrase as an
+//   "unsent draft" while the input was empty, making /clear and /compact
+//   undeliverable fleet-wide.
+//
+//   DRAFT_LINE — the controlled counter-experiment: "drafttest123" literally
+//   typed via send-keys (then erased). Real typed text renders with NO dim
+//   attribute.
+const GHOST_LINE = "\u001b[39m❯\u00a0\u001b[2mwait for the gate verdict\u001b[0m";
+const DRAFT_LINE = "\u001b[38;5;246m❯\u00a0\u001b[39mdrafttest123";
+const styledPane = (inputLine) =>
+  ["some history", "────────", inputLine, "────────", "  ⏸ plan mode on · PR #32"].join("\n");
+
+test("the TUI's ghost suggestion is chrome, not a draft — the control command DELIVERS", async () => {
+  const { deps, calls } = fakeTmux({ panes: [styledPane(GHOST_LINE), styledPane(GHOST_LINE)] });
+  const r = await submit.submitControl(deps, "/compact");
+  assert.equal(r.submitted, true, "refusing on ghost text is the defect this fixes");
+  assert.equal(r.verified, true);
+  assert.ok(
+    calls.some((c) => c.startsWith("capture-pane -e")),
+    "the guard must capture WITH styling — a plain capture flattens ghost and draft to identical bytes",
+  );
+});
+
+test("a REAL typed draft still refuses — the reason quotes the styled line and names the rule", async () => {
+  const { deps, calls } = fakeTmux({ panes: [styledPane(DRAFT_LINE)] });
+  const r = await submit.submitControl(deps, "/compact");
+  assert.equal(r.submitted, false);
+  assert.equal(r.pasted, false);
+  assert.match(r.reason, /"drafttest123/, "the draft itself is quoted");
+  assert.match(r.reason, /Rule: non-dim/, "the rule that fired is named");
+  assert.match(r.reason, /AGENT_COORD_GHOST_TEXT_SGR/, "the override is named");
+  assert.match(r.reason, /Styled input line:/, "the styled capture is quoted so the next false positive self-diagnoses");
+  assert.ok(!calls.some((c) => c.includes("paste-buffer")), "never append a control command to a draft");
+});
+
+test("typed text alongside a ghost continuation: the draft is the typed part only", async () => {
+  // Mixed line — typed "wait", ghost continuation completing the suggestion.
+  const MIXED = "❯\u00a0wait\u001b[2m for the gate verdict\u001b[0m";
+  const st = submit.readPaneState(styledPane(MIXED));
+  assert.equal(st.draft, "wait");
+  assert.equal(st.ghost, "for the gate verdict");
+
+  const { deps } = fakeTmux({ panes: [styledPane(MIXED)] });
+  const r = await submit.submitControl(deps, "/clear");
+  assert.equal(r.submitted, false, "the typed part is a real draft");
+  assert.match(r.reason, /"wait"/, "quotes what was typed, not the chrome");
+});
+
+test("unknown styling fails toward refusing — never toward delivering", async () => {
+  // A harness that styles its suggestion some other way (italic here) is
+  // indistinguishable from a draft, and the asymmetry decides: a false
+  // refusal costs one retryable command; a false delivery types into
+  // someone's real unsent text. The fix for such a harness is teaching
+  // AGENT_COORD_GHOST_TEXT_SGR its rendering, not loosening the guard.
+  const ITALIC = "❯\u00a0\u001b[3msome suggestion styled in a way we do not know\u001b[0m";
+  assert.equal(submit.readPaneState(styledPane(ITALIC)).draft, "some suggestion styled in a way we do not know");
+  const { deps } = fakeTmux({ panes: [styledPane(ITALIC)] });
+  const r = await submit.submitControl(deps, "/clear");
+  assert.equal(r.submitted, false);
+});
+
+test("partitionStyledLine: the SGR state machine's load-bearing cases", () => {
+  // Dim opened, then explicitly cleared by 22 ("normal intensity").
+  assert.deepEqual(submit.partitionStyledLine("\u001b[2mghost\u001b[22mreal"), { real: "real", ghost: "ghost" });
+  // Compound SGR: dim riding with a color in one sequence.
+  assert.deepEqual(submit.partitionStyledLine("\u001b[2;38;5;246mg\u001b[0mr"), { real: "r", ghost: "g" });
+  // A bare 2 INSIDE an extended-color spec is a palette index, not dim.
+  assert.deepEqual(submit.partitionStyledLine("\u001b[38;5;2mplain\u001b[0m"), { real: "plain", ghost: "" });
+  // Empty SGR is a full reset.
+  assert.deepEqual(submit.partitionStyledLine("\u001b[2mg\u001b[mr"), { real: "r", ghost: "g" });
+});
+
+test("stripAnsi removes CSI and OSC-8 hyperlinks, keeps the text", () => {
+  // Shape taken from the live status line: an OSC-8 wrapped PR link.
+  const linked = "\u001b[4m\u001b[38;5;220m\u001b]8;id=x;https://github.com/x/y/pull/32\u001b\\#32\u001b[0m\u001b]8;;\u001b\\ done";
+  assert.equal(submit.stripAnsi(linked), "#32 done");
+});
+
+test("the verifier is not fooled by a ghost that contains the payload", () => {
+  // The TUI can suggest the very command that just ran. A plain capture reads
+  // that as "still in the input" → false non-submit → the retry path types
+  // extra Enters into a live pane on the strength of chrome.
+  const GHOST_CMD = "❯\u00a0\u001b[2m/compact\u001b[0m";
+  assert.equal(submit.stillInInput(styledPane(GHOST_CMD), "/compact"), false);
+  // …while the command genuinely still sitting there (non-dim) reads true.
+  const REAL_CMD = "❯\u00a0/compact";
+  assert.equal(submit.stillInInput(styledPane(REAL_CMD), "/compact"), true);
 });
 
 // ---------- 3. truthful receipts ----------
@@ -227,6 +328,33 @@ test("send_command reports confirmed ONLY for a verified submission", async () =
   assert.equal(none.delivery, "pending");
   assert.match(none.reason, /no delivery receipt/);
   assert.ok(t.sendCommandTool, "send_command still exists with its existing signature");
+});
+
+// ---------- the -e lock: the capture must keep the style layer ----------
+
+test("every pane capture in submit.mjs carries -e — the flag the ghost fix depends on", () => {
+  // Stripping -e from either capture site left the suite GREEN when the gate
+  // tried it: the parser tests inject styled text below the capture, so the
+  // one flag the whole fix rides on had no witness. That is the scriptMtime
+  // family of failure — the subject of a check silently disabling it. Source
+  // lock, same idiom as the pusher drift-locks: count the sites AND assert
+  // the flag per site, so a new capture call added without -e trips it too.
+  const src = readFileSync(path.join(REPO, "hooks/submit.mjs"), "utf8");
+  const sites = src.match(/run\(\[\s*"capture-pane"[^\]]*\]/g) ?? [];
+  assert.equal(
+    sites.length,
+    1,
+    "expected exactly ONE capture call site (captureStyled) — a moved or added site must be re-counted here and carry -e",
+  );
+  for (const s of sites) {
+    assert.ok(s.includes('"-e"'), `capture site discards the style layer the ghost fix depends on: ${s}`);
+  }
+  // …and both consumers (the guard and the verifier) route through it:
+  assert.equal(
+    (src.match(/captureStyled\(/g) ?? []).length,
+    3,
+    "definition + two call sites (submitControl guard, pollUntilGone verifier)",
+  );
 });
 
 // ---------- 4. both pushers, one implementation ----------

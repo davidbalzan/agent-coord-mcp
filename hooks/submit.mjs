@@ -64,6 +64,27 @@ export const PROMPT_PATTERN = () => envStr("AGENT_COORD_PROMPT_PATTERN", "^\\s*[
 export const PLACEHOLDER_PATTERN = () =>
   envStr("AGENT_COORD_PLACEHOLDER_PATTERN", '^(Try ".*"|Press up to edit queued messages|)$');
 
+// GHOST TEXT — the ONE place the rendering assumption lives.
+//
+// Claude Code renders a session-derived SUGGESTED next prompt ("ghost text")
+// inside the input box while idle: `❯ ` + ESC[2m + suggestion + ESC[0m. It is
+// chrome, not content: nobody typed it, the first keystroke replaces it, and
+// it never reaches scrollback. To a plain `capture-pane` it is byte-for-byte
+// indistinguishable from a real draft — which made this guard refuse control
+// commands against EMPTY inputs fleet-wide (2026-07-29: three live refusals,
+// every quoted "draft" was the suggestion; /clear and /compact were
+// undeliverable to exactly the agents they were built for). The placeholder
+// regex above cannot help: the suggestion is derived from session state, so
+// its space of values is unbounded — no content pattern can enumerate it.
+// Styling is the only channel that carries the distinction, hence
+// `capture-pane -e` below.
+//
+// SGR 2 (dim/faint) is Claude Code's CURRENT rendering of the suggestion — a
+// per-harness rendering detail, not a protocol guarantee. If a harness styles
+// suggestions differently, or a release changes it, override or edit HERE and
+// nowhere else.
+export const GHOST_TEXT_SGR = () => envStr("AGENT_COORD_GHOST_TEXT_SGR", "2");
+
 function envStr(name, fallback) {
   const v = process.env[name];
   return v === undefined ? fallback : v;
@@ -78,6 +99,65 @@ export function sleep(ms) {
 // substring matching on captured pane text is unreliable.
 function squash(s) {
   return String(s ?? "").replace(/\s+/g, " ").trim();
+}
+
+// Terminal escape sequences as they appear in `capture-pane -e` output:
+// CSI (colors/attributes, cursor) and OSC (hyperlinks, titles). Anything not
+// matched stays in the text — unrecognized bytes read as content, and content
+// fails toward refusing, never toward delivering.
+const CSI_RE = /\x1b\[[0-9;:?]*[A-Za-z]/g;
+const OSC_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
+export function stripAnsi(s) {
+  return String(s ?? "").replace(OSC_RE, "").replace(CSI_RE, "");
+}
+
+// Split ONE styled line into real (typed) and ghost (suggestion) text by
+// walking its SGR state. Dim-attributed spans are ghost; everything else —
+// including any styling we do not recognize — is real. See GHOST_TEXT_SGR for
+// why dim, and for the asymmetry that makes "unrecognized = real" the safe
+// default.
+export function partitionStyledLine(styledLine) {
+  const ghostAttr = GHOST_TEXT_SGR();
+  const src = String(styledLine ?? "");
+  let real = "";
+  let ghost = "";
+  let dim = false;
+  let i = 0;
+  while (i < src.length) {
+    if (src[i] === "\x1b") {
+      const rest = src.slice(i);
+      const om = /^\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/.exec(rest);
+      if (om) {
+        i += om[0].length;
+        continue;
+      }
+      const cm = /^\x1b\[([0-9;:?]*)([A-Za-z])/.exec(rest);
+      if (cm) {
+        if (cm[2] === "m") {
+          // SGR: parameters separated by ; or :. Empty list means reset.
+          const params = cm[1] === "" ? ["0"] : cm[1].split(/[;:]/);
+          for (const p of params) {
+            if (p === "0" || p === "") dim = false; // full reset
+            else if (p === "22") dim = false; // "normal intensity" clears dim
+            else if (p === ghostAttr) dim = true;
+            // 38;5;N color runs share the list; a bare "5"/"2" inside a color
+            // spec could false-trigger — handle the extended-color form:
+            if (p === "38" || p === "48") break; // rest of list is a color spec
+          }
+        }
+        i += cm[0].length;
+        continue;
+      }
+      // Lone ESC we do not understand: drop the ESC byte, keep going.
+      i += 1;
+      continue;
+    }
+    if (dim) ghost += src[i];
+    else real += src[i];
+    i += 1;
+  }
+  return { real, ghost };
 }
 
 // Is `payload` still sitting in the pane's INPUT LINE?
@@ -109,32 +189,49 @@ export function stillInInput(paneText, payload) {
 
 // Read the pane's input state: is the TUI busy, and is there unsent text?
 //
-// `null` for either field means UNKNOWN — the pane could not be captured, or
+// Accepts BOTH plain and styled (`capture-pane -e`) text — on styled input the
+// ghost suggestion is partitioned out of `draft` (see GHOST_TEXT_SGR); plain
+// text has no style layer, so everything on the input line reads as content,
+// which is the conservative side. `ghost` and `styledInputLine` are null on
+// plain input.
+//
+// `null` for busy/draft means UNKNOWN — the pane could not be captured, or
 // this TUI does not look like the one we know how to read. Unknown is never
 // treated as "fine": callers either proceed and fall back to verify-by-absence
 // or report the uncertainty, but they never upgrade it to a confirmation.
 export function readPaneState(paneText) {
-  if (paneText === null || paneText === undefined) return { busy: null, draft: null };
+  if (paneText === null || paneText === undefined) {
+    return { busy: null, draft: null, ghost: null, styledInputLine: null };
+  }
   const text = String(paneText);
   const busyRe = BUSY_PATTERN();
-  const busy = busyRe ? new RegExp(busyRe).test(text) : null;
+  // Busy markers live in the status chrome; match on the de-styled text.
+  const busy = busyRe ? new RegExp(busyRe).test(stripAnsi(text)) : null;
 
   const promptRe = PROMPT_PATTERN();
   let draft = null;
+  let ghost = null;
+  let styledInputLine = null;
   if (promptRe) {
     const re = new RegExp(promptRe);
-    const lines = text.split("\n").map((l) => l.replace(/\s+$/, ""));
+    const lines = text.split("\n");
     // The LAST prompt line is the live input; earlier ones are history.
     for (let i = lines.length - 1; i >= 0; i--) {
-      const m = re.exec(lines[i]);
+      // Partition FIRST: the prompt char renders undimmed, so it stays in
+      // `real` and the prompt regex matches the de-styled real text. Ghost
+      // spans never reach the draft no matter what they contain.
+      const { real, ghost: ghostText } = partitionStyledLine(lines[i]);
+      const m = re.exec(real.replace(/\s+$/, ""));
       if (!m) continue;
       const content = (m[1] ?? "").trim();
       const placeholder = PLACEHOLDER_PATTERN();
       draft = placeholder && new RegExp(placeholder).test(content) ? "" : content;
+      ghost = squash(ghostText) || null;
+      styledInputLine = lines[i];
       break;
     }
   }
-  return { busy, draft };
+  return { busy, draft, ghost, styledInputLine };
 }
 
 // Submit a CONTROL command (/clear, /compact) — the path that must actually
@@ -146,12 +243,22 @@ export function readPaneState(paneText) {
 // delivery:"confirmed". Waiting briefly and then declining is slower and
 // louder — deliberately, because a control command that silently becomes a
 // chat message is worse than one that says it did not run.
+// The ONE place a pane is captured for guard/verify decisions. `-e` is
+// load-bearing: it keeps the style layer, the only channel that distinguishes
+// a real draft from the TUI's ghost suggestion (see GHOST_TEXT_SGR). Without
+// it every ghost reads as a draft again — and the SUITE CANNOT NOTICE,
+// because the parser tests inject styled text below this call. That is the
+// scriptMtime family of failure: the subject of a check silently disabling
+// it. A source lock in control-submit.test.mjs pins the flag here and counts
+// capture sites, so a new capture call added without `-e` trips it too.
+function captureStyled(run, target) {
+  const cap = run(["capture-pane", "-e", "-p", "-t", target]);
+  return cap.status === 0 ? String(cap.stdout ?? "") : null;
+}
+
 export async function submitControl(deps, payload) {
   const { run, target } = deps;
-  const capture = () => {
-    const cap = run(["capture-pane", "-p", "-t", target]);
-    return cap.status === 0 ? String(cap.stdout ?? "") : null;
-  };
+  const capture = () => captureStyled(run, target);
 
   const idleBudget = CONTROL_IDLE_WAIT_MS();
   const deadline = Date.now() + idleBudget;
@@ -172,6 +279,14 @@ export async function submitControl(deps, payload) {
     };
   }
   if (state.draft) {
+    // ASYMMETRY — do not "fix" this branch toward delivering. A false REFUSAL
+    // costs one control command: retryable, visible, and self-diagnosing via
+    // the styled quote below. A false DELIVERY types keystrokes into someone's
+    // real unsent text and submits the concatenation to their model — the
+    // exact harm this guard exists to prevent. A harness whose ghost text is
+    // NOT dim-styled therefore lands here and refuses; that is the intended
+    // conservative direction, and the remedy is teaching GHOST_TEXT_SGR its
+    // rendering, never loosening this check.
     return {
       submitted: false,
       verified: true,
@@ -179,7 +294,10 @@ export async function submitControl(deps, payload) {
       attempts: 0,
       reason:
         `pane '${target}' has unsent text in its input (${JSON.stringify(state.draft.slice(0, 40))}…) — not pasted. ` +
-        `The command would have been appended to that draft and sent to the model as an ordinary message.`,
+        `The command would have been appended to that draft and sent to the model as an ordinary message. ` +
+        `Rule: non-dim input-line content is a draft; dim (SGR ${GHOST_TEXT_SGR()}) spans are the TUI's ghost ` +
+        `suggestion and are ignored (AGENT_COORD_GHOST_TEXT_SGR overrides). ` +
+        `Styled input line: ${JSON.stringify(String(state.styledInputLine ?? "").slice(0, 160))}`,
     };
   }
   return pasteAndSubmit(deps, payload, { bracketed: false, verify: true });
@@ -259,9 +377,13 @@ async function pollUntilGone(deps, payload) {
   const deadline = Date.now() + VERIFY_TIMEOUT_MS();
   let readInput = false;
   for (;;) {
-    const cap = run(["capture-pane", "-p", "-t", target]);
-    if (cap.status === 0) {
-      const verdict = stillInInput(String(cap.stdout ?? ""), payload);
+    // Styled capture here too: a ghost suggestion CONTAINING the payload
+    // (e.g. the TUI suggesting "/compact" right after it ran) would otherwise
+    // read as "still in the input" — a false non-submit whose retry path
+    // sends extra Enters into a live pane on the strength of chrome.
+    const pane = captureStyled(run, target);
+    if (pane !== null) {
+      const verdict = stillInInput(pane, payload);
       if (verdict === false) return false;
       if (verdict === true) readInput = true; // we could read the input line
     }

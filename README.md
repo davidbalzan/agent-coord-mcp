@@ -349,6 +349,8 @@ The reminder is per-recipient on `room:` broadcasts (each gets their own DM with
 
 The receipt lives in a **file the sender polls**, never in any inbox or room — so verification costs **zero added agent context/tokens** (the confirmation rides back in the caller's own tool result, which it was already paying for). Pass `waitForDelivery:false` for the old fire-and-forget behavior, or tune `deliveryTimeoutMs`. Receipts are trimmed by `prune` like any other log.
 
+**Ghost text vs. real drafts.** The guard that refuses to paste onto unsent input reads the pane **with styling** (`capture-pane -e`): Claude Code renders a session-derived *suggested* next prompt dim (SGR 2) inside the input box while idle, and to a plain capture that chrome is byte-for-byte identical to a draft — for a while every idle worker looked permanently mid-draft and control commands were undeliverable fleet-wide. Dim spans are ignored; any **non-dim** input content still refuses, and the refusal quotes the styled line so a false positive self-diagnoses. The dim assumption is a per-harness rendering detail pinned in one place (`AGENT_COORD_GHOST_TEXT_SGR` overrides it for a TUI that styles suggestions differently); a harness we can't read fails toward refusing, because a false refusal costs one retryable command while a false delivery types into someone's real unsent text.
+
 Works identically over the remote transport (`coord-pusher`).
 
 ## Remote agents (Streamable HTTP)
