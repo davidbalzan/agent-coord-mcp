@@ -81,6 +81,13 @@ export type TransportMarker = {
   // pusher — the class of bug that silently dropped /clear /compact in v0.8.1.
   // Absent on markers written by older versions (treated as "unknown, skip").
   scriptMtime?: number;
+  // Build identity (newest dist mtime, sampled at that server's module load)
+  // of the MCP server whose attach_agent stamped this marker. A marker
+  // stamped by a server predating the current on-disk build was written by
+  // attach/stamp logic the rebuild replaced — doctor's provenance check flags
+  // it for a session restart + re-attach. Absent on markers written by older
+  // versions (treated as "unknown, skip", deliberately mirroring scriptMtime).
+  serverBuildMtime?: number;
 };
 
 export type AgentRegistry = Record<string, AgentEntry>;

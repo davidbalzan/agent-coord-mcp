@@ -2,7 +2,7 @@
 // corruption is isolated from the other suites.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, appendFileSync, readdirSync, statSync, utimesSync } from "node:fs";
+import { mkdtempSync, rmSync, appendFileSync, readdirSync, statSync, utimesSync, copyFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -133,6 +133,33 @@ test("doctor flags a stale local pusher (loaded mtime < on-disk mtime)", async (
   }
 });
 
+// Disposable live pid for marker fixtures: doctor's liveness gate needs a
+// real process, but pairing OUR OWN pid with a pane we don't own is the exact
+// shape doctor({fix:true})'s reaper SIGTERMs — safe only while isPusherProcess
+// gates the kill, i.e. one guard away from killing the test runner. A
+// throwaway child is killable with zero blast radius.
+async function disposablePid() {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 300000)"]);
+  await new Promise((resolve) => child.once("spawn", resolve));
+  return child;
+}
+
+// Temp copy of hooks/*.mjs with every mtime set to `stamp`. Freshness tests
+// vary mtimes to stage their scenarios — doing that to the REAL files would
+// flip every live pusher's freshness while `node --test` runs other files in
+// parallel against the same checkout. The AGENT_COORD_HOOKS_DIR seam points
+// doctor's measurement (never attach's spawn) at the copy.
+function hooksCopyAt(stamp) {
+  const realHooks = fileURLToPath(new URL("../hooks", import.meta.url));
+  const copy = mkdtempSync(path.join(tmpdir(), "coord-hooks-"));
+  for (const f of readdirSync(realHooks)) {
+    if (!f.endsWith(".mjs")) continue;
+    copyFileSync(path.join(realHooks, f), path.join(copy, f));
+    utimesSync(path.join(copy, f), stamp, stamp);
+  }
+  return copy;
+}
+
 test("touching an imported hooks module alone makes an already-spawned pusher report stale", async () => {
   // The pusher loads submit.mjs (control submission) and tier.mjs/roles.mjs
   // (tiering) at spawn. A marker stamped with the ENTRY file's mtime is what
@@ -141,10 +168,10 @@ test("touching an imported hooks module alone makes an already-spawned pusher re
   // matching stamp and reports ok on a pusher running exactly the code the
   // fix replaced — a false green on the mechanism every pusher-side rollout
   // is verified with (#21/#25 both live in submit.mjs).
-  const hooksDir = fileURLToPath(new URL("../hooks", import.meta.url));
-  const submitPath = path.join(hooksDir, "submit.mjs");
-  const entryMtime = statSync(path.join(hooksDir, "tmux-pusher.mjs")).mtimeMs;
-  const orig = statSync(submitPath);
+  const spawnTime = new Date(Date.now() - 60_000);
+  const hooksCopy = hooksCopyAt(spawnTime);
+  const entryMtime = statSync(path.join(hooksCopy, "tmux-pusher.mjs")).mtimeMs;
+  const child = await disposablePid();
   await t.registerTool({ agentId: "graphstale" });
   await store.updateJson(
     store.transportFile("graphstale"),
@@ -152,25 +179,26 @@ test("touching an imported hooks module alone makes an already-spawned pusher re
     () => ({
       agentId: "graphstale",
       transport: "tmux-push",
-      pid: process.pid,
+      pid: child.pid,
       tmuxTarget: "%0",
       since: Date.now(),
       scriptMtime: entryMtime, // spawned when the entry file was current…
     }),
   );
+  process.env.AGENT_COORD_HOOKS_DIR = hooksCopy;
   try {
-    // …then the imported module alone is updated on disk (metadata-only
-    // touch; content untouched, mtimes restored in finally).
+    // …then the imported module alone is updated on disk.
     const now = new Date();
-    utimesSync(submitPath, now, now);
+    utimesSync(path.join(hooksCopy, "submit.mjs"), now, now);
     const r = await t.doctorTool({});
     const f = r.findings.find((x) => x.check === "stale-pusher-script");
     assert.equal(f.level, "warn", "a stale import must not read as fresh");
     assert.ok(f.items.some((i) => i.includes("graphstale")));
   } finally {
-    utimesSync(submitPath, orig.atime, orig.mtime);
-    // Same leak hazard as above: our own pid paired with a pane we don't own.
+    delete process.env.AGENT_COORD_HOOKS_DIR;
+    child.kill();
     await store.deleteFile(store.transportFile("graphstale"));
+    rmSync(hooksCopy, { recursive: true, force: true });
   }
 });
 
@@ -178,12 +206,9 @@ test("a pusher stamped with the newest hooks mtime reports fresh", async () => {
   // The no-false-positive direction: a pusher spawned after every hooks
   // change must not be nagged to re-attach. Stamp exactly what attach_agent
   // stamps at spawn — the newest mtime across hooks/*.mjs.
-  const hooksDir = fileURLToPath(new URL("../hooks", import.meta.url));
-  const newest = Math.max(
-    ...readdirSync(hooksDir)
-      .filter((f) => f.endsWith(".mjs"))
-      .map((f) => statSync(path.join(hooksDir, f)).mtimeMs),
-  );
+  const spawnTime = new Date(Date.now() - 60_000);
+  const hooksCopy = hooksCopyAt(spawnTime);
+  const child = await disposablePid();
   await t.registerTool({ agentId: "freshpusher" });
   await store.updateJson(
     store.transportFile("freshpusher"),
@@ -191,12 +216,13 @@ test("a pusher stamped with the newest hooks mtime reports fresh", async () => {
     () => ({
       agentId: "freshpusher",
       transport: "tmux-push",
-      pid: process.pid,
+      pid: child.pid,
       tmuxTarget: "%0",
       since: Date.now(),
-      scriptMtime: newest,
+      scriptMtime: spawnTime.getTime(),
     }),
   );
+  process.env.AGENT_COORD_HOOKS_DIR = hooksCopy;
   try {
     const r = await t.doctorTool({});
     const f = r.findings.find((x) => x.check === "stale-pusher-script");
@@ -205,7 +231,128 @@ test("a pusher stamped with the newest hooks mtime reports fresh", async () => {
       `fresh pusher flagged stale: ${JSON.stringify(f)}`,
     );
   } finally {
+    delete process.env.AGENT_COORD_HOOKS_DIR;
+    child.kill();
     await store.deleteFile(store.transportFile("freshpusher"));
+    rmSync(hooksCopy, { recursive: true, force: true });
+  }
+});
+
+// --- Server build identity: the same staleness class one layer up ---
+
+test("server-build-drift warns when the on-disk build is newer than the loaded one", async () => {
+  // The loaded side is sampled at module load and deliberately cannot be
+  // faked — the thing that measures must be the thing that ran. The
+  // discriminating side is the on-disk build, staged newer via the
+  // AGENT_COORD_DIST_DIR seam (a temp dir standing in for a rebuilt dist/).
+  const fake = mkdtempSync(path.join(tmpdir(), "coord-dist-"));
+  writeFileSync(path.join(fake, "rebuilt.js"), "// stands in for a rebuilt module\n");
+  const future = new Date(Date.now() + 60_000);
+  utimesSync(path.join(fake, "rebuilt.js"), future, future);
+  process.env.AGENT_COORD_DIST_DIR = fake;
+  try {
+    const r = await t.doctorTool({});
+    const f = r.findings.find((x) => x.check === "server-build-drift");
+    assert.equal(f.level, "warn", "a server outliving its dist must be visible");
+    assert.ok(f.detail.includes("Restart"), "the remedy must be named");
+  } finally {
+    delete process.env.AGENT_COORD_DIST_DIR;
+    rmSync(fake, { recursive: true, force: true });
+  }
+});
+
+test("server-build-drift is ok when the loaded build is current", async () => {
+  // On-disk older than anything this process could have loaded → no drift.
+  const fake = mkdtempSync(path.join(tmpdir(), "coord-dist-"));
+  writeFileSync(path.join(fake, "old.js"), "// stands in for an old build\n");
+  utimesSync(path.join(fake, "old.js"), new Date(1000), new Date(1000));
+  process.env.AGENT_COORD_DIST_DIR = fake;
+  try {
+    const r = await t.doctorTool({});
+    const f = r.findings.find((x) => x.check === "server-build-drift");
+    assert.equal(f.level, "ok", JSON.stringify(f));
+  } finally {
+    delete process.env.AGENT_COORD_DIST_DIR;
+    rmSync(fake, { recursive: true, force: true });
+  }
+});
+
+test("a marker stamped by an outdated server build is flagged for restart + re-attach", async () => {
+  // A live, perfectly healthy pusher whose marker was stamped by a server
+  // that predates the current dist: the stamps were computed with replaced
+  // logic. scriptMtime is omitted so the stale-pusher-script check skips —
+  // provenance must fire on its own.
+  const child = await disposablePid();
+  await t.registerTool({ agentId: "oldstamp" });
+  await store.updateJson(
+    store.transportFile("oldstamp"),
+    {},
+    () => ({
+      agentId: "oldstamp",
+      transport: "tmux-push",
+      pid: child.pid,
+      tmuxTarget: "%0",
+      since: Date.now(),
+      serverBuildMtime: 1, // stamped by a server loaded before any real build
+    }),
+  );
+  try {
+    const r = await t.doctorTool({});
+    const f = r.findings.find((x) => x.check === "marker-server-provenance");
+    assert.equal(f.level, "warn");
+    assert.ok(f.items.some((i) => i.includes("oldstamp")));
+    assert.ok(f.detail.includes("Restart"), "the remedy must be named");
+  } finally {
+    child.kill();
+    await store.deleteFile(store.transportFile("oldstamp"));
+  }
+});
+
+test("provenance: current stamps and pre-upgrade markers are not flagged", async () => {
+  const build = await import("../dist/build.js");
+  const childA = await disposablePid();
+  const childB = await disposablePid();
+  await t.registerTool({ agentId: "curstamp" });
+  await t.registerTool({ agentId: "prestamp" });
+  await store.updateJson(
+    store.transportFile("curstamp"),
+    {},
+    () => ({
+      agentId: "curstamp",
+      transport: "tmux-push",
+      pid: childA.pid,
+      tmuxTarget: "%0",
+      since: Date.now(),
+      // Exactly what a current server stamps: the same value doctor compares
+      // against, through the same function.
+      serverBuildMtime: build.onDiskBuildMtime(),
+    }),
+  );
+  await store.updateJson(
+    store.transportFile("prestamp"),
+    {},
+    () => ({
+      agentId: "prestamp",
+      transport: "tmux-push",
+      pid: childB.pid,
+      tmuxTarget: "%0",
+      since: Date.now(),
+      // No serverBuildMtime: a pre-upgrade marker. SKIP, mirroring the
+      // scriptMtime absence semantics — the queued P2 flips both together.
+    }),
+  );
+  try {
+    const r = await t.doctorTool({});
+    const f = r.findings.find((x) => x.check === "marker-server-provenance");
+    assert.ok(
+      !(f.items ?? []).some((i) => i.includes("curstamp") || i.includes("prestamp")),
+      `falsely flagged: ${JSON.stringify(f)}`,
+    );
+  } finally {
+    childA.kill();
+    childB.kill();
+    await store.deleteFile(store.transportFile("curstamp"));
+    await store.deleteFile(store.transportFile("prestamp"));
   }
 });
 

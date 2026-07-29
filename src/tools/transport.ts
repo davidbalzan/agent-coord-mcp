@@ -1,4 +1,5 @@
 import { loadLiveTransports, isMarkerLive, isPidAlive } from "./registry.js";
+import { newestMtimeUnder, onDiskBuildMtime, SERVER_BUILD_MTIME, SERVER_BUILD_SHA, BUILD_DIR } from "../build.js";
 import { registerTool } from "./registry.js";
 import { roleInputSchema, type RoleArg } from "../roles.js";
 import { attributeWriter, isGitRepo, lastWriterOf, loadScopes, ownsDocument } from "./scopes.js";
@@ -562,7 +563,7 @@ export async function attachAgentTool(args: {
   // Stamp the pusher source's freshness so doctor() can flag a stale daemon if
   // it outlives a later upgrade of the on-disk code (see v0.8.1 → v0.8.2 bug
   // report: control commands silently dropped by pre-v0.8 in-memory code).
-  const scriptMtime = await newestPusherSourceMtime();
+  const scriptMtime = newestPusherSourceMtime();
   const marker: TransportMarker = {
     agentId: args.agentId,
     transport: "tmux-push",
@@ -570,6 +571,11 @@ export async function attachAgentTool(args: {
     tmuxTarget: target,
     since: Date.now(),
     scriptMtime,
+    // Provenance: the build identity THIS server loaded at startup — not a
+    // fresh stat of dist/, because the code doing the stamping is the loaded
+    // code, and after an in-place rebuild the two differ (that difference is
+    // exactly what doctor's provenance check exists to surface).
+    serverBuildMtime: SERVER_BUILD_MTIME,
   };
   // Use updateJson so it lockfile-protects and creates the file atomically.
   await updateJson<TransportMarker>(transportFile(args.agentId), marker, () => marker);
@@ -653,19 +659,12 @@ function resolvePusherPath(): string {
 // mtime unchanged — a single-file stamp/compare reports ok on a pusher running
 // exactly the code the fix replaced. Used by both the attach-time stamp and
 // doctor's on-disk comparison so the two sides can never drift apart.
-async function newestPusherSourceMtime(): Promise<number | undefined> {
-  try {
-    const dir = path.dirname(resolvePusherPath());
-    let newest: number | undefined;
-    for (const f of await fsp.readdir(dir)) {
-      if (!f.endsWith(".mjs")) continue;
-      const m = (await fsp.stat(path.join(dir, f))).mtimeMs;
-      if (newest === undefined || m > newest) newest = m;
-    }
-    return newest;
-  } catch {
-    return undefined; // not packaged? non-fatal — callers skip the check
-  }
+// AGENT_COORD_HOOKS_DIR is a test seam only: it redirects what freshness
+// MEASURES (against a temp copy of hooks/) so tests never touch the mtimes of
+// real sources shared with live pushers — it never changes what attach SPAWNS.
+function newestPusherSourceMtime(): number | undefined {
+  const dir = process.env.AGENT_COORD_HOOKS_DIR ?? path.dirname(resolvePusherPath());
+  return newestMtimeUnder(dir, [".mjs"]);
 }
 
 // ---------- status / whoami ----------
@@ -982,7 +981,7 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
   //     Local tmux-push only — for tmux-push-remote the script lives on a
   //     different host so we can't stat it from here.
   {
-    const localPusherMtime = await newestPusherSourceMtime();
+    const localPusherMtime = newestPusherSourceMtime();
     const stale: string[] = [];
     for (const fname of await listTransportFiles()) {
       const file = path.join(TRANSPORT_DIR, fname);
@@ -1005,6 +1004,68 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
         : "all attached pushers are running the current on-disk script",
       fixable: false,
       items: stale.length ? stale : undefined,
+    });
+  }
+
+  // 1b². The same staleness class one layer up: doctor itself runs inside an
+  //      MCP server process that imported dist/ at startup. `npm run build`
+  //      rewrites dist/ under the still-running server, which then keeps
+  //      spawning pushers and stamping markers with logic the rebuild
+  //      replaced — merging is not deploying, and until the session restarts
+  //      no on-disk artifact reflects what this process will actually do.
+  //      Self-scoped by construction: each session's doctor reports on the
+  //      server it is running in, which is the only process whose loaded
+  //      build it can truthfully know.
+  {
+    const onDisk = onDiskBuildMtime();
+    const drifted =
+      SERVER_BUILD_MTIME !== undefined && onDisk !== undefined && SERVER_BUILD_MTIME < onDisk - 1;
+    const identity = `${SERVER_BUILD_SHA ?? "unknown-sha"} @ ${BUILD_DIR}`;
+    findings.push({
+      check: "server-build-drift",
+      level: drifted ? "warn" : "ok",
+      detail: drifted
+        ? `this MCP server loaded its build at ${new Date(SERVER_BUILD_MTIME!).toISOString()} but the on-disk build is newer (${new Date(onDisk!).toISOString()}) — the session is running pre-rebuild code and everything it stamps or spawns uses replaced logic. Restart this agent's session. (${identity})`
+        : `server is running the current on-disk build (${identity})`,
+      fixable: false,
+    });
+  }
+
+  // 1b³. Marker provenance — which server BUILD stamped each marker. A live
+  //      pusher can be perfectly fresh while the marker's stamps were
+  //      computed by an outdated server (observed live 2026-07-29: a stale
+  //      server's attach stamped single-file freshness that agreed with the
+  //      new on-disk check only because tmux-pusher.mjs happened to be the
+  //      newest hooks file). Local tmux-push only, same as 1b.
+  {
+    const onDisk = onDiskBuildMtime();
+    const outdated: string[] = [];
+    for (const fname of await listTransportFiles()) {
+      const file = path.join(TRANSPORT_DIR, fname);
+      const marker = await readJson<TransportMarker | null>(file, null);
+      if (!marker || !isMarkerLive(marker, reg, now)) continue;
+      if (marker.transport !== "tmux-push") continue; // remote = can't verify
+      // Absent field = pre-upgrade marker: SKIP, deliberately mirroring the
+      // scriptMtime semantics in 1b. Two checks holding different opinions
+      // about the same absence would be harder to see than either behaviour
+      // alone — the queued P2 ("missing scriptMtime is a skip, not a warn")
+      // flips BOTH together. Do not "fix" one half here.
+      if (marker.serverBuildMtime === undefined) continue;
+      if (onDisk === undefined) continue;
+      if (marker.serverBuildMtime < onDisk - 1) {
+        const stamped = new Date(marker.serverBuildMtime).toISOString();
+        const current = new Date(onDisk).toISOString();
+        outdated.push(`${marker.agentId} (stamped by server build ${stamped}, on-disk build ${current})`);
+      }
+    }
+    findings.push({
+      check: "marker-server-provenance",
+      level: outdated.length ? "warn" : "ok",
+      detail: outdated.length
+        ? `${outdated.length} transport marker(s) stamped by a server build older than dist/ — the stamping/spawn logic (freshness basis, pusher argv) predates the current code. Restart that agent's session, then detach_agent + attach_agent.`
+        : "all local transport markers were stamped by the current server build",
+      fixable: false,
+      items: outdated.length ? outdated : undefined,
     });
   }
 
