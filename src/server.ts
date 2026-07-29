@@ -4,8 +4,16 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { ensureDirs, getTokenMap, reloadTokenMapSync } from "./store.js";
+import { unlinkSync, writeFileSync } from "node:fs";
 import {
+  ensureDirs,
+  getTokenMap,
+  reloadTokenMapSync,
+  sessionFile,
+  type SessionBinding,
+} from "./store.js";
+import {
+  liveClaimEvidence,
   attachAgentSchema,
   attachAgentTool,
   clearTransportSchema,
@@ -95,8 +103,103 @@ function jsonResult(data: unknown) {
 //     switching (the PR #45 spoof shape) is rejected.
 //   - rename_agent updates the binding to the new id on success so the
 //     renamed session keeps working.
-function buildServer(initialBound?: string): McpServer {
+//   - First-claim guard (v0.20.0): TOFU no longer lets a fresh session claim
+//     an id that is currently LIVE on the bus (fresh heartbeat, live
+//     transport, or another live bound session) — that silently created a
+//     second session acting as an already-running agent (hit live 2026-07-06:
+//     a dev session bound itself to `disavow-liaison`). A live-id claim needs
+//     the agent's token or an explicit force (join/register params). See
+//     guardFirstClaim for how absent vs unreadable evidence is decided.
+//   - `trackSession` (stdio only): each successful bind writes a
+//     sessions/<id>.<pid>.<nonce>.json marker so doctor can SEE two live
+//     sessions bound to one id — closure state alone cannot be inspected
+//     from outside the process. Not tracked for HTTP sessions: tokens.json
+//     already enforces their identity and many share one pid, which would
+//     make pid-liveness meaningless.
+function buildServer(initialBound?: string, opts: { trackSession?: boolean } = {}): McpServer {
   let bound = initialBound;
+  const trackSession = opts.trackSession ?? false;
+  let sessionMarker: string | undefined;
+  let exitHooksInstalled = false;
+
+  // Best-effort: a marker left behind by SIGKILL has a dead pid, which both
+  // the guard's evidence read and doctor's duplicate-session-binding check
+  // treat as garbage (doctor fix deletes it).
+  function recordSessionBinding(agentId: string, via: string): void {
+    if (!trackSession) return;
+    try {
+      const file = sessionFile(agentId, process.pid, randomUUID().slice(0, 8));
+      const marker: SessionBinding = {
+        agentId,
+        pid: process.pid,
+        boundAt: Date.now(),
+        via,
+        ...(process.env.TMUX_PANE ? { tmuxPane: process.env.TMUX_PANE } : {}),
+      };
+      writeFileSync(file, JSON.stringify(marker, null, 2) + "\n");
+      if (sessionMarker) {
+        try { unlinkSync(sessionMarker); } catch { /* already gone */ }
+      }
+      sessionMarker = file;
+      if (!exitHooksInstalled) {
+        exitHooksInstalled = true;
+        const cleanup = () => {
+          try { if (sessionMarker) unlinkSync(sessionMarker); } catch { /* already gone */ }
+        };
+        process.on("exit", cleanup);
+        // Default signal death skips 'exit' handlers; SIGHUP stays reserved
+        // for the token-map reload in loadTokenMap.
+        for (const sig of ["SIGTERM", "SIGINT"] as const) {
+          process.on(sig, () => { cleanup(); process.exit(0); });
+        }
+      }
+    } catch { /* marker is observability, never worth failing the bind */ }
+  }
+
+  // Decide whether a fresh session may claim `claimed` as its identity, and
+  // how. Returns the bind provenance ("tofu" | "token" | "force" |
+  // "same-pane") or throws. Ordering is deliberate:
+  //   - a presented token must MATCH or the claim fails loudly, even when the
+  //     id is not live — a wrong credential silently succeeding via the
+  //     not-live path would teach callers that garbage tokens work;
+  //   - force is an explicit human/agent decision, honored before evidence;
+  //   - evidence that exists but cannot be read REFUSES (cannot-verify ≠
+  //     verified-absent; unreadable state must not disable the guard);
+  //   - a live id refuses, except when its live pusher types into THIS
+  //     process's own tmux pane — two sessions cannot share a pane, so that
+  //     is the same seat restarting (the routine fleet-restart case), not a
+  //     second session. The exception never applies when another live
+  //     session is already bound to the id.
+  //   - verified-not-live binds freely: refusing absent evidence would break
+  //     every first onboarding, and the guard exists to protect LIVE ids.
+  async function guardFirstClaim(claimed: string, args: Record<string, unknown>): Promise<string> {
+    const token = typeof args["token"] === "string" ? (args["token"] as string) : undefined;
+    if (token !== undefined) {
+      if (getTokenMap()?.get(token) === claimed) return "token";
+      throw new Error(
+        `token presented for '${claimed}' does not match tokens.json (or no token map is loaded). ` +
+          `Mint one with scripts/coord-token.mjs add ${claimed} (then SIGHUP the bus), or pass force:true if you are certain.`,
+      );
+    }
+    if (args["force"] === true) return "force";
+    const ev = await liveClaimEvidence(claimed, Date.now());
+    if (!ev.verifiable) {
+      throw new Error(
+        `cannot verify whether '${claimed}' is live: ${ev.reasons.join("; ")}. ` +
+          `Refusing to bind rather than treating unreadable evidence as absence. ` +
+          `Repair the state (doctor), or pass the agent's token or force:true (join/register).`,
+      );
+    }
+    if (ev.live) {
+      if (ev.samePane && ev.boundElsewhere === 0) return "same-pane";
+      throw new Error(
+        `agent '${claimed}' is live on this bus (${ev.reasons.join("; ")}) — refusing to bind this fresh session to it. ` +
+          `If you ARE '${claimed}' restarting, re-join from its tmux pane, or pass its token or force:true (join/register). ` +
+          `If you are diagnosing, use status/ping (read-only, they never bind) or your own id.`,
+      );
+    }
+    return "tofu";
+  }
 
   // Gate every tool that takes a caller identity. `field: null` (list_agents,
   // list_rooms, prune) bypasses the check entirely.
@@ -117,7 +220,12 @@ function buildServer(initialBound?: string): McpServer {
         if (typeof claimed === "string") {
           if (bound === undefined) {
             if (bindOnClaim) {
-              bound = claimed; // TOFU: first claim wins, then sticky.
+              // TOFU: first claim wins, then sticky — but only after the
+              // first-claim guard agrees the id isn't someone else's live
+              // session (see guardFirstClaim).
+              const via = await guardFirstClaim(claimed, args);
+              bound = claimed;
+              recordSessionBinding(claimed, via);
             }
           } else if (bound !== claimed) {
             throw new Error(
@@ -137,7 +245,7 @@ function buildServer(initialBound?: string): McpServer {
 
   server.tool(
     "join",
-    "Recommended session-start call. Does register + auto-attach (if running inside tmux) + read inbox in one round-trip. Pass attach=false to skip the transport, attach={...overrides} to customize, or omit it to let the server auto-detect $TMUX_PANE. Returns the registration, attach result, any unread inbox messages, and the default channel's topic + MOTD (room rules) so you see them on connect. Calling join binds this MCP process's identity to agentId for the lifetime of the session — no env var or config needed. Each Claude Code session runs its own stdio process so bindings are naturally isolated.",
+    "Recommended session-start call. Does register + auto-attach (if running inside tmux) + read inbox in one round-trip. Pass attach=false to skip the transport, attach={...overrides} to customize, or omit it to let the server auto-detect $TMUX_PANE. Returns the registration, attach result, any unread inbox messages, and the default channel's topic + MOTD (room rules) so you see them on connect. Calling join binds this MCP process's identity to agentId for the lifetime of the session — no env var or config needed. Each Claude Code session runs its own stdio process so bindings are naturally isolated. Claiming an id that is currently LIVE on the bus (fresh heartbeat, live pusher, or another bound session) is refused unless the claim comes from that agent's own tmux pane or carries the agent's token or force:true — diagnosing someone else's agent is what status/ping are for.",
     joinSchema,
     // join explicitly sets the session binding when unset, so each agent can
     // declare its identity via join rather than relying on env vars.
@@ -145,7 +253,9 @@ function buildServer(initialBound?: string): McpServer {
       const claimed = args["agentId"];
       if (typeof claimed === "string") {
         if (bound === undefined) {
+          const via = await guardFirstClaim(claimed, args);
           bound = claimed;
+          recordSessionBinding(claimed, via);
         } else if (bound !== claimed) {
           throw new Error(
             `identity bound to '${bound}'; rejected attempt to act as '${claimed}'`,
@@ -306,15 +416,23 @@ function buildServer(initialBound?: string): McpServer {
     async (args: Record<string, unknown>) => {
       const claimed = args.agentId;
       if (typeof claimed === "string") {
-        if (bound === undefined) bound = claimed;
-        else if (bound !== claimed) {
+        if (bound === undefined) {
+          // Renaming a live agent from a fresh session is still a first
+          // claim of that agent's identity — same guard as any other.
+          const via = await guardFirstClaim(claimed, args);
+          bound = claimed;
+          recordSessionBinding(claimed, via);
+        } else if (bound !== claimed) {
           throw new Error(`identity bound to '${bound}'; rejected attempt to act as '${claimed}'`);
         }
       }
       const result = await renameAgentTool(args as { agentId: string; newAgentId: string });
       if (result && typeof result === "object" && (result as { ok?: unknown }).ok === true) {
         const to = (result as { to?: unknown }).to;
-        if (typeof to === "string") bound = to;
+        if (typeof to === "string") {
+          bound = to;
+          recordSessionBinding(to, "rename");
+        }
       }
       return jsonResult(result);
     },
@@ -404,6 +522,10 @@ function buildServer(initialBound?: string): McpServer {
     gate(null, forceUnregisterTool as (a: Record<string, unknown>) => Promise<unknown>),
   );
 
+  // An env pre-bound session is just as live as a TOFU-bound one — record it
+  // so doctor's duplicate check sees it too. (No-op unless trackSession.)
+  if (initialBound) recordSessionBinding(initialBound, "env");
+
   return server;
 }
 
@@ -452,7 +574,7 @@ async function main() {
           "  unregister before restarting so the new name starts fresh.",
       );
     }
-    const server = buildServer(boundAgent);
+    const server = buildServer(boundAgent, { trackSession: true });
     const transport = new StdioServerTransport();
     await server.connect(transport);
   }

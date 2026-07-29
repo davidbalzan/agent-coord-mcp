@@ -2,7 +2,12 @@
 
 All notable changes to this project will be documented here.
 
-## [0.19.0] — 2026-07-29
+## [Unreleased]
+
+### Added (P2 — the act of looking could claim a live identity)
+- **First-claim guard: a live agent id cannot be TOFU-claimed.** A fresh session's first identity claim used to bind to whatever id it named — even a diagnostic against an already-running agent silently created a second session acting as it (hit live 2026-07-06: a dev session bound itself to `disavow-liaison`). The first claim now consults live evidence — fresh heartbeat, live transport marker, another live bound session — and refuses a live id unless the claim comes from the agent's own tmux pane (restart-in-place, so fleet restarts need no override), presents the agent's token (`join`/`register` `token` param vs `tokens.json`), or passes an explicit `force:true`. Read-only `status`/`ping` never bind (pinned since v0.13.0); a presented-but-wrong token fails loudly even for a free id, and force does not rescue it — a credential offered is a credential checked.
+- **Absent evidence is decided, not defaulted.** *Verified absent* (readable state, id not live) binds freely — the guard protects live ids, not onboarding. *Cannot verify* (a state file exists but is unreadable) refuses: the lenient reader would have treated corrupt `agents.json` as an empty registry and waved the claim through, disabling the guard with the very corruption it should report — the same absence-is-not-exemption class 0.19.0 closed in the freshness checks.
+- **Bindings are visible: `doctor` gains `duplicate-session-binding`.** Each successful stdio bind writes a `sessions/<id>.<pid>.<nonce>.json` marker recording how the bind was established (`tofu`/`env`/`token`/`force`/`same-pane`/`rename`), removed on clean exit and on SIGTERM/SIGINT. Two live sessions bound to one id — exactly what `force` makes possible on purpose — now warn with both pids and their provenance; dead-pid leftovers (SIGKILL litter) are cleaned under `fix:true`. HTTP sessions are deliberately untracked: tokens.json already enforces their identity, and many share one pid.
 
 The release where the health checks stopped lying. Every headline item below is the same defect wearing a different hat: **a check that reports healthy while the thing it checks is not.** `scriptMtime` watched one file of a two-file module. The server that stamps freshness was never itself checked. A missing stamp was treated as "fine" rather than "unverifiable". And the guard protecting unsent drafts was reading the terminal's own ghost text as if a human had typed it — refusing every `/clear` and `/compact` sent to an idle agent, while its protective behaviour had never once been demonstrated against a real draft.
 

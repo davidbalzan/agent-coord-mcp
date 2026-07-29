@@ -46,7 +46,10 @@ import {
   transportFile,
   TRANSPORT_DIR,
   updateJson,
+  listSessionFiles,
+  readJsonStrict,
   type RoomRegistry,
+  type SessionBinding,
 } from "../store.js";
 import { recordAuthorityFor, resolveRole, roleInputSchema, type RoleArg } from "../roles.js";
 import {
@@ -73,6 +76,11 @@ export const registerSchema = {
   agentId: z.string().min(1),
   project: z.string().optional(),
   role: roleInputSchema.optional(),
+  // First-claim guard overrides (server.ts guardFirstClaim): claiming an id
+  // that is LIVE on the bus refuses unless the call presents that agent's
+  // token (tokens.json / coord-token) or force:true. Ignored once bound.
+  token: z.string().optional(),
+  force: z.boolean().optional(),
 };
 
 // Work out what `role`/`roleId` should become, or why the update is refused.
@@ -297,6 +305,94 @@ export function isPidAlive(pid: number): boolean {
     const code = (err as NodeJS.ErrnoException).code;
     return code === "EPERM"; // EPERM = exists but not ours; ESRCH = gone
   }
+}
+
+// ---------- first-claim liveness evidence ----------
+// What the TOFU binding guard (server.ts guardFirstClaim) consults before a
+// fresh session may claim an id. Three independent signals say "this id is
+// currently active": a fresh registry heartbeat, a live transport marker, and
+// a live session-binding marker from another pid. The verdict distinguishes
+// VERIFIED ABSENT (state readable, id not live → free to bind; refusing here
+// would break all onboarding) from CANNOT VERIFY (a state file exists but is
+// unreadable → the guard must refuse rather than treat corruption as absence).
+// `samePane`: a live local pusher for the claimed id types into THIS process's
+// own tmux pane — two sessions cannot share a pane, so this is the same seat
+// restarting in place, not a second session claiming a live id.
+
+export type ClaimEvidence = {
+  live: boolean;
+  verifiable: boolean;
+  samePane: boolean;
+  boundElsewhere: number;
+  reasons: string[];
+};
+
+export async function liveClaimEvidence(agentId: string, now: number): Promise<ClaimEvidence> {
+  const reasons: string[] = [];
+  let verifiable = true;
+  let samePane = false;
+  let heartbeatFresh = false;
+  let markerLive = false;
+  let boundElsewhere = 0;
+
+  let reg: AgentRegistry = {};
+  try {
+    reg = await readJsonStrict<AgentRegistry>(AGENTS_FILE, {});
+  } catch {
+    verifiable = false;
+    reasons.push("agents.json exists but cannot be parsed — heartbeat liveness is unverifiable");
+  }
+  const entry = reg[agentId];
+  if (entry && now - entry.lastHeartbeat < STALE_MS) {
+    heartbeatFresh = true;
+    reasons.push(`fresh registry heartbeat ${Math.floor((now - entry.lastHeartbeat) / 1000)}s ago`);
+  }
+
+  let marker: TransportMarker | null = null;
+  try {
+    marker = await readJsonStrict<TransportMarker | null>(transportFile(agentId), null);
+  } catch {
+    verifiable = false;
+    reasons.push("transport marker exists but cannot be parsed — transport liveness is unverifiable");
+  }
+  if (marker && isMarkerLive(marker, reg, now)) {
+    markerLive = true;
+    reasons.push(
+      `live ${marker.transport} transport (pid ${marker.pid}${marker.tmuxTarget ? `, pane ${marker.tmuxTarget}` : ""})`,
+    );
+    if (
+      marker.transport === "tmux-push" &&
+      marker.tmuxTarget &&
+      process.env.TMUX_PANE &&
+      marker.tmuxTarget === process.env.TMUX_PANE
+    ) {
+      samePane = true;
+    }
+  }
+
+  for (const file of await listSessionFiles()) {
+    let s: SessionBinding | null = null;
+    try {
+      s = await readJsonStrict<SessionBinding | null>(file, null);
+    } catch {
+      verifiable = false;
+      reasons.push(`session binding ${path.basename(file)} cannot be parsed — unverifiable (doctor fix cleans it)`);
+      continue;
+    }
+    if (!s || s.agentId !== agentId || s.pid === process.pid) continue;
+    if (isPidAlive(s.pid)) {
+      boundElsewhere++;
+      reasons.push(`another live session (pid ${s.pid}, via ${s.via}) is already bound to this id`);
+    }
+  }
+
+  return {
+    live: heartbeatFresh || markerLive || boundElsewhere > 0,
+    verifiable,
+    samePane,
+    boundElsewhere,
+    reasons,
+  };
 }
 
 // ---------- rename_agent (NICK) ----------
