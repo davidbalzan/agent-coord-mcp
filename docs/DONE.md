@@ -16,6 +16,9 @@ those glyphs; an ASCII hyphen/period renders the panel empty.
 
 ## Done
 
+- [x] Pusher freshness covers the loaded module graph; pattern kills scoped per agent — davidbalzan/agent-coord-mcp#28 · 2026-07-29
+- [x] The submit verifier reads the input line, not a tail window (P1b false negative) — davidbalzan/agent-coord-mcp#25 · 2026-07-29 · verified live: idle+populated-scrollback confirms, twice, incl. with `/compact` already echoed in the transcript
+- [x] Control commands are verified as submitted rather than assumed (P1) — davidbalzan/agent-coord-mcp#21 · 2026-07-29 · verified live: busy pane declines with nothing pasted, draft pane refuses with the draft intact
 - [x] Read-only status/ping never establish a TOFU identity binding (P2 partial — item 2 of 3; items 1 & 3 pending architecture steer) — davidbalzan/agent-coord-mcp#12 · 2026-07-08
 - [x] `coord-pusher` hard-fails on startup register/report_transport errors — davidbalzan/agent-coord-mcp#10 · 2026-07-08
 - [x] `rename_agent` refreshes in-process token map without requiring SIGHUP — davidbalzan/agent-coord-mcp#8 · 2026-07-08
