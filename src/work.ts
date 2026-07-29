@@ -63,6 +63,33 @@ export type BoardRow = {
   raw?: string;
 };
 
+// The one arity BoardRow can hold. boardCells() and the parser's arity guard
+// both reference this constant so the two sides cannot drift; a test pins
+// boardCells().length === BOARD_ARITY.
+export const BOARD_ARITY = 5;
+
+// A table row whose column count does not match BoardRow. It is REFUSED a
+// record (boardRowsOf never returns it) but PRESERVED byte-exactly — the
+// alternative, destructuring whatever arity into a fixed 5-tuple, silently
+// narrowed 6-column rows and widened 4-column ones on export (hit live
+// 2026-07-29: #38's extra `Pane` column was dropped on write-back). Refusing
+// the row rather than throwing keeps one bad row from taking down the whole
+// document's import. The schema decision stays with the board owner: widening
+// BoardRow is a deliberate act (change BOARD_ARITY, boardCells, and this
+// guard together), never something a docs commit does by accident.
+export type MalformedRow = {
+  malformed: true;
+  // Replayed byte-exactly on render — never narrowed, never widened.
+  verbatim: string;
+  // Names the line, quotes the row, states expected/actual — loud enough to
+  // fix from the message alone.
+  issue: string;
+};
+
+export function isMalformedRow(r: BoardRow | MalformedRow): r is MalformedRow {
+  return (r as MalformedRow).malformed === true;
+}
+
 // A parsed document: an ordered block list. `text` blocks are verbatim lines
 // (never interpreted); the others carry records rendered back in place.
 export type Block =
@@ -71,7 +98,7 @@ export type Block =
   | { kind: "done"; entries: DoneEntry[] }
   // `header` and `align` are kept as raw lines for the same reason as
   // BoardRow.raw — the alignment row (`|---|---|`) has no canonical form.
-  | { kind: "board"; header: string; align: string; rows: BoardRow[] };
+  | { kind: "board"; header: string; align: string; rows: (BoardRow | MalformedRow)[] };
 
 export type WorkDoc = {
   // Kept so an export can be written back with the exact byte tail it had.
@@ -182,11 +209,13 @@ function boardCells(r: BoardRow): string[] {
 }
 
 // Replay the original line when the fields still say what it said; re-render
-// once anything actually changed.
-export function renderBoardRow(r: BoardRow): string {
+// once anything actually changed. A malformed row has no fields to have
+// changed — it replays its bytes, always.
+export function renderBoardRow(r: BoardRow | MalformedRow): string {
+  if (isMalformedRow(r)) return r.verbatim;
   if (r.raw !== undefined) {
     const cells = splitRow(r.raw);
-    if (cells.length === 5 && cells.every((c, i) => c === boardCells(r)[i])) return r.raw;
+    if (cells.length === BOARD_ARITY && cells.every((c, i) => c === boardCells(r)[i])) return r.raw;
   }
   return renderRow(boardCells(r));
 }
@@ -280,11 +309,28 @@ export function parseWorkDoc(source: string): WorkDoc {
 
     // Lanes table: a header row followed by an alignment row.
     if (TABLE_ROW.test(line) && TABLE_ALIGN.test(lines[i + 1] ?? "")) {
-      const rows: BoardRow[] = [];
+      const rows: (BoardRow | MalformedRow)[] = [];
       let j = i + 2;
       for (; j < lines.length && TABLE_ROW.test(lines[j] ?? ""); j++) {
         const raw = lines[j] ?? "";
-        const [lane = "", owner = "", state = "", currentSlice = "", nextGo = ""] = splitRow(raw);
+        const cells = splitRow(raw);
+        // Arity guard: a row BoardRow cannot hold is refused a record, kept
+        // verbatim, and named loudly — destructuring it into the 5-tuple is
+        // exactly the silent narrow/widen this exists to prevent. An empty
+        // trailing cell (`| a | b | c | d | |`) is still five columns and
+        // still a legitimate row.
+        if (cells.length !== BOARD_ARITY) {
+          rows.push({
+            malformed: true,
+            verbatim: raw,
+            issue:
+              `board row at line ${j + 1} has ${cells.length} column(s), expected ${BOARD_ARITY} — ` +
+              `refused (kept verbatim, excluded from board records). Fix the row, or widen BoardRow ` +
+              `deliberately (BOARD_ARITY + boardCells + this guard together). Row: ${raw}`,
+          });
+          continue;
+        }
+        const [lane = "", owner = "", state = "", currentSlice = "", nextGo = ""] = cells;
         rows.push({ id: idFor("b", lane), lane, owner, state, currentSlice, nextGo, raw });
       }
       flushText();
@@ -325,5 +371,16 @@ export function doneEntriesOf(doc: WorkDoc): DoneEntry[] {
 }
 
 export function boardRowsOf(doc: WorkDoc): BoardRow[] {
-  return doc.blocks.flatMap((b) => (b.kind === "board" ? b.rows : []));
+  return doc.blocks.flatMap((b) =>
+    b.kind === "board" ? b.rows.filter((r): r is BoardRow => !isMalformedRow(r)) : [],
+  );
+}
+
+// Every refused row's issue, in document order — what makes the parse-time
+// rejection LOUD at the tool layer (import_work/list_work/export_work all
+// surface it) instead of a filtered-out record nobody notices.
+export function workDocIssues(doc: WorkDoc): string[] {
+  return doc.blocks.flatMap((b) =>
+    b.kind === "board" ? b.rows.filter(isMalformedRow).map((r) => r.issue) : [],
+  );
 }

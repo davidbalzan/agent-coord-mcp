@@ -13,6 +13,7 @@ import {
   parseWorkDoc,
   queueItemsOf,
   renderWorkDoc,
+  workDocIssues,
 } from "../work.js";
 import { loadScopes, ownsDocument } from "./scopes.js";
 import { AGENTS_FILE } from "../store.js";
@@ -110,18 +111,28 @@ export async function importWorkTool(args: { project: string; repo?: string }) {
   const state: WorkState = { project: args.project, repo, importedAt: Date.now(), docs };
   await saveState(state);
 
+  const allIssues = docs.flatMap((d) => workDocIssues(d.doc).map((issue) => `${d.path}: ${issue}`));
   return {
     ok: true as const,
     project: args.project,
     repo,
     file: workFile(args.project),
-    imported: docs.map((d) => ({
-      path: d.path,
-      kind: d.kind,
-      queue: queueItemsOf(d.doc).length,
-      done: doneEntriesOf(d.doc).length,
-      board: boardRowsOf(d.doc).length,
-    })),
+    imported: docs.map((d) => {
+      const issues = workDocIssues(d.doc);
+      return {
+        path: d.path,
+        kind: d.kind,
+        queue: queueItemsOf(d.doc).length,
+        done: doneEntriesOf(d.doc).length,
+        board: boardRowsOf(d.doc).length,
+        ...(issues.length ? { issues } : {}),
+      };
+    }),
+    ...(allIssues.length
+      ? {
+          warning: `${allIssues.length} table row(s) were refused a record (wrong column count) and kept verbatim — the documents round-trip unchanged, but these rows are invisible to board consumers until fixed. See imported[].issues.`,
+        }
+      : {}),
     note: "the markdown remains authoritative — this store is a derived index",
   };
 }
@@ -161,10 +172,12 @@ export async function listWorkTool(args: {
   const queue: QueueItem[] = [];
   const done: DoneEntry[] = [];
   const board: BoardRow[] = [];
+  const issues: string[] = [];
   for (const d of state.docs) {
     queue.push(...queueItemsOf(d.doc));
     done.push(...doneEntriesOf(d.doc));
     board.push(...boardRowsOf(d.doc));
+    issues.push(...workDocIssues(d.doc).map((issue) => `${d.path}: ${issue}`));
   }
 
   const openQueue = args.includeDone ? queue : queue.filter((q) => !q.done);
@@ -178,6 +191,9 @@ export async function listWorkTool(args: {
     ...(args.kind === "queue" || args.kind === undefined ? { queue: filtered } : {}),
     ...(args.kind === "done" || args.kind === undefined ? { done } : {}),
     ...(args.kind === "board" || args.kind === undefined ? { board } : {}),
+    // A row refused for wrong arity is absent from `board` — say so rather
+    // than let the absence read as "that lane doesn't exist".
+    ...(issues.length ? { issues } : {}),
   };
 }
 
@@ -245,11 +261,16 @@ export async function exportWorkTool(args: {
       : undefined;
 
     if (write && rendered !== current) await fsp.writeFile(target, rendered, "utf8");
+    const issues = workDocIssues(d.doc);
     files.push({
       path: d.path,
       bytes: Buffer.byteLength(rendered, "utf8"),
       identical: rendered === current,
       written: write && rendered !== current,
+      // Refused rows replay verbatim — the write is byte-faithful — but a
+      // caller rewriting a document should hear that some rows carry no
+      // record, rather than infer health from `identical:true`.
+      ...(issues.length ? { issues } : {}),
       ...(scope ? { scope } : {}),
     });
   }
