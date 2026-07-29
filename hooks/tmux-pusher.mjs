@@ -461,6 +461,12 @@ function writeReceipts(msgs, outcome) {
         ts: Date.now(),
         from: m.from,
         control: m.control === true,
+        // Build identity of the pusher that did the typing/verifying — the
+        // same module-graph stamp the transport marker carries (SCRIPT_MTIME
+        // covers hooks/*.mjs, not just this file). Lets deliveryOutcome note
+        // a "confirmed" issued by pre-upgrade verification logic. Omitted
+        // when unknown: absence reads as UNKNOWN downstream, never as fresh.
+        ...(SCRIPT_MTIME !== undefined ? { scriptMtime: SCRIPT_MTIME } : {}),
         ...(outcome
           ? {
               submitted: outcome.submitted === true,

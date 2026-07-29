@@ -194,7 +194,21 @@ export const sendCommandSchema = {
 
 // A receipt as the pusher writes it. `submitted` is present only on control
 // receipts from a pusher new enough to VERIFY submission (v0.19.0+).
-type Receipt = { id: string; ts: number; control?: boolean; submitted?: boolean; verified?: boolean; reason?: string };
+// `scriptMtime` is the reporting pusher's build identity — the same
+// module-graph stamp the transport marker carries (newest mtime across the
+// pusher's entry file AND its hooks/ imports, per #28: the stale part is as
+// likely submit.mjs as the entrypoint). It is honesty, not security: a lying
+// pusher defeats it, exactly like report_transport. The value is that a
+// "confirmed" can be tied to the code that did the confirming.
+type Receipt = {
+  id: string;
+  ts: number;
+  control?: boolean;
+  submitted?: boolean;
+  verified?: boolean;
+  reason?: string;
+  scriptMtime?: number;
+};
 
 // Poll an agent's receipt log until a receipt for `msgId` appears or the
 // deadline passes. Returns the receipt, or null on timeout. File-only — no
@@ -223,18 +237,38 @@ async function waitForReceipt(agentId: string, msgId: string, timeoutMs: number)
 // pending with a reason the caller can act on. Reporting an unverified
 // submission as confirmed is the defect this exists to remove: a check that
 // cannot fail loudly is worse than no check.
+//
+// `pusherSourceMtime` (the caller passes newestPusherSourceMtime()) lets a
+// CONFIRMED verdict carry a note when the reporting pusher's build identity
+// is behind the on-disk pusher source, or absent entirely. The note never
+// downgrades the verdict — the command demonstrably ran — it says whose
+// verification logic said so. Absence of the stamp reads as UNKNOWN, never
+// as fresh (same ruling as doctor's stale-pusher-script / provenance
+// checks: absence is not exemption), and the absence note is issued before
+// the on-disk comparison so an unstattable hooks dir cannot silence it.
 export function deliveryOutcome(
   agentId: string,
   receipt: Receipt | null,
   timeoutMs: number,
-): { delivery: "confirmed" | "pending"; at?: number; reason?: string } {
+  pusherSourceMtime?: number,
+): { delivery: "confirmed" | "pending"; at?: number; reason?: string; note?: string } {
   if (!receipt) {
     return {
       delivery: "pending",
       reason: `no delivery receipt from '${agentId}' within ${timeoutMs}ms — the command was written but may not have reached the pane (stale/wedged pusher). Run doctor or re-attach the agent.`,
     };
   }
-  if (receipt.submitted === true) return { delivery: "confirmed", at: receipt.ts };
+  if (receipt.submitted === true) {
+    let note: string | undefined;
+    if (receipt.scriptMtime === undefined) {
+      note = `'${agentId}' confirmed the submission, but its pusher carries no build-identity stamp — the pusher predates receipt provenance and this confirmation cannot be tied to any known code; re-attach the agent (detach_agent + attach_agent) to upgrade it.`;
+    } else if (pusherSourceMtime !== undefined && receipt.scriptMtime < pusherSourceMtime - 1) {
+      const loaded = new Date(receipt.scriptMtime).toISOString();
+      const ondisk = new Date(pusherSourceMtime).toISOString();
+      note = `'${agentId}' confirmed the submission, but its pusher loaded its code at ${loaded} and the on-disk pusher source is newer (${ondisk}) — the verification logic behind this confirmation predates the current code; re-attach the agent (detach_agent + attach_agent) to upgrade it.`;
+    }
+    return { delivery: "confirmed", at: receipt.ts, ...(note ? { note } : {}) };
+  }
   if (receipt.submitted === false) {
     return {
       delivery: "pending",
@@ -353,7 +387,7 @@ export async function sendCommandTool(args: {
     const wait = args.waitForDelivery ?? true;
     const deliveryTimeoutMs = args.deliveryTimeoutMs ?? 8000;
     const receipt = wait ? await waitForReceipt(args.to, msg.id, deliveryTimeoutMs) : null;
-    const outcome = wait ? deliveryOutcome(args.to, receipt, deliveryTimeoutMs) : null;
+    const outcome = wait ? deliveryOutcome(args.to, receipt, deliveryTimeoutMs, newestPusherSourceMtime()) : null;
     const confirmed = outcome?.delivery === "confirmed";
     // After /clear the receiver forgets its identity and that it's bus-attached
     // (the system prompt isn't re-applied because /clear isn't a session
@@ -375,7 +409,10 @@ export async function sendCommandTool(args: {
             delivery: outcome.delivery,
             confirmed,
             ...(outcome.at !== undefined ? { deliveredAt: outcome.at } : {}),
-            ...(confirmed ? {} : { warning: outcome.reason }),
+            // A confirmed delivery can still warn: the note names a reporting
+            // pusher whose build identity is stale or absent. `confirmed`
+            // stays true — the command ran; the warning is about who said so.
+            ...(confirmed ? (outcome.note ? { warning: outcome.note } : {}) : { warning: outcome.reason }),
           }
         : {}),
       ...(reminderMs > 0 ? { reminderScheduled: { delayMs: reminderMs, recipients: [args.to] } } : {}),
@@ -411,11 +448,13 @@ export async function sendCommandTool(args: {
   let confirmed: string[] = [];
   let pending: string[] = [];
   let pendingReasons: string[] = [];
+  let confirmNotes: string[] = [];
   if (wait) {
+    const sourceMtime = newestPusherSourceMtime();
     const results = await Promise.all(
       delivered.map(async (m) => ({
         m,
-        outcome: deliveryOutcome(m, await waitForReceipt(m, msg.id, deliveryTimeoutMs), deliveryTimeoutMs),
+        outcome: deliveryOutcome(m, await waitForReceipt(m, msg.id, deliveryTimeoutMs), deliveryTimeoutMs, sourceMtime),
       })),
     );
     confirmed = results.filter((r) => r.outcome.delivery === "confirmed").map((r) => r.m);
@@ -423,6 +462,9 @@ export async function sendCommandTool(args: {
     pendingReasons = results
       .filter((r) => r.outcome.delivery !== "confirmed")
       .map((r) => `${r.m}: ${r.outcome.reason}`);
+    confirmNotes = results
+      .filter((r) => r.outcome.delivery === "confirmed" && r.outcome.note)
+      .map((r) => r.outcome.note!);
   }
   // Same post-/clear re-anchor as the DM path — one reminder per delivered
   // member, in their own inbox, with their own agentId in the body.
@@ -446,6 +488,9 @@ export async function sendCommandTool(args: {
                 warning: `not confirmed as submitted within ${deliveryTimeoutMs}ms — ${pendingReasons.join(" | ")}`,
               }
             : {}),
+          // Confirmed members whose reporting pusher is stale or unstamped —
+          // the confirmations stand, the notes say whose code issued them.
+          ...(confirmNotes.length ? { notes: confirmNotes } : {}),
         }
       : {}),
     ...(reminderMs > 0 ? { reminderScheduled: { delayMs: reminderMs, recipients: delivered } } : {}),
@@ -834,6 +879,13 @@ export const reportReceiptSchema = {
   submitted: z.boolean().optional(),
   verified: z.boolean().optional(),
   reason: z.string().optional(),
+  // Build identity of the reporting pusher: newest mtime across its loaded
+  // module graph (entry file + hooks/ imports), sampled once at its startup —
+  // the same basis report_transport's scriptMtime uses. Absent → the receipt's
+  // provenance is UNKNOWN and deliveryOutcome says so; the server never
+  // defaults it (a default here would be assume-fresh, the twin of the
+  // assume-success `submitted` refuses to invent).
+  scriptMtime: z.number().optional(),
 };
 
 // Wire-callable counterpart to the local pusher's receipt stamp (writeReceipts
@@ -859,6 +911,7 @@ export async function reportReceiptTool(args: {
   submitted?: boolean;
   verified?: boolean;
   reason?: string;
+  scriptMtime?: number;
 }) {
   const receipt: Receipt & { agentId: string; from?: string } = {
     id: args.id,
@@ -869,6 +922,7 @@ export async function reportReceiptTool(args: {
     ...(args.submitted !== undefined ? { submitted: args.submitted } : {}),
     ...(args.verified !== undefined ? { verified: args.verified } : {}),
     ...(args.reason !== undefined ? { reason: args.reason } : {}),
+    ...(args.scriptMtime !== undefined ? { scriptMtime: args.scriptMtime } : {}),
   };
   await appendJsonl(receiptFile(args.agentId), receipt);
   return { ok: true, receipt };

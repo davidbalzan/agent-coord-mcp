@@ -114,15 +114,41 @@ try {
 } catch (e) {
   die(`register failed: ${e?.message ?? e}`);
 }
-// Stamp the mtime of THIS process's loaded script so doctor() can spot a
-// stale remote pusher after a remote-side upgrade (see v0.8.2 stale-pusher
-// check — same hazard as the local tmux-pusher).
-let scriptMtime;
-try {
-  const { statSync } = await import("node:fs");
-  const { fileURLToPath } = await import("node:url");
-  scriptMtime = statSync(fileURLToPath(import.meta.url)).mtimeMs;
-} catch { /* non-fatal */ }
+// Build identity of THIS pusher process: newest mtime across the entry file
+// AND its ../hooks/*.mjs imports, sampled once at startup. The entry file
+// alone is not enough — the paste/submit pipeline lives in hooks/submit.mjs,
+// so a fix landing there alone would leave a single-file stamp unchanged and
+// a still-running pusher on the old code would read as fresh (#28's lesson,
+// carried across the wire). Over-covering hooks siblings we don't import is
+// the safe direction: a spurious stale flag is loud and cheap, a false fresh
+// silently invalidates rollout verification. Stamped on the transport marker
+// AND on every receipt this process reports; undefined on failure — an
+// absent stamp reads as UNKNOWN downstream, never as fresh, and a partial
+// (entry-only) value could read fresh while submit.mjs is exactly the stale
+// part.
+const scriptMtime = await (async () => {
+  try {
+    const { statSync, readdirSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const path = await import("node:path");
+    const self = fileURLToPath(import.meta.url);
+    let newest = statSync(self).mtimeMs;
+    const hooksDir = path.join(path.dirname(self), "..", "hooks");
+    for (const f of readdirSync(hooksDir)) {
+      if (!f.endsWith(".mjs")) continue;
+      let m;
+      try {
+        m = statSync(path.join(hooksDir, f)).mtimeMs;
+      } catch {
+        continue; // deleted mid-scan
+      }
+      if (m > newest) newest = m;
+    }
+    return newest;
+  } catch {
+    return undefined; // non-fatal — absence stays honest
+  }
+})();
 try {
   await call(
     "report_transport",
@@ -323,6 +349,10 @@ async function reportReceipts(msgs, outcome) {
           id: m.id,
           ...(m.from !== undefined ? { from: m.from } : {}),
           control: m.control === true,
+          // Our build identity (module-graph mtime, see the startup stamp) —
+          // ties this receipt to the code that typed/verified the delivery.
+          // Omitted when unknown; the server must not default it.
+          ...(scriptMtime !== undefined ? { scriptMtime } : {}),
           ...(outcome
             ? {
                 submitted: outcome.submitted === true,
