@@ -323,6 +323,25 @@ test("the pusher stamps scriptMtime on its own marker", () => {
   assert.match(body[1], /scriptMtime:/, "marker must carry scriptMtime or doctor skips it");
 });
 
+test("SCRIPT_MTIME covers the pusher's sibling modules, not just the entry file", () => {
+  // The control-submit fixes (#21/#25) live in submit.mjs and tiering in
+  // tier.mjs/roles.mjs — a stamp taken from import.meta.url alone reads
+  // "fresh" on a pusher whose imports were replaced after it spawned, the
+  // exact false green doctor's stale-pusher-script check exists to prevent.
+  // Source-level for the same reason as above.
+  const src = readFileSync(
+    fileURLToPath(new URL("../hooks/tmux-pusher.mjs", import.meta.url)),
+    "utf8",
+  );
+  const body = src.match(/const SCRIPT_MTIME = \(\(\) => \{([\s\S]*?)\n\}\)\(\);/);
+  assert.ok(body, "SCRIPT_MTIME initializer not found");
+  assert.match(
+    body[1],
+    /readdirSync/,
+    "stamp must scan the hooks dir (the loaded module graph), not stat one file",
+  );
+});
+
 // --- Phase 8 Task 2: typed records drive the tier ---
 
 const rec = (type, extra = {}) => ({ ...room("body text is irrelevant"), record: { type }, ...extra });

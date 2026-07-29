@@ -315,6 +315,7 @@ Under the hood: [`hooks/tmux-pusher.mjs`](./hooks/tmux-pusher.mjs) is the daemon
 - The pusher pastes into the pane unconditionally. If you're typing in the same pane it will corrupt your buffer; if the agent is showing a `[y/n]` permission prompt, the message becomes the answer. Run the receiving agent in a pane you don't normally edit in.
 - Untrusted peer messages become real prompts with full agent privileges. Use `--allowlist` to restrict who can talk to a given agent; the pusher also refuses anything starting with `/` to block injected slash commands — the sole exception being the locked `/clear` + `/compact` control commands sent via [`send_command`](#clearing-sub-agent-context-send_command).
 - Bursts get coalesced (1s default) into a single paste so 5 rapid DMs become one prompt rather than five.
+- **Never `pkill -f tmux-pusher.mjs`.** The pattern matches **every** pusher on the bus, not just yours — one agent's test-rig cleanup doing exactly that silently detached all four live agents at once (the panes stay alive; delivery just stops until each agent re-attaches). The pusher is spawned with its agentId in argv (`tmux-pusher.mjs --agent <id>`) precisely so a pattern kill can be scoped to one agent: `pkill -f "tmux-pusher.mjs --agent <id>"`. Better still, use `detach_agent({agentId})` — it SIGTERMs the exact pid from the transport marker.
 
 ### Clearing sub-agent context (`send_command`)
 

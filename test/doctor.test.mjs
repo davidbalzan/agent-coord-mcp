@@ -2,8 +2,9 @@
 // corruption is isolated from the other suites.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, appendFileSync } from "node:fs";
+import { mkdtempSync, rmSync, appendFileSync, readdirSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 
@@ -129,6 +130,82 @@ test("doctor flags a stale local pusher (loaded mtime < on-disk mtime)", async (
     // own, which is exactly the shape the wedged-pusher reaper SIGTERMs. Left
     // behind, a later doctor({fix:true}) in this file kills the test runner.
     await store.deleteFile(store.transportFile("staleagent"));
+  }
+});
+
+test("touching an imported hooks module alone makes an already-spawned pusher report stale", async () => {
+  // The pusher loads submit.mjs (control submission) and tier.mjs/roles.mjs
+  // (tiering) at spawn. A marker stamped with the ENTRY file's mtime is what
+  // a pusher spawned before a submit.mjs-only fix carries: tmux-pusher.mjs
+  // itself untouched, so a check that stats only the entry file sees a
+  // matching stamp and reports ok on a pusher running exactly the code the
+  // fix replaced — a false green on the mechanism every pusher-side rollout
+  // is verified with (#21/#25 both live in submit.mjs).
+  const hooksDir = fileURLToPath(new URL("../hooks", import.meta.url));
+  const submitPath = path.join(hooksDir, "submit.mjs");
+  const entryMtime = statSync(path.join(hooksDir, "tmux-pusher.mjs")).mtimeMs;
+  const orig = statSync(submitPath);
+  await t.registerTool({ agentId: "graphstale" });
+  await store.updateJson(
+    store.transportFile("graphstale"),
+    {},
+    () => ({
+      agentId: "graphstale",
+      transport: "tmux-push",
+      pid: process.pid,
+      tmuxTarget: "%0",
+      since: Date.now(),
+      scriptMtime: entryMtime, // spawned when the entry file was current…
+    }),
+  );
+  try {
+    // …then the imported module alone is updated on disk (metadata-only
+    // touch; content untouched, mtimes restored in finally).
+    const now = new Date();
+    utimesSync(submitPath, now, now);
+    const r = await t.doctorTool({});
+    const f = r.findings.find((x) => x.check === "stale-pusher-script");
+    assert.equal(f.level, "warn", "a stale import must not read as fresh");
+    assert.ok(f.items.some((i) => i.includes("graphstale")));
+  } finally {
+    utimesSync(submitPath, orig.atime, orig.mtime);
+    // Same leak hazard as above: our own pid paired with a pane we don't own.
+    await store.deleteFile(store.transportFile("graphstale"));
+  }
+});
+
+test("a pusher stamped with the newest hooks mtime reports fresh", async () => {
+  // The no-false-positive direction: a pusher spawned after every hooks
+  // change must not be nagged to re-attach. Stamp exactly what attach_agent
+  // stamps at spawn — the newest mtime across hooks/*.mjs.
+  const hooksDir = fileURLToPath(new URL("../hooks", import.meta.url));
+  const newest = Math.max(
+    ...readdirSync(hooksDir)
+      .filter((f) => f.endsWith(".mjs"))
+      .map((f) => statSync(path.join(hooksDir, f)).mtimeMs),
+  );
+  await t.registerTool({ agentId: "freshpusher" });
+  await store.updateJson(
+    store.transportFile("freshpusher"),
+    {},
+    () => ({
+      agentId: "freshpusher",
+      transport: "tmux-push",
+      pid: process.pid,
+      tmuxTarget: "%0",
+      since: Date.now(),
+      scriptMtime: newest,
+    }),
+  );
+  try {
+    const r = await t.doctorTool({});
+    const f = r.findings.find((x) => x.check === "stale-pusher-script");
+    assert.ok(
+      !(f.items ?? []).some((i) => i.includes("freshpusher")),
+      `fresh pusher flagged stale: ${JSON.stringify(f)}`,
+    );
+  } finally {
+    await store.deleteFile(store.transportFile("freshpusher"));
   }
 });
 
