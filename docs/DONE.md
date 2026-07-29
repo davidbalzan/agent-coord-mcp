@@ -16,6 +16,7 @@ those glyphs; an ASCII hyphen/period renders the panel empty.
 
 ## Done
 
+- [x] The board parser refuses a row it cannot round-trip: wrong arity is denied a record, preserved byte-exactly, and named loudly (the defect was two-sided, silently widening 4-column rows as well as narrowing 6-column ones) — davidbalzan/agent-coord-mcp#44 · 2026-07-29
 - [x] A receipt names the pusher build that confirmed it, so a confirmed verdict from a stale or unstamped reporter is annotated without being downgraded — davidbalzan/agent-coord-mcp#40 · 2026-07-29
 - [x] First-claim identity guard: a live agent id cannot be TOFU-claimed without its token, force, or its own pane, and unreadable evidence refuses rather than reading as verified-absent — davidbalzan/agent-coord-mcp#42 · 2026-07-29
 - [x] `doctor` reaps wedged local pushers (pid alive, tmux pane gone) under fix, verified against real tmux rather than fixtures — davidbalzan/agent-coord-mcp@af2ca41 · 2026-07-29
