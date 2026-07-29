@@ -1,5 +1,5 @@
 import { loadLiveTransports, isMarkerLive, isPidAlive } from "./registry.js";
-import { newestMtimeUnder, onDiskBuildMtime, SERVER_BUILD_MTIME, SERVER_BUILD_SHA, BUILD_DIR } from "../build.js";
+import { newestMtimeUnder, onDiskBuildMtime, onDiskSourceMtime, SERVER_BUILD_MTIME, SERVER_BUILD_SHA, BUILD_DIR } from "../build.js";
 import { registerTool } from "./registry.js";
 import { roleInputSchema, type RoleArg } from "../roles.js";
 import { attributeWriter, isGitRepo, lastWriterOf, loadScopes, ownsDocument } from "./scopes.js";
@@ -1027,6 +1027,28 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
       detail: drifted
         ? `this MCP server loaded its build at ${new Date(SERVER_BUILD_MTIME!).toISOString()} but the on-disk build is newer (${new Date(onDisk!).toISOString()}) — the session is running pre-rebuild code and everything it stamps or spawns uses replaced logic. Restart this agent's session. (${identity})`
         : `server is running the current on-disk build (${identity})`,
+      fixable: false,
+    });
+  }
+
+  // 1b²ᵇ. The affirmative catch for merged-but-never-rebuilt: src/ newer than
+  //       the compiled build means no restart can help — the artifact every
+  //       future session will load is already behind the code. Distinct from
+  //       1b² (a process behind its dist); this is the DISK being behind
+  //       itself, which is why it can fire on a bus with zero live sessions.
+  //       Not inferred from marker state: both sides are statted directly.
+  {
+    const srcMtime = onDiskSourceMtime();
+    const distMtime = onDiskBuildMtime();
+    const behind = srcMtime !== undefined && distMtime !== undefined && distMtime < srcMtime - 1;
+    findings.push({
+      check: "dist-behind-source",
+      level: behind ? "warn" : "ok",
+      detail: behind
+        ? `src/ is newer than the compiled build (src ${new Date(srcMtime!).toISOString()}, dist ${new Date(distMtime!).toISOString()}) — the checkout was updated but never rebuilt, so every session (current and future) runs pre-update code. \`npm run build\`, then restart sessions.`
+        : srcMtime === undefined
+          ? "no src/ to compare (packaged install) — dist is the only artifact"
+          : "compiled build is at least as new as src/",
       fixable: false,
     });
   }
