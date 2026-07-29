@@ -55,6 +55,37 @@ export const ARCHIVE_ROOMS_DIR = path.join(ARCHIVE_DIR, "rooms");
 export const ARCHIVE_INBOX_DIR = path.join(ARCHIVE_DIR, "inbox");
 export const ARCHIVE_STATUS_FILE = path.join(ARCHIVE_DIR, "status.jsonl");
 
+// Live session-binding markers (v0.20.0). One small file per *bound* stdio MCP
+// session: which agentId the session claimed, which pid holds it, and how the
+// bind was established. Written at bind time, removed on clean exit; a file
+// whose pid is dead is garbage doctor can clean. This is what makes two live
+// sessions bound to the same id VISIBLE (doctor `duplicate-session-binding`)
+// — in-process closure state can't be, by definition. HTTP sessions are not
+// tracked here: with tokens.json they are already identity-enforced, and many
+// share one pid, so pid-liveness would be meaningless for them.
+export const SESSIONS_DIR = path.join(ROOT, "sessions");
+
+export type SessionBinding = {
+  agentId: string;
+  pid: number;
+  boundAt: number;
+  // How the bind was established: "tofu" (first claim, id verified not live),
+  // "env" (AGENT_COORD_BOUND_AGENT), "token", "force", "same-pane" (live
+  // marker types into this session's own tmux pane), "rename".
+  via: string;
+  tmuxPane?: string;
+};
+
+export function sessionFile(agentId: string, pid: number, nonce: string): string {
+  return path.join(SESSIONS_DIR, `${sanitize(agentId)}.${pid}.${nonce}.json`);
+}
+
+export async function listSessionFiles(): Promise<string[]> {
+  if (!existsSync(SESSIONS_DIR)) return [];
+  const names = await fs.readdir(SESSIONS_DIR);
+  return names.filter((n) => n.endsWith(".json")).map((n) => path.join(SESSIONS_DIR, n));
+}
+
 // Per-agent token map for identity-bound bus auth (v0.7.0). Shape on disk:
 //   { "alice": "tk_<random-secret>", "bob": "tk_<another-secret>" }
 // HTTP transport reverse-looks-up the bearer to bind the session to an
@@ -82,7 +113,7 @@ export function workFile(project: string): string {
 }
 
 export function ensureDirs(): void {
-  for (const d of [ROOT, INBOX_DIR, CURSOR_DIR, TRANSPORT_DIR, PID_DIR, LOG_DIR, ROOMS_DIR, RECEIPTS_DIR, HISTORY_DIR, WORK_DIR]) {
+  for (const d of [ROOT, INBOX_DIR, CURSOR_DIR, TRANSPORT_DIR, PID_DIR, LOG_DIR, ROOMS_DIR, RECEIPTS_DIR, HISTORY_DIR, WORK_DIR, SESSIONS_DIR]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
   }
   for (const f of [ROOM_FILE, STATUS_FILE]) {
@@ -328,6 +359,19 @@ export async function readJson<T>(file: string, fallback: T): Promise<T> {
   } catch {
     return fallback;
   }
+}
+
+// Like readJson, but a file that EXISTS and cannot be parsed THROWS instead of
+// silently returning the fallback. For callers whose decision flips on
+// "verified absent" vs "cannot verify": the first-claim binding guard must
+// refuse when evidence is unreadable, because a guard that treats unreadable
+// evidence as absent is disabled by the very corruption it should be
+// reporting (the absence-is-not-exemption class, #36).
+export async function readJsonStrict<T>(file: string, fallback: T): Promise<T> {
+  if (!existsSync(file)) return fallback;
+  const raw = await fs.readFile(file, "utf8");
+  if (!raw.trim()) return fallback;
+  return JSON.parse(raw) as T;
 }
 
 export async function writeJson(file: string, data: unknown): Promise<void> {

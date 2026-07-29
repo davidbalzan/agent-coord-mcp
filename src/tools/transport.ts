@@ -31,7 +31,9 @@ import {
   inboxFile,
   listCursorFiles,
   listInboxFiles,
+  listSessionFiles,
   listTransportFiles,
+  type SessionBinding,
   logFile,
   memberRooms,
   normalizeRoom,
@@ -712,6 +714,11 @@ export const joinSchema = {
   // false → never; object → attach with overrides.
   attach: z.union([z.boolean(), joinAttachOptionsSchema]).optional(),
   readInbox: z.boolean().optional(),
+  // First-claim guard overrides (server.ts guardFirstClaim): claiming an id
+  // that is LIVE on the bus refuses unless the call presents that agent's
+  // token (tokens.json / coord-token) or force:true. Ignored once bound.
+  token: z.string().optional(),
+  force: z.boolean().optional(),
 };
 
 export async function joinTool(args: {
@@ -1181,6 +1188,55 @@ export async function doctorTool(args: { fix?: boolean; maxFileBytes?: number })
               `${w.agentId} (pid ${w.pid}, tmux target '${w.target}')${w.isPusher ? "" : " — pid is not a tmux-pusher, marker will be cleared without signalling"}`,
           )
         : undefined,
+    });
+  }
+
+  // 1d. Duplicate session bindings — two live MCP sessions bound to one agent
+  //     id means two processes are ACTING as the same agent (the
+  //     disavow-liaison shape: a dev session bound onto a live worker's id;
+  //     force/token make that possible on purpose, this makes it visible).
+  //     Bindings are per-process closure state, so this reads the on-disk
+  //     session markers stdio servers write at bind time. A marker whose pid
+  //     is dead is litter from a killed session (default signal death skips
+  //     exit handlers) — cleaned under fix. Live duplicates are NOT auto-
+  //     fixable: doctor cannot know which of two running sessions is the
+  //     impostor; the wrong session should `quit` (its marker clears on exit).
+  {
+    const byAgent = new Map<string, { pid: number; via: string; boundAt: number }[]>();
+    const stale: string[] = [];
+    for (const file of await listSessionFiles()) {
+      const s = await readJson<SessionBinding | null>(file, null);
+      if (!s || typeof s.pid !== "number" || !s.agentId || !isPidAlive(s.pid)) {
+        stale.push(path.basename(file));
+        if (fix) {
+          await deleteFile(file);
+          fixed.push(`deleted stale session binding ${path.basename(file)}`);
+        }
+        continue;
+      }
+      const list = byAgent.get(s.agentId) ?? [];
+      list.push({ pid: s.pid, via: s.via ?? "unknown", boundAt: s.boundAt ?? 0 });
+      byAgent.set(s.agentId, list);
+    }
+    const dupes: string[] = [];
+    for (const [id, list] of byAgent) {
+      if (list.length < 2) continue;
+      dupes.push(
+        `${id} — ${list
+          .map((b) => `pid ${b.pid} (via ${b.via}, bound ${b.boundAt ? new Date(b.boundAt).toISOString() : "unknown"})`)
+          .join(" AND ")}`,
+      );
+    }
+    findings.push({
+      check: "duplicate-session-binding",
+      level: dupes.length ? "warn" : "ok",
+      detail: dupes.length
+        ? `${dupes.length} agent id(s) bound by more than one live session — two processes are acting as the same agent. Decide which is legitimate; the other should quit (its binding clears on exit).`
+        : stale.length
+          ? `no duplicate session bindings (${stale.length} stale binding file(s) from dead sessions${fix ? " — cleaned" : "; run doctor with fix:true to clean"})`
+          : "no duplicate session bindings",
+      fixable: true,
+      items: dupes.length ? dupes : undefined,
     });
   }
 
