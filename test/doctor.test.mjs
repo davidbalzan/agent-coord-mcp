@@ -209,6 +209,42 @@ test("a pusher stamped with the newest hooks mtime reports fresh", async () => {
   }
 });
 
+// Wait for a child to be gone, whether or not its 'exit' event has already
+// fired. `await new Promise((r) => child.once("exit", r))` is a missed-event
+// race: doctor's fix SIGTERMs the child MID-CALL, so the 'exit' event can be
+// emitted while doctorTool's remaining checks are still awaiting — a listener
+// attached afterwards waits forever on an event that already happened, and
+// with the child dead nothing else keeps the event loop alive, so the whole
+// file dies as "Promise resolution is still pending but the event loop has
+// already resolved" and every later test cancels (the ~25% gate flake,
+// traced 2026-07-29: the test process received NO signal — its loop simply
+// drained 6ms after the dummy's SIGTERM). exitCode/signalCode are assigned
+// before 'exit' is emitted, so the guard cannot itself race.
+function waitForChildExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => child.once("exit", resolve));
+}
+
+test("waitForChildExit resolves even when 'exit' already fired (the flake's shape)", async () => {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 300000)"]);
+  await new Promise((resolve) => child.once("spawn", resolve));
+  child.kill("SIGTERM");
+  // Reproduce the race deterministically: only proceed once the 'exit' event
+  // has demonstrably fired (signalCode set), i.e. the moment the old code
+  // started waiting forever.
+  await new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(child.signalCode, "SIGTERM");
+  // A ref'd timer keeps the loop alive, so a regression fails this assertion
+  // loudly instead of draining the loop and cancelling the rest of the file.
+  let timer;
+  const winner = await Promise.race([
+    waitForChildExit(child).then(() => "exited"),
+    new Promise((resolve) => { timer = setTimeout(() => resolve("hung"), 2000); }),
+  ]);
+  clearTimeout(timer);
+  assert.equal(winner, "exited", "waitForChildExit must not wait on an 'exit' that already happened");
+});
+
 // Real tmux state, not fixtures — a "wedged" pusher (pid alive, pane dead) is
 // only distinguishable from a healthy one by actually probing the pane, so
 // this test creates and kills a real tmux session rather than faking targets.
@@ -265,7 +301,8 @@ const tmuxOnMachine = spawnSync("tmux", ["-V"]).status === 0;
 
       const fixed = await t.doctorTool({ fix: true });
       assert.ok(fixed.fixed.some((f) => f.includes("wedgedagent") && f.includes("reaped")));
-      await new Promise((resolve) => dummy.once("exit", resolve));
+      // The dummy may already be dead by now — see waitForChildExit above.
+      await waitForChildExit(dummy);
       assert.equal(dummy.signalCode, "SIGTERM", "an identified pusher is signalled");
       assert.equal(await store.readJson(store.transportFile("wedgedagent"), null), null, "marker cleared");
       assert.ok(await store.readJson(store.transportFile("liveagent"), null), "live pusher's marker untouched");
