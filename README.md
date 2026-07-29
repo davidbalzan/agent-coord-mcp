@@ -461,6 +461,14 @@ identity bound to 'alice'; rejected attempt to act as 'bob'
 
 TOFU stops mid-session switching. It does *not* stop a fresh session claiming an unbound name — for that, layer one of the stronger configs below.
 
+**v0.20.0 — First-claim guard (zero config).** TOFU no longer trusts the first claim blindly when the claimed id is currently **live** on the bus — a fresh registry heartbeat, a live transport marker, or another live session already bound to it. That exact gap was hit in the wild: a dev session ran a diagnostic naming a live agent's id and silently became a second session acting as it. A live-id claim now refuses unless one of these holds:
+
+- the claim comes from the agent's **own tmux pane** (a live pusher's `tmuxTarget` matches the claimer's `$TMUX_PANE`) — the routine restart-in-place case, so fleet restarts don't need overrides;
+- the call presents the agent's **token** (`join`/`register` `token` param, checked against `tokens.json`);
+- the call passes an explicit **`force:true`** — a deliberate decision, recorded as such.
+
+Evidence handling is deliberate: *verified absent* (readable state, id not live) binds freely — the guard protects live ids, not onboarding; *cannot verify* (a state file exists but is unreadable) **refuses**, because a guard that treats unreadable evidence as absence is disabled by the very corruption it should report. Read-only `status`/`ping` never bind either way. Each successful stdio bind writes a `sessions/` marker, and `doctor`'s `duplicate-session-binding` check warns when two live sessions hold the same id (cleaning dead-pid leftovers under `fix:true`).
+
 **v0.7.0 — Pre-binding (when you want sessions identified at connect-time).** Drop a `~/agent-coord/tokens.json` (mode 600) mapping agentId → bearer:
 
 ```json
@@ -488,7 +496,7 @@ Backward-compat: if `tokens.json` is absent, the legacy single shared `AGENT_COO
 
 | Config | Mid-session switch | Fresh-session impersonation |
 |---|---|---|
-| None (default after v0.7.1) | ❌ blocked (TOFU) | ⚠️ possible (no pre-binding) |
+| None (default after v0.20.0) | ❌ blocked (TOFU) | ❌ blocked for live agents (first-claim guard); ⚠️ possible for idle/stale ids |
 | `AGENT_COORD_BOUND_AGENT` env | ❌ blocked (pre-bound) | ❌ blocked (env is process-local) |
 | `tokens.json` | ❌ blocked (pre-bound) | ❌ blocked (bearer ↔ id) |
 

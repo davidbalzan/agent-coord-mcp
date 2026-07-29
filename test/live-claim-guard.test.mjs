@@ -286,6 +286,21 @@ test("session markers: a bind writes one, a clean close removes it", async () =>
   assert.equal(gone, true, "session marker should be removed on clean shutdown");
 });
 
+test("session markers: a SIGTERM'd session still removes its marker (signal path, not just event-loop drain)", async () => {
+  // close() ends the child by closing stdin — event-loop drain, 'exit' fires.
+  // A real kill (Claude Code tearing a session down, an operator's kill) is a
+  // signal, which skips 'exit' handlers by default; this pins the handler.
+  const dir = path.join(tmp, "sigterm-cleanup");
+  const c = await spawnClient(dir);
+  await c.callTool({ name: "register", arguments: { agentId: "doomed" } });
+  const markers = sessionMarkers(dir);
+  assert.equal(markers.length, 1);
+  process.kill(markers[0].pid, "SIGTERM");
+  const gone = await pollUntil(() => sessionMarkers(dir).length === 0);
+  assert.equal(gone, true, "session marker should be removed on SIGTERM");
+  try { await c.close(); } catch { /* child already dead */ }
+});
+
 test("doctor: two live sessions bound to one id warn as duplicate-session-binding", async () => {
   // Runs in the module-level AGENT_COORD_DIR so the in-process doctorTool
   // sees the same state the spawned servers write.
