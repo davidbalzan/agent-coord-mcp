@@ -365,7 +365,7 @@ test("a marker stamped by an outdated server build is flagged for restart + re-a
   }
 });
 
-test("provenance: current stamps and pre-upgrade markers are not flagged", async () => {
+test("provenance: a current stamp passes; a MISSING stamp is unverifiable, not exempt", async () => {
   const build = await import("../dist/build.js");
   const childA = await disposablePid();
   const childB = await disposablePid();
@@ -394,16 +394,23 @@ test("provenance: current stamps and pre-upgrade markers are not flagged", async
       pid: childB.pid,
       tmuxTarget: "%0",
       since: Date.now(),
-      // No serverBuildMtime: a pre-upgrade marker. SKIP, mirroring the
-      // scriptMtime absence semantics — the queued P2 flips both together.
+      // No serverBuildMtime: written by a pre-provenance server — precisely
+      // the population the check exists to police. Flagged as unverifiable,
+      // in the SAME commit that flipped scriptMtime absence, so the two
+      // checks can never disagree about what a missing stamp means.
     }),
   );
   try {
     const r = await t.doctorTool({});
     const f = r.findings.find((x) => x.check === "marker-server-provenance");
     assert.ok(
-      !(f.items ?? []).some((i) => i.includes("curstamp") || i.includes("prestamp")),
-      `falsely flagged: ${JSON.stringify(f)}`,
+      !(f.items ?? []).some((i) => i.includes("curstamp")),
+      `a current stamp must not be flagged: ${JSON.stringify(f)}`,
+    );
+    assert.equal(f.level, "warn");
+    assert.ok(
+      f.items.some((i) => i.includes("prestamp") && i.includes("no serverBuildMtime")),
+      `a missing stamp must be flagged as unverifiable, not silently exempt: ${JSON.stringify(f.items)}`,
     );
   } finally {
     childA.kill();
@@ -557,7 +564,13 @@ const tmuxOnMachine = spawnSync("tmux", ["-V"]).status === 0;
   },
 );
 
-test("doctor doesn't warn when the marker has no scriptMtime (pre-v0.8.2 marker)", async () => {
+test("doctor WARNS when a live local marker has no scriptMtime — absence is not exemption", async () => {
+  // The old semantics skipped unstamped markers ("pre-v0.8.2, no info") — but
+  // the field's own writer once DROPPED it, so the silent skip let the check
+  // be disabled by the very thing it monitors. A live pusher whose freshness
+  // cannot be verified is a warn ("cannot verify — re-attach"), never an ok
+  // (credit agent-coordination-david-dev).
+  const child = await disposablePid();
   await t.registerTool({ agentId: "legacy" });
   await store.updateJson(
     store.transportFile("legacy"),
@@ -565,7 +578,7 @@ test("doctor doesn't warn when the marker has no scriptMtime (pre-v0.8.2 marker)
     () => ({
       agentId: "legacy",
       transport: "tmux-push",
-      pid: process.pid,
+      pid: child.pid,
       tmuxTarget: "%0",
       since: Date.now(),
       // scriptMtime intentionally omitted — pre-v0.8.2 shape.
@@ -576,10 +589,20 @@ test("doctor doesn't warn when the marker has no scriptMtime (pre-v0.8.2 marker)
   // doesn't make this assertion ambiguous.
   await store.deleteFile(store.transportFile("staleagent"));
 
-  const r = await t.doctorTool({});
-  const f = r.findings.find((x) => x.check === "stale-pusher-script");
-  assert.ok(f);
-  assert.equal(f.level, "ok", `pre-v0.8.2 marker should be skipped, got: ${JSON.stringify(f)}`);
+  try {
+    const r = await t.doctorTool({});
+    const f = r.findings.find((x) => x.check === "stale-pusher-script");
+    assert.ok(f);
+    assert.equal(f.level, "warn", `an unverifiable pusher must not read as ok: ${JSON.stringify(f)}`);
+    assert.ok(
+      f.items.some((i) => i.includes("legacy") && i.includes("cannot verify")),
+      `the item must name the agent and say WHY it cannot be trusted: ${JSON.stringify(f.items)}`,
+    );
+    assert.match(f.detail, /cannot be verified/, "the detail must surface the unverifiable count");
+  } finally {
+    child.kill();
+    await store.deleteFile(store.transportFile("legacy"));
+  }
 });
 
 test("doctor doesn't try to verify remote (tmux-push-remote) markers", async () => {
