@@ -118,11 +118,22 @@ export async function pruneTool(args: {
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
   const decisionCutoff = Date.now() - decisionDays * 24 * 60 * 60 * 1000;
   const dryRun = args.dryRun ?? false;
-  // room-scoped prune touches only that channel's messages; targets narrows
-  // the sweep otherwise. Default remains "everything".
+  // `room` scopes every sweep to that channel; `targets` narrows which sweeps
+  // run. They compose: `room` only changes the DEFAULT target set, so an
+  // explicit `targets` always wins.
+  //
+  // WHY (regression): this previously read `scopedRoom ? ["rooms"] : args.targets`,
+  // which silently DISCARDED an explicit `targets` whenever `room` was passed.
+  // `prune {room, targets:["members"], dryRun:true}` therefore reported
+  // `orphanMembers: []` because the member sweep never ran — a caller asking
+  // "which members are phantoms in this room" got a clean bill of health that
+  // had not been computed, while `roomMessages` (the one target the override
+  // left enabled) reported real messages a live run would have archived. Field
+  // report: two members that `ping` called `unregistered` were invisible here.
+  // A sweep must never answer a question it did not evaluate.
   const scopedRoom = args.room ? normalizeRoom(args.room) : undefined;
   const targets = new Set<PruneTarget>(
-    scopedRoom ? ["rooms"] : args.targets ?? [...PRUNE_TARGETS]
+    args.targets ?? (scopedRoom ? ["rooms"] : [...PRUNE_TARGETS])
   );
   const keep = (e: { ts: number; kind?: string }) => keepEntry(e, cutoff, decisionCutoff);
 
@@ -133,6 +144,10 @@ export async function pruneTool(args: {
   const staleAgent = (m: string) => !knownAgents.has(m) || (reg[m]?.lastHeartbeat ?? 0) <= cutoff;
 
   const channels = scopedRoom ? [scopedRoom] : Object.keys(await getRooms());
+  // The membership sweeps walk the room registry rather than `channels`, so they
+  // need the scope predicate explicitly — without it, `room` scoped the message
+  // sweep while membership silently swept EVERY room.
+  const inScope = (chan: string) => !scopedRoom || chan === scopedRoom;
 
   if (dryRun) {
     let roomMessages = 0;
@@ -159,6 +174,7 @@ export async function pruneTool(args: {
     if (targets.has("members")) {
       const rooms = await getRooms();
       for (const [chan, e] of Object.entries(rooms)) {
+        if (!inScope(chan)) continue;
         const remaining: string[] = [];
         for (const m of e.members ?? []) {
           if (!knownAgents.has(m)) orphanMembers.add(m);
@@ -264,7 +280,8 @@ export async function pruneTool(args: {
   const archivedRooms: string[] = [];
   if (targets.has("members")) {
     await updateJson<RoomRegistry>(ROOMS_FILE, {}, (current) => {
-      for (const e of Object.values(current)) {
+      for (const [chan, e] of Object.entries(current)) {
+        if (!inScope(chan)) continue;
         if ((e.members?.length ?? 0) === 0) continue;
         e.members = (e.members ?? []).filter((m) => {
           if (!knownAgents.has(m)) {
@@ -284,7 +301,7 @@ export async function pruneTool(args: {
     if (args.archiveEmptyRooms ?? true) {
       const rooms = await getRooms();
       for (const [chan, e] of Object.entries(rooms)) {
-        if (chan === DEFAULT_ROOM || (e.members?.length ?? 0) > 0) continue;
+        if (chan === DEFAULT_ROOM || !inScope(chan) || (e.members?.length ?? 0) > 0) continue;
         const file = roomFile(chan);
         const msgs = await readJsonl<Message>(file);
         const lastTs = msgs[msgs.length - 1]?.ts ?? 0;
